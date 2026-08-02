@@ -1,0 +1,20 @@
+"""Shared helpers for backend FEATURE_SPEC construction."""
+from __future__ import annotations
+
+from ..data.feature_config import FeatureConfig
+
+__all__ = ["resolve_f0_config"]
+
+
+def resolve_f0_config(train_cfg: dict, *, default_extractor: str = "rmvpe") -> FeatureConfig:
+    """Build an f0 FeatureConfig, allowing train_cfg to override the extractor.
+
+    Supported extractors: ``rmvpe`` (default) and ``fcpe``.
+    """
+    extractor = train_cfg.get("f0_extractor", default_extractor)
+    assert extractor in ("rmvpe", "fcpe"), f"unsupported f0_extractor: {extractor}"
+    params = {"extractor": extractor, "uv_policy": "raw"}
+    if extractor == "rmvpe":
+        # RMVPE needs an external weight; FCPE ships its weight bundled.
+        params["model_ckpt"] = train_cfg.get("rmvpe_ckpt", "pretrained/rmvpe/model.pt")
+    return FeatureConfig("f0", params)

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Pretrained weights (download separately, ~1GB)
+pretrained/
+
+# Bundled FCPE weight (43MB, tracked via release assets instead)
+usvc/features/fcpe/assets/*.pt
+
+# Datasets & temp outputs
+*.wav
+*.flac
+*.pt
+audio/
+audio_16k/
+mel/
+f0/
+rms/
+units/
+spec/
+meta.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Benchmark reports (regenerate locally)
+*_report.json
