@@ -26,15 +26,13 @@ train = [
     "schedulefree>=1.4",
     "tensorboard>=2.15",
 ]
-# Retrieval (RVC-style units index)
-retrieval = [
-    "faiss-cpu>=1.7",
-]
 
 [project.scripts]
 usvc-preprocess = "usvc.cli.preprocess:main"
 usvc-train = "usvc.cli.train:main"
 usvc-infer = "usvc.cli.infer:main"
+usvc-index = "usvc.retrieval.cli:main_index"
+usvc-cluster = "usvc.retrieval.cli:main_cluster"
 
 [build-system]
 requires = ["hatchling"]
