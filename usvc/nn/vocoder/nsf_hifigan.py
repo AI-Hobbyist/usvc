@@ -1,13 +1,20 @@
 """Shared NSF-HiFiGAN vocoder (openvpi pretrained, 44.1k/hop512/128bin).
 
-Extracted verbatim from DDSP-SVC-6.3 ``nsf_hifigan/models.py`` (the openvpi
-pretrained vocoder released at openvpi/vocoders; same weights used by
-Diffusion-SVC / DDSP-SVC / ReFlow-VAE-SVC / so-vits shallow diffusion).
+Extracted verbatim from openvpi/SingingVocoders ``models/nsf_HiFigan/models.py``
+(the pretrained vocoder released at openvpi/SingingVocoders; same weights used
+by Diffusion-SVC / DDSP-SVC / ReFlow-VAE-SVC / so-vits shallow diffusion).
 
-NOTE: this is the *standalone* openvpi vocoder Generator (conv_pre input =
-num_mels, no speaker cond, full 5-stage upsample). It differs from the
-VITS-built-in NSF generator inside usvc/backends/sovits|rvc (which has a
-cond layer for speaker conditioning and is used for sovits/rvc inference).
+Two Generator architectures are supported, auto-detected from the ckpt keys:
+
+- ``mini_nsf=True`` (PC-NSF-HiFiGAN, openvpi 2025.02+): uses ``fastsinegen``
+  + a single ``source_conv`` injected after the 2nd upsample stage. Keys:
+  ``source_conv.*`` (no ``m_source`` / ``noise_convs``).
+- ``mini_nsf=False`` (classic NSF-HiFiGAN): uses ``SourceModuleHnNSF``
+  (``m_source``) + per-stage ``noise_convs``. Keys: ``m_source.*`` +
+  ``noise_convs.*``.
+
+The standalone vocoder differs from the VITS-built-in NSF generator inside
+usvc/backends/sovits|rvc (which has a cond layer for speaker conditioning).
 
 Weight formats accepted on load: {'generator': sd} | {'state_dict': sd} |
 {'model': sd} | bare state_dict.
@@ -251,6 +258,7 @@ class Generator(torch.nn.Module):
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
         self.mini_nsf = h.mini_nsf
+        self.noise_sigma = h.noise_sigma
 
         if h.mini_nsf:
             self.source_sr = h.sampling_rate / int(np.prod(h.upsample_rates[2:]))
@@ -292,7 +300,7 @@ class Generator(torch.nn.Module):
         self.conv_post.apply(init_weights)
 
     def fastsinegen(self, f0):
-        n = torch.arange(1, self.upp + 1, device=f0.device)
+        n = torch.arange(1, self.upp + 1, device=f0.device, dtype=f0.dtype)
         s0 = f0.unsqueeze(-1) / self.source_sr
         ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
         rad = s0 * n + 0.5 * ds0 * n * (n - 1) / self.upp
@@ -309,6 +317,8 @@ class Generator(torch.nn.Module):
         else:
             har_source = self.m_source(f0, self.upp).transpose(1, 2)
         x = self.conv_pre(x)
+        if self.noise_sigma is not None and self.noise_sigma > 0:
+            x += self.noise_sigma * torch.randn_like(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
@@ -339,14 +349,13 @@ class Generator(torch.nn.Module):
         remove_weight_norm(self.conv_post)
 
 
-def load_config(config_path):
-    with open(config_path) as f:
-        data = f.read()
-    json_config = json.loads(data)
-    h = AttrDict(json_config)
-    # standalone vocoder configs don't carry mini_nsf; default to full NSF
-    if h.mini_nsf is None:
-        h["mini_nsf"] = False
+def load_config(config):
+    """Load config from a json path or dict; returns an AttrDict."""
+    if isinstance(config, dict):
+        h = AttrDict(config)
+    else:
+        with open(config) as f:
+            h = AttrDict(json.loads(f.read()))
     return h
 
 
@@ -354,19 +363,31 @@ class NSFHiFiGAN(nn.Module):
     """Shared NSF-HiFiGAN vocoder wrapper.
 
     Args:
-        config_path: openvpi ``config.json`` (44.1k/hop512/128bin).
-        ckpt_path: pretrained weights (``{'generator': state_dict}``).
+        config: openvpi ``config.json`` path or config dict (44.1k/hop512/128bin).
+        ckpt_path: pretrained weights. ``mini_nsf`` is auto-detected from ckpt
+            keys when the config does not set it explicitly
+            (``source_conv.*`` -> mini_nsf=True; ``m_source.*`` -> mini_nsf=False).
         device: 'cuda' | 'cpu'.
         is_half: cast weights to fp16.
     """
 
-    def __init__(self, config_path, ckpt_path, device="cuda", is_half=False):
+    def __init__(self, config, ckpt_path, device="cuda", is_half=False):
         super().__init__()
         self.device = device
-        self.h = load_config(config_path)
+        self.h = load_config(config)
         self.sampling_rate = self.h.sampling_rate
         self.hop_size = self.h.hop_size
         self.num_mels = self.h.num_mels
+
+        if self.h.mini_nsf is None:  # not set in config -> infer from ckpt keys
+            mini_nsf = self._detect_mini_nsf(ckpt_path)
+            if mini_nsf is None:
+                raise RuntimeError(
+                    "cannot determine vocoder architecture: config has no "
+                    "'mini_nsf' and ckpt has neither 'source_conv' nor "
+                    "'m_source' keys"
+                )
+            self.h["mini_nsf"] = mini_nsf
 
         self.generator = Generator(self.h).to(device)
         self.load_weights(ckpt_path)
@@ -375,8 +396,13 @@ class NSFHiFiGAN(nn.Module):
         if is_half:
             self.generator.half()
 
-    def load_weights(self, ckpt_path):
-        """Load pretrained weights, tolerant of common wrapper formats."""
+    @staticmethod
+    def _detect_mini_nsf(ckpt_path):
+        """Peek ckpt state_dict keys to determine the Generator variant.
+
+        Returns True (mini_nsf / PC-NSF-HiFiGAN), False (classic NSF) or None
+        if the keys are ambiguous.
+        """
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         sd = ckpt
         if isinstance(ckpt, dict):
@@ -384,6 +410,39 @@ class NSFHiFiGAN(nn.Module):
                 if key in ckpt and isinstance(ckpt[key], dict):
                     sd = ckpt[key]
                     break
+        if not isinstance(sd, dict):
+            return None
+        keys = set(sd.keys())
+        # ckpts wrapped as {'state_dict': {'generator.*': ..., 'discriminator.*':}}
+        # carry a prefix; keep only the generator sub-keys for detection.
+        if any(k.startswith("generator.") for k in keys):
+            keys = {k[len("generator."):] for k in keys if k.startswith("generator.")}
+        if any(k.startswith("source_conv") for k in keys):
+            return True
+        if any(k.startswith("m_source.") for k in keys):
+            return False
+        return None
+
+    def load_weights(self, ckpt_path):
+        """Load pretrained weights, tolerant of common wrapper formats.
+
+        Accepts {'generator': sd} | {'state_dict': sd} | {'model': sd} |
+        bare state_dict; strips a leading ``generator.`` prefix if present.
+        """
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sd = ckpt
+        if isinstance(ckpt, dict):
+            for key in ("generator", "state_dict", "model"):
+                if key in ckpt and isinstance(ckpt[key], dict):
+                    sd = ckpt[key]
+                    break
+        if isinstance(sd, dict):
+            # openvpi release ckpts are {'state_dict': {'generator.*': ...,
+            # 'discriminator.*': ...}}: load only the generator sub-keys.
+            gen_keys = [k for k in sd if k.startswith("generator.")]
+            if gen_keys:
+                sd = {k[len("generator."):]: v for k, v in sd.items()
+                      if k.startswith("generator.")}
         missing, unexpected = self.generator.load_state_dict(sd, strict=False)
         if missing:
             raise RuntimeError(
