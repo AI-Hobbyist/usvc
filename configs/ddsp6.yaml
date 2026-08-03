@@ -1,0 +1,70 @@
+# ============================================================
+# usvc 训练配置: DDSP-SVC v6 (Rectified Flow + 速度网络)
+# ============================================================
+# 对应原项目: DDSP-SVC-6.1 / 6.2 / 6.3 (github.com/yxlllc/DDSP-SVC)
+# 三个版本共用相同 reflow 数学, 只差速度网络和配置:
+#   6.1: LYNXNet (n_chans=512, t_start=0.7, contentvec hop=320)
+#   6.2: LYNXNet 微调 (n_chans=1024, t_start=0.0, contentvec_tta2x hop=160)
+#   6.3: LYNXNet2 重写 (n_chans=1024, t_start=0.0, contentvec_tta2x) ← 默认
+#
+# usvc 通过 version 选项一键切换, 也可单独覆盖任意参数
+# ============================================================
+
+backend: ddsp6
+dataset_dir: data/my_dataset       # 必填: 预处理后的数据集目录 (含 meta.json)
+exp_dir: experiments/ddsp6         # 输出目录
+
+# ---- 训练超参 ----
+batch_size: 48                     # [可调] 原项目默认 48; A10G 24GB 安全
+max_frames: 128                    # [可调] 训练片段长度(帧), 原项目 duration=2s ≈ 128 帧
+num_workers: 8                     # [可调] dataloader worker 数
+max_steps: 500000                  # [可调] 总训练步数
+val_interval: 2000                 # [可调] 验证间隔(步)
+save_interval: 2000                # [可调] checkpoint 保存间隔(步)
+precision: bf16-mixed              # [可调] bf16 AMP (已验证近无损)
+
+# ---- 优化器 (DDSP-SVC 用 AdamW) ----
+optimizer:
+  type: adamw                      # [可调] adamw (原项目默认)
+  lr: 0.0006                       # [可调] 原项目默认 6e-4
+  betas: [0.9, 0.98]               # [可调] 原项目默认 (0.9, 0.98)
+  weight_decay: 0.0                # [可调] 原项目默认 0
+schedule:
+  type: linear_warmup_decay        # [可调] None | step | exponential | linear_warmup_decay
+  warmup_steps: 1000               # [可调] 预热步数
+  decay_step: 40000                # [可调] 学习率衰减步长 (原项目 decay_step)
+  gamma: 0.5                       # [可调] 衰减因子
+
+grad_clip: 1.0                     # [可调] 梯度裁剪; None 关闭
+
+# ---- 模型架构 (version 一键切换 6.1/6.2/6.3) ----
+backend_opts:
+  version: "6.3"                   # [可调] "6.1" | "6.2" | "6.3" — 选择 DDSP-SVC 版本
+  # version 会自动设置以下默认值:
+  #   6.1 -> velocity_net=LYNXNet, n_aux_layers=3, n_aux_chans=256, n_chans=512,
+  #          t_start=0.7, use_norm=False
+  #   6.2 -> velocity_net=LYNXNet, n_aux_layers=6, n_aux_chans=512, n_chans=1024,
+  #          t_start=0.0, use_norm=True
+  #   6.3 -> velocity_net=LYNXNet2, n_aux_layers=6, n_aux_chans=512, n_chans=1024,
+  #          t_start=0.0, use_norm=True
+  #
+  # 以下可单独覆盖 version 的默认值 (显式设置优先):
+  # velocity_net: LYNXNet2         # [可调] LYNXNet (6.1/6.2) | LYNXNet2 (6.3)
+  # n_aux_layers: 6                # [可调] auxiliary 网络层数
+  # n_aux_chans: 512               # [可调] auxiliary 网络通道数
+  # n_layers: 6                    # [可调] 速度网络层数
+  # n_chans: 1024                  # [可调] 速度网络通道数
+  # t_start: 0.0                   # [可调] flow 起始时间 (6.1 用 0.7)
+  # use_norm: true                 # [可调] 是否使用 LayerNorm
+  # use_attention: false           # [可调] 是否使用注意力
+  # use_pitch_aug: true            # [可调] 音高增强
+  num_speaker: 1                   # [可调] 说话人数
+  n_units: 768                     # [可调] 内容编码器维度: 768 (contentvec) / 256 (hubertsoft)
+
+# 特征说明:
+#   version="6.2"/"6.3" 自动用 contentvec_tta2x (hop=160)
+#   version="6.1" 自动用 contentvec (hop=320)
+#   由 backend feature_spec 自动处理, 无需手动配
+# 覆盖特征:
+# units_kind: hubertsoft           # 切换 hubertsoft (需同时 n_units: 256)
+# f0_extractor: fcpe               # [可调] rmvpe(默认) | fcpe (更快)

@@ -24,6 +24,15 @@ class DiffusionModule(BaseSVCModule):
             out_dims=opts.get("out_dims", 128),
             timesteps=opts.get("timesteps", 1000),
             n_hidden=opts.get("n_hidden", 256),
+            use_pitch_aug=opts.get("use_pitch_aug", False),
+            k_step=opts.get("k_step", 1000),
+            denoiser=opts.get("denoiser", "convnext"),
+            wn_layers=opts.get("wn_layers", 20),
+            wn_chans=opts.get("wn_chans", 384),
+            cn_layers=opts.get("cn_layers", 20),
+            cn_chans=opts.get("cn_chans", 384),
+            mlp_factor=opts.get("mlp_factor", 4),
+            gradient_checkpointing=opts.get("gradient_checkpointing", False),
         )
 
     def forward_loss(self, batch: SVCBatch):

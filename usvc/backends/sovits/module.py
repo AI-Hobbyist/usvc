@@ -37,6 +37,7 @@ class SoVITSModule(BaseGANModule):
             spec_channels=spec_channels,
             inter_channels=inter_channels,
             hidden_channels=hidden_channels,
+            filter_channels=opts.get("filter_channels", 768),
             n_heads=opts.get("n_heads", 2),
             n_layers_dec=opts.get("n_layers_dec", 6),
             n_layers_enc=opts.get("n_layers_enc", 6),
@@ -44,6 +45,8 @@ class SoVITSModule(BaseGANModule):
             n_sdp_layers=opts.get("n_sdp_layers", 6),
             n_spk=opts.get("num_speaker", 1),
             segment_size=opts.get("segment_size", 10240),
+            gin_channels=opts.get("gin_channels", 768),
+            use_automatic_f0_prediction=opts.get("use_automatic_f0_prediction", True),
         )
         self.discriminator = MultiPeriodDiscriminator(
             use_spectral_norm=opts.get("use_spectral_norm", False),

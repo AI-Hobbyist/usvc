@@ -193,6 +193,7 @@ class DDPMObjective:
         x0_mel: torch.Tensor,
         denoise_fn: Callable,
         cond: dict | torch.Tensor | None = None,
+        t_max: int | None = None,
     ) -> torch.Tensor:
         """Compute epsilon-prediction MSE loss.
 
@@ -200,6 +201,9 @@ class DDPMObjective:
             x0_mel: [B, T, M] target mel (raw).
             denoise_fn: callable(xt, t, cond) → eps prediction.
             cond: conditioning.
+            t_max: upper bound (exclusive) for the random timestep. None →
+                self.timesteps. so-vits shallow diffusion trains with
+                t = randint(0, k_step_max) where k_step_max < 1000.
 
         Returns:
             scalar loss tensor.
@@ -208,7 +212,8 @@ class DDPMObjective:
         batch = x0.shape[0]
         device = x0.device
 
-        t = torch.randint(0, self.timesteps, (batch,), device=device)
+        t_hi = t_max if t_max is not None else self.timesteps
+        t = torch.randint(0, t_hi, (batch,), device=device)
         noise = torch.randn_like(x0)
 
         sqrt_acp = self.sqrt_alphas_cumprod.to(device)[t]

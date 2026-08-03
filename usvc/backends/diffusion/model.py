@@ -505,6 +505,9 @@ class DiffusionModel(nn.Module):
         mlp_factor=4,
         gradient_checkpointing=False,
         k_step=1000,
+        denoiser="convnext",
+        wn_layers=20,
+        wn_chans=384,
     ):
         super().__init__()
         self.n_spk = n_spk
@@ -526,20 +529,30 @@ class DiffusionModel(nn.Module):
         else:
             self.spk_embed = None
 
-        # denoiser
-        self.denoise_fn = ConvNext(
-            mel_channels=out_dims,
-            dim=cn_chans,
-            mlp_factor=mlp_factor,
-            condition_dim=n_hidden,
-            num_layers=cn_layers,
-            dilation_cycle=4,
-            gradient_checkpointing=gradient_checkpointing,
-        )
+        # denoiser (registered only via decoder; see GaussianDiffusion)
+        if denoiser == "wavenet":
+            from .wavenet import WaveNet
+
+            denoise_fn = WaveNet(
+                in_dims=out_dims,
+                n_layers=wn_layers,
+                n_chans=wn_chans,
+                n_hidden=n_hidden,
+            )
+        else:  # convnext (existing default)
+            denoise_fn = ConvNext(
+                mel_channels=out_dims,
+                dim=cn_chans,
+                mlp_factor=mlp_factor,
+                condition_dim=n_hidden,
+                num_layers=cn_layers,
+                dilation_cycle=4,
+                gradient_checkpointing=gradient_checkpointing,
+            )
 
         # sampler (inference only)
         self.decoder = GaussianDiffusion(
-            self.denoise_fn,
+            denoise_fn,
             out_dims=out_dims,
             timesteps=timesteps,
             k_step=k_step,
@@ -566,8 +579,13 @@ class DiffusionModel(nn.Module):
 
         x = self.unit_embed(units) + self.f0_embed((1 + f0 / 700).log()) + self.volume_embed(volume)
         if self.spk_embed is not None and spk_id is not None:
-            # original Diffusion-SVC convention: 1-based speaker ids
-            x = x + self.spk_embed(spk_id - 1)
+            # original Diffusion-SVC convention: 1-based speaker ids.
+            # spk_id is [B] (usvc SVCBatch); unsqueeze to [B, 1] so the
+            # embedding broadcasts against x [B, T, n_hidden] correctly
+            # regardless of T (embedding([B]) -> [B, H] would only align
+            # when T == B by accident).
+            spk = spk_id if spk_id.dim() > 1 else spk_id.unsqueeze(1)
+            x = x + self.spk_embed(spk - 1)
         if self.aug_shift_embed is not None and aug_shift is not None:
             x = x + self.aug_shift_embed(aug_shift / 5)
         return x
@@ -578,7 +596,7 @@ class DiffusionModel(nn.Module):
         cond: [B, n_hidden, T] (already transposed).
         """
         xt4 = xt.transpose(1, 2).unsqueeze(1)  # [B, T, M] -> [B, 1, M, T]
-        pred4 = self.denoise_fn(xt4, t, cond)  # [B, 1, M, T]
+        pred4 = self.decoder.denoise_fn(xt4, t, cond)  # [B, 1, M, T]
         return pred4[:, 0].transpose(1, 2)  # [B, T, M]
 
     def forward(
@@ -605,7 +623,9 @@ class DiffusionModel(nn.Module):
         x = self._embed_condition(units, f0, volume, spk_id, aug_shift)
         cond = x.transpose(1, 2)  # [B, n_hidden, T]
 
-        loss = self.objective.compute_loss(gt_spec, self._denoise_wrapper, cond)
+        loss = self.objective.compute_loss(
+            gt_spec, self._denoise_wrapper, cond, t_max=self.k_step
+        )
         return loss, {"eps_loss": loss.item()}
 
     @torch.no_grad()

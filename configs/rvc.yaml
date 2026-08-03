@@ -1,0 +1,67 @@
+# ============================================================
+# usvc 训练配置: RVC (VITS + NSF-HiFiGAN, GAN 训练)
+# ============================================================
+# 对应原项目: RVC (github.com/RVC-Project/Retrieval-based-Voice-Conversion)
+# 原项目配置: configs/v1/{32k,40k,48k}.json, configs/v2/{32k,48k}.json
+#
+# RVC 的版本/采样率差异:
+#   v1: 默认 hubertbase 768 维 + f0 量化 token
+#   v2: 改进的 contentvec + final_proj (256 维投影) ← usvc 默认
+#   采样率: 32k/40k/48k (影响 mel 配置, hop=采样率/100)
+# usvc 通过 backend_opts 的 sr + rvc_version 切换
+# ============================================================
+
+backend: rvc
+dataset_dir: data/my_dataset       # 必填: 预处理后的数据集目录 (含 meta.json)
+                                   # 注意: RVC 默认 48k/hop480, 与 44.1k/512 家族不同,
+                                   #       需单独预处理数据集
+exp_dir: experiments/rvc           # 输出目录
+
+# ---- 训练超参 ----
+batch_size: 32                     # [可调] 原项目默认 4-8 (保守); A10G 24GB 可开 32 (完整GAN 10.4GB)
+max_frames: 64                     # [可调] 训练片段长度(帧), 需 > segment_size
+num_workers: 8                     # [可调] dataloader worker 数
+max_steps: 500000                  # [可调] 总训练步数
+val_interval: 2000                 # [可调] 验证间隔(步)
+save_interval: 2000                # [可调] checkpoint 保存间隔(步)
+precision: bf16-mixed              # [可调] bf16 AMP (GAN 已验证近无损)
+
+# ---- 优化器 (GAN: G/D 双优化器, 用相同配置) ----
+optimizer:
+  type: adamw                      # [可调] adamw (原项目默认)
+  lr: 0.0002                       # [可调] 原项目默认 2e-4
+  betas: [0.8, 0.99]               # [可调] 原项目默认 (0.8, 0.99)
+  weight_decay: 0.0                # [可调] 原项目默认 0
+grad_clip: null                    # [可调] GAN 通常不裁剪 (原项目无)
+
+# ---- 模型架构 (对应原项目 SynthesizerTrn) ----
+backend_opts:
+  # 维度参数
+  inter_channels: 192              # [可调] latent 维度
+  hidden_channels: 192             # [可调] 隐藏维度
+  filter_channels: 768             # [可调] filter 维度
+  n_units: 768                     # [可调] 内容编码器维度: 768 (contentvec/hubertbase)
+  num_speaker: 1                   # [可调] 说话人数 (= spk_embed_dim, 原项目 1 人多用 200)
+  segment_size: 20                 # [可调] 训练片段(帧), 原项目 segment_size//hop; 必须 < max_frames
+  use_spectral_norm: false         # [可调] 判别器 spectral norm (原项目默认 false)
+
+  # RVC 采样率 (影响 mel 配置, 通常不改)
+  sr: 48000                        # [可调] 采样率: 32000 | 40000 | 48000
+                                   #       v1 有 32k/40k/48k, v2 有 32k/48k
+
+  # mel 提取参数 (原项目 48k.json data 段, 通常不改)
+  filter_length: 2048              # n_fft
+  n_mel_channels: 128              # mel bins (RVC 用 128, 与 so-vits 80 不同)
+  sampling_rate: 48000             # 采样率 (与 sr 一致)
+  hop_length: 480                  # hop (原项目 480 = 48k/100)
+  win_length: 2048                 # 窗长
+  mel_fmin: 0.0                    # mel 最低频
+  mel_fmax: null                   # mel 最高频 (null = 全频带, 原项目默认)
+
+  # 损失系数 (原项目 c_mel/c_kl, 已验证与原项目一致)
+  c_mel: 45.0                      # [可调] mel loss 权重 (原项目 45)
+  c_kl: 1.0                        # [可调] KL loss 权重 (原项目 1)
+
+# 特征覆盖 (可选):
+# rvc_version: v1                  # [可调] v2(默认) | v1 (切换特征提取, 见 backends/rvc/__init__.py)
+# f0_extractor: fcpe               # [可调] rmvpe(默认) | fcpe (更快)

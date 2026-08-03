@@ -1,0 +1,89 @@
+# ============================================================
+# usvc 训练配置: 扩散 SVC (DDPM epsilon-prediction)
+# ============================================================
+# 一个 backend 覆盖三个原项目 (数学核心相同, 已验证数值等价):
+#
+#   ① Diffusion-SVC v2 (默认): ConvNext 去噪器, 128-bin mel
+#      → 对应 Diffusion-SVC/configs/config.yaml
+#      → denoiser: convnext (默认)
+#
+#   ② Diffusion-SVC v1: WaveNet 去噪器, 128-bin mel
+#      → 对应 Diffusion-SVC-v1/configs/config.yaml
+#      → denoiser: wavenet (loss 与 v1 diff=0.0000%, 已验证)
+#
+#   ③ so-vits-svc 浅扩散: WaveNet 去噪器, 80-bin mel, k_step<1000
+#      → 对应 so-vits-svc/configs/diffusion.yaml
+#      → denoiser: wavenet, out_dims: 80, k_step: 300, n_mels: 80
+#      (so-vits 浅扩散的 wavenet.py 与 v1 完全相同, MD5 一致)
+# ============================================================
+
+backend: diffusion
+dataset_dir: data/my_dataset       # 必填: 预处理后的数据集目录 (含 meta.json)
+exp_dir: experiments/diffusion     # 输出目录
+
+# ---- 训练超参 ----
+batch_size: 48                     # [可调] 原项目默认 48; A10G 24GB 安全
+max_frames: 256                    # [可调] 训练片段长度(帧)
+num_workers: 8                     # [可调] dataloader worker 数
+max_steps: 500000                  # [可调] 总训练步数
+val_interval: 2000                 # [可调] 验证间隔(步)
+save_interval: 2000                # [可调] checkpoint 保存间隔(步)
+precision: bf16-mixed              # [可调] bf16 AMP (已验证近无损)
+
+# ---- 优化器 ----
+optimizer:
+  type: adamw                      # [可调] adamw (原项目默认)
+  lr: 0.0006                       # [可调] Diffusion-SVC 默认 6e-4
+  betas: [0.9, 0.98]               # [可调] 原项目默认 (0.9, 0.98)
+  weight_decay: 0.0                # [可调] 原项目默认 0
+schedule:
+  type: linear_warmup_decay        # [可调] None | step | exponential | linear_warmup_decay
+  warmup_steps: 1000               # [可调] 预热步数
+  decay_step: 40000                # [可调] 衰减步长 (原项目 decay_step)
+  gamma: 0.5                       # [可调] 衰减因子
+
+grad_clip: 1.0                     # [可调] 梯度裁剪; None 关闭
+
+# ---- 模型架构 ----
+backend_opts:
+  denoiser: convnext               # [可调] convnext (Diffusion-SVC v2) | wavenet (v1/so-vits浅扩散)
+
+  # --- ConvNext 去噪器参数 (denoiser=convnext 时生效) ---
+  cn_layers: 20                    # [可调] ConvNext 层数 (原项目 config.yaml 用 20)
+  cn_chans: 384                    # [可调] ConvNext 通道数 (原项目 384)
+
+  # --- WaveNet 去噪器参数 (denoiser=wavenet 时生效) ---
+  wn_layers: 20                    # [可调] WaveNet 层数
+  wn_chans: 384                    # [可调] WaveNet 通道: 384 (so-vits浅扩散) | 512 (v1官方config)
+
+  # --- 通用参数 ---
+  out_dims: 128                    # [可调] mel bins: 128 (Diffusion-SVC) | 80 (so-vits 浅扩散)
+  k_step: 1000                     # [可调] 扩散步数上限: 1000 (全扩散) | 300 (so-vits 浅扩散)
+  timesteps: 1000                  # [可调] DDPM 总步数 (通常不改)
+  n_hidden: 256                    # [可调] condition 隐藏维度 (原项目 256)
+  use_pitch_aug: false             # [可调] 音高增强; 加载原项目 ckpt 且原项目启用时需 true
+  mlp_factor: 4                    # [可调] MLP 倍数 (ConvNext 用)
+  gradient_checkpointing: false    # [可调] 梯度检查点 (省显存, 慢)
+  num_speaker: 1                   # [可调] 说话人数
+  n_units: 768                     # [可调] 内容编码器维度: 768 (contentvec) / 256 (hubertsoft)
+
+# ---- mel 特征覆盖 (so-vits 浅扩散必须改) ----
+# Diffusion-SVC (128-bin): 用默认, 无需配
+# so-vits 浅扩散 (80-bin): 取消注释下面 3 行
+# n_mels: 80
+# fmin: 0.0
+# fmax: 22050
+
+# 特征覆盖 (可选):
+# units_kind: hubertsoft           # 切换 hubertsoft (需同时 n_units: 256)
+# f0_extractor: fcpe               # [可调] rmvpe(默认) | fcpe (更快)
+
+# ============================================================
+# 快速切换示例 (复制对应块的 backend_opts 替换上面即可):
+#
+# 【Diffusion-SVC v1 等效】
+#   denoiser: wavenet, out_dims: 128, wn_chans: 512
+# 【so-vits 浅扩散等效】
+#   denoiser: wavenet, out_dims: 80, k_step: 300, wn_chans: 384
+#   + 顶层 n_mels: 80, fmin: 0.0, fmax: 22050
+# ============================================================

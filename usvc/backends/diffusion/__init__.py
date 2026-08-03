@@ -45,6 +45,20 @@ class DiffusionBackend(Backend):
     def feature_spec(train_cfg: dict) -> FeatureSpec:
         base = DiffusionBackend.DEFAULT_FEATURES
         f0 = resolve_f0_config(train_cfg)
+        # mel config may be overridden by train_cfg (so-vits shallow diffusion
+        # uses 80 bins / fmin=0 / fmax=22050 while diffusion default is
+        # 128 bins / fmin=40 / fmax=16000).
+        mel = FeatureConfig(
+            "mel",
+            {
+                "n_fft": 2048,
+                "win_length": 2048,
+                "n_mels": train_cfg.get("n_mels", 128),
+                "fmin": train_cfg.get("fmin", 40.0),
+                "fmax": train_cfg.get("fmax", 16000.0),
+                "center": False,
+            },
+        )
         if train_cfg.get("units_kind") == "hubertsoft":
             units = FeatureConfig(
                 "units",
@@ -58,7 +72,7 @@ class DiffusionBackend(Backend):
             )
         else:
             units = base.units
-        return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
+        return FeatureSpec(mel=mel, f0=f0, rms=base.rms, units=units)
 
     def build_dataset(
         self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
