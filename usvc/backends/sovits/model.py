@@ -30,6 +30,106 @@ from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 LRELU_SLOPE = 0.1
 
 # ---------------------------------------------------------------------------
+# mel_spectrogram / spec_to_mel (from so-vits-svc/modules/mel_processing.py)
+# ---------------------------------------------------------------------------
+
+_mel_basis_cache: dict = {}
+_hann_window_cache: dict = {}
+
+
+def _spectrogram_torch(
+    y: torch.Tensor, n_fft: int, sampling_rate: int, hop_size: int,
+    win_size: int, center: bool = False, eps: float = 1e-6,
+) -> torch.Tensor:
+    """Linear spectrogram from waveform.
+
+    Bit-matches so-vits (eps=1e-6 via view_as_real) or RVC (eps=2e-7 via
+    real/imag) mel_processing. y: [B, samples] or [samples].
+    Returns [B, n_fft//2+1, T] magnitudes.
+    """
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+
+    dtype_device = str(y.dtype) + "_" + str(y.device)
+    key = f"{win_size}_{dtype_device}"
+    if key not in _hann_window_cache:
+        _hann_window_cache[key] = torch.hann_window(win_size).to(
+            dtype=y.dtype, device=y.device
+        )
+
+    pad = int((n_fft - hop_size) / 2)
+    y = torch.nn.functional.pad(y.unsqueeze(1), (pad, pad), mode="reflect")
+    y = y.squeeze(1)
+
+    y_dtype = y.dtype
+    if y.dtype == torch.bfloat16:
+        y = y.to(torch.float32)
+
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=_hann_window_cache[key],
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=True,
+    )
+    if eps == 1e-6:
+        # so-vits: view_as_real -> sqrt(re^2+im^2+1e-6)
+        spec = torch.view_as_real(spec).to(y_dtype)
+        spec = torch.sqrt(spec.pow(2).sum(-1) + eps)
+    else:
+        # RVC: sqrt(real^2 + imag^2 + 2e-7)
+        spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + eps)
+        spec = spec.to(y_dtype)
+    return spec
+
+
+def spec_to_mel(
+    spec: torch.Tensor, n_fft: int, num_mels: int, sampling_rate: int,
+    fmin: float, fmax: float | None, clip_val: float = 1e-5,
+) -> torch.Tensor:
+    """Linear spec -> log mel.
+
+    Bit-matches so-vits (clip_val=1e-5) or RVC (clip_val=2e-6) mel_processing.
+    """
+    dtype_device = str(spec.dtype) + "_" + str(spec.device)
+    key = f"{fmax}_{dtype_device}"
+    if key not in _mel_basis_cache:
+        import librosa
+
+        mel = librosa.filters.mel(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+        )
+        _mel_basis_cache[key] = torch.from_numpy(mel).to(
+            dtype=spec.dtype, device=spec.device
+        )
+    mel = torch.matmul(_mel_basis_cache[key], spec)
+    mel = torch.log(torch.clamp(mel, min=clip_val))
+    return mel
+
+
+def mel_spectrogram(
+    y: torch.Tensor, n_fft: int, num_mels: int, sampling_rate: int,
+    hop_size: int, win_size: int, fmin: float, fmax: float | None,
+    center: bool = False, clip_val: float = 1e-5, eps: float = 1e-6,
+) -> torch.Tensor:
+    """Waveform -> log mel.
+
+    Bit-matches so-vits (default clip_val=1e-5/eps=1e-6) or RVC
+    (clip_val=2e-6/eps=2e-7) mel_processing. y: [B, samples] or [samples].
+    Returns [B, num_mels, T].
+    """
+    spec = _spectrogram_torch(
+        y, n_fft, sampling_rate, hop_size, win_size, center, eps=eps
+    )
+    return spec_to_mel(spec, n_fft, num_mels, sampling_rate, fmin, fmax, clip_val=clip_val)
+
+
+# ---------------------------------------------------------------------------
 # commons helpers (from so-vits-svc/modules/commons.py)
 # ---------------------------------------------------------------------------
 

@@ -22,6 +22,12 @@ __all__ = ["run_training"]
 
 def run_training(cfg: TrainConfig, resume: str | None = None):
     """Run training with the given config."""
+    # Enable TF32 on Ampere+ for near-lossless matmul/cudnn speedup.
+    # (PyTorch defaults these to False for historical reasons.)
+    import torch as _t
+    _t.backends.cuda.matmul.allow_tf32 = True
+    _t.backends.cudnn.allow_tf32 = True
+
     from ..backends import get_backend
 
     backend = get_backend(cfg.backend)()
