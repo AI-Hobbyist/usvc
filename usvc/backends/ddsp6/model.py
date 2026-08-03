@@ -84,9 +84,12 @@ class SinusoidalPosEmb(nn.Module):
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
+        # Compute in the input's dtype when it is floating point (half/bf16
+        # inference); long time-steps (training) still use float32.
+        dtype = x.dtype if x.is_floating_point else torch.float32
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
+        emb = x[:, None].to(dtype) * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -174,7 +177,8 @@ class LYNXNet2(nn.Module):
 
         x = self.input_projection(x.transpose(1, 2))
         x = x + self.conditioner_projection(cond.transpose(1, 2))
-        x = x + self.diffusion_embedding(diffusion_step).unsqueeze(1)
+        # Cast long time-step to x.dtype for half/bf16 inference.
+        x = x + self.diffusion_embedding(diffusion_step.to(x.dtype)).unsqueeze(1)
 
         for layer in self.residual_layers:
             x = layer(x)
@@ -321,7 +325,8 @@ class LYNXNet(nn.Module):
         x = self.input_projection(x)  # x [B, residual_channel, T]
         x = F.gelu(x)
 
-        diffusion_step = self.diffusion_embedding(diffusion_step).unsqueeze(-1)
+        # Cast long time-step to x.dtype for half/bf16 inference.
+        diffusion_step = self.diffusion_embedding(diffusion_step.to(x.dtype)).unsqueeze(-1)
 
         for layer in self.residual_layers:
             x = layer(x, cond, diffusion_step)
@@ -810,13 +815,13 @@ class RectifiedFlow(nn.Module):
 
             # initial condition and step size of the ODE
             if gt_spec is None:
-                x = torch.randn(shape, device=device)
+                x = torch.randn(shape, device=device, dtype=cond.dtype)
                 t = torch.full((b,), 0, device=device)
                 dt = 1.0 / infer_step
             else:
                 norm_spec = self.norm_spec(gt_spec)
                 norm_spec = norm_spec.transpose(1, 2)[:, None, :, :]  # [B, 1, M, T]
-                x = t_start * norm_spec + (1 - t_start) * torch.randn(shape, device=device)
+                x = t_start * norm_spec + (1 - t_start) * torch.randn(shape, device=device, dtype=cond.dtype)
                 t = torch.full((b,), t_start, device=device)
                 dt = (1.0 - t_start) / infer_step
 
@@ -1006,6 +1011,9 @@ class Unit2Wav(nn.Module):
         extractor = vocoder if vocoder is not None else self.mel_extractor
         if extractor is not None:
             ddsp_mel = extractor.extract(ddsp_wav[:, start_frame * self.block_size:])
+            # Mel extraction is computed in float32 internally; align to the
+            # model dtype so half/bf16 inference stays consistent.
+            ddsp_mel = ddsp_mel.to(ddsp_wav.dtype)
         else:
             ddsp_mel = None
 

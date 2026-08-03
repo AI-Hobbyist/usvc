@@ -57,9 +57,10 @@ class DiffusionEmbedding(nn.Module):
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
+        dtype = x.dtype if x.is_floating_point else torch.float32
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
+        emb = x[:, None].to(dtype) * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -181,7 +182,11 @@ class ConvNext(nn.Module):
         x = self.input_projection(spec)  # x [B, residual_channel, T]
         x = F.gelu(x)
 
-        diffusion_step = self.diffusion_embedding(diffusion_step).unsqueeze(-1)
+        # diffusion_step is a long tensor; the embedding computes in float32.
+        # Cast it to x.dtype first so the embedding + following Linear layers
+        # stay in half/bf16 inference dtype (the embedding uses x.dtype when
+        # x is a floating point tensor).
+        diffusion_step = self.diffusion_embedding(diffusion_step.to(x.dtype)).unsqueeze(-1)
         condition = self.conditioner_projection(cond)
 
         for layer in self.residual_layers:
@@ -344,10 +349,10 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_ddim(self, x, t, interval, cond):
-        a_t = _extract(self.alphas_cumprod, t, x.shape)
+        a_t = _extract(self.alphas_cumprod, t, x.shape).to(x.dtype)
         a_prev = _extract(
             self.alphas_cumprod, torch.max(t - interval, torch.zeros_like(t)), x.shape
-        )
+        ).to(x.dtype)
         noise_pred = self.denoise_fn(x, t, cond=cond)
         x_prev = a_prev.sqrt() * (
             x / a_t.sqrt()
@@ -361,10 +366,10 @@ class GaussianDiffusion(nn.Module):
         """PLMS sampling (Pseudo Numerical Methods for Diffusion Models)."""
 
         def get_x_pred(x, noise_t, t):
-            a_t = _extract(self.alphas_cumprod, t, x.shape)
+            a_t = _extract(self.alphas_cumprod, t, x.shape).to(x.dtype)
             a_prev = _extract(
                 self.alphas_cumprod, torch.max(t - interval, torch.zeros_like(t)), x.shape
-            )
+            ).to(x.dtype)
             a_t_sq, a_prev_sq = a_t.sqrt(), a_prev.sqrt()
             x_delta = (a_prev - a_t) * (
                 (1 / (a_t_sq * (a_t_sq + a_prev_sq))) * x
@@ -419,7 +424,7 @@ class GaussianDiffusion(nn.Module):
 
         if gt_spec is None or k_step is None:
             t = self.k_step
-            x = torch.randn(shape, device=device)
+            x = torch.randn(shape, device=device, dtype=condition.dtype)
         else:
             t = k_step
             norm_spec = self.norm_spec(gt_spec)

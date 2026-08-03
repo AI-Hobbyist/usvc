@@ -304,7 +304,7 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         time = self.time2emb(timestep)
-        time = self.time_emb(time)
+        time = self.time_emb(time.to(self.time_emb.weight.dtype))
         time = self.act(time)
         time = self.proj(time)
         return time
@@ -741,11 +741,12 @@ class RIFTDiTModel(nn.Module):
             return pred
 
         # Noise input
-        y0 = torch.randn(batch, mel_seq_len, num_mel_channels, device=self.device)
+        y0 = torch.randn(batch, mel_seq_len, num_mel_channels, device=self.device,
+                         dtype=src_mel.dtype)
         y0 = y0.masked_fill(~mask.unsqueeze(-1), 0)
 
         t_start = 0
-        t = torch.linspace(t_start, 1, steps, device=self.device)
+        t = torch.linspace(t_start, 1, steps, device=self.device, dtype=src_mel.dtype)
 
         # Fixed-grid Euler loop — numerically identical to torchdiffeq
         # odeint(method='euler') on the same uniform grid:

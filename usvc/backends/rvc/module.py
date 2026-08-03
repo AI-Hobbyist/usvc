@@ -19,12 +19,35 @@ from .model import MultiPeriodDiscriminatorV2, RVCModel
 __all__ = ["RVCModule"]
 
 
+# RVC upsample configs by (version, sr): prod(upsample_rates) == hop (sr/100)
+_RVC_UPSAMPLE = {
+    ("v1", 32000): ([10, 4, 2, 2, 2], [16, 16, 4, 4, 4]),
+    ("v1", 40000): ([10, 10, 2, 2], [16, 16, 4, 4]),
+    ("v1", 48000): ([10, 6, 2, 2, 2], [16, 16, 4, 4, 4]),
+    ("v2", 32000): ([10, 8, 2, 2], [20, 16, 4, 4]),
+    ("v2", 48000): ([12, 10, 2, 2], [24, 20, 4, 4]),
+}
+
+
 class RVCModule(BaseGANModule):
     """LightningModule for rvc (VITS GAN training)."""
 
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
         opts = cfg.backend_opts
+
+        version = str(opts.get("rvc_version", "v2"))
+        sr = int(opts.get("sr", 48000))
+        if "upsample_rates" not in opts or "upsample_kernel_sizes" not in opts:
+            try:
+                up, k = _RVC_UPSAMPLE[(version, sr)]
+            except KeyError:
+                raise ValueError(
+                    f"no RVC upsample defaults for ({version}, {sr}); "
+                    f"supported: {sorted(_RVC_UPSAMPLE)}"
+                )
+        else:
+            up, k = opts["upsample_rates"], opts["upsample_kernel_sizes"]
 
         self.generator = RVCModel(
             inter_channels=opts.get("inter_channels", 192),
@@ -33,7 +56,9 @@ class RVCModule(BaseGANModule):
             n_units=opts.get("n_units", 768),
             spk_embed_dim=opts.get("num_speaker", 1),
             segment_size=opts.get("segment_size", 20),
-            sr=opts.get("sr", 48000),
+            sr=sr,
+            upsample_rates=up,
+            upsample_kernel_sizes=k,
         )
         self.discriminator = MultiPeriodDiscriminatorV2(
             use_spectral_norm=opts.get("use_spectral_norm", False),
@@ -189,5 +214,10 @@ class RVCModule(BaseGANModule):
     def sample(self, batch: SVCBatch):
         units, pitch_token, pitchf, spec, wave, spk_id = self._prepare_inputs(batch)
         with torch.no_grad():
-            out = self.generator.infer(units, pitch_token, pitchf, spk_id)
+            phone_lengths = torch.full(
+                (units.shape[0],), units.shape[1], device=units.device, dtype=torch.long
+            )
+            out, *_ = self.generator.infer(
+                units, phone_lengths, pitch_token, pitchf, spk_id
+            )
         return out

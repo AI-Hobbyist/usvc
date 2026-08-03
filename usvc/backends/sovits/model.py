@@ -1423,3 +1423,48 @@ class SoVITSModel(nn.Module):
             "uv": uv,
             "c_lengths": c_lengths,
         }
+
+    def infer(self, c, f0, uv, g=None, noice_scale=0.35, seed=52468,
+              predict_f0=False, vol=None):
+        """so-vits NetGSvc.infer (verbatim from so-vits-svc/models.py).
+
+        Args:
+            c: [B, ssl_dim, T] content features (transposed).
+            f0: [B, T] continuous f0 (Hz).
+            uv: [B, T] voicing flag (0/1).
+            g: [B, 1] speaker ids (so-vits convention; [B] also accepted).
+            noice_scale: prior noise scale.
+            seed: RNG seed for the stochastic prior.
+            predict_f0: use the f0 decoder head instead of ground f0.
+            vol: [B, T] volume (only if vol_embedding).
+
+        Returns:
+            (o, f0): wav [B, 1, L] and (possibly predicted) f0 [B, T].
+        """
+        if c.device == torch.device("cuda"):
+            torch.cuda.manual_seed_all(seed)
+        else:
+            torch.manual_seed(seed)
+
+        c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
+
+        if g.dim() == 1:
+            g = g.unsqueeze(0)
+        g = self.emb_g(g).transpose(1, 2)
+
+        x_mask = torch.unsqueeze(sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
+
+        vol = self.emb_vol(vol[:, :, None]).transpose(1, 2) if vol is not None and self.vol_embedding else 0
+
+        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol
+
+        if self.use_automatic_f0_prediction and predict_f0:
+            lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
+            norm_lf0 = normalize_f0(lf0, x_mask, uv, random_scale=False)
+            pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
+            f0 = (700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)).squeeze(1)
+
+        z_p, m_p, logs_p, c_mask = self.enc_p(x, x_mask, f0=f0_to_coarse(f0), noice_scale=noice_scale)
+        z = self.flow(z_p, c_mask, g=g, reverse=True)
+        o = self.dec(z * c_mask, g=g, f0=f0)
+        return o, f0

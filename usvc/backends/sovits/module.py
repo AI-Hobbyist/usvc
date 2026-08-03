@@ -203,7 +203,10 @@ class SoVITSModule(BaseGANModule):
     def sample(self, batch: SVCBatch):
         """Generate waveform for validation."""
         with torch.no_grad():
-            out = self.generator.infer(
-                batch.units, batch.f0, batch.spk_id, uv=batch.uv, max_length=None
+            out, _ = self.generator.infer(
+                batch.units.transpose(1, 2),  # [B, D, T] (so-vits convention)
+                batch.f0,
+                batch.uv,
+                batch.spk_id.unsqueeze(-1),  # [B, 1]
             )
         return out

@@ -65,6 +65,5 @@ class DiffusionModule(BaseSVCModule):
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id,
                 aug_shift=batch.aug_shift,
-                frame_len=batch.frame_len,
             )
         return mel_gen

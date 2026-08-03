@@ -160,11 +160,13 @@ class Bi_RectifiedFlow(nn.Module):
 
             if x_start is not None and x_end is None:
                 x = x_start.transpose(1, 2).unsqueeze(1)  # [B, 1, M, T]
-                t = torch.full((x_start.shape[0],), t_start, device=x_start.device)
+                t = torch.full((x_start.shape[0],), t_start, device=x_start.device,
+                               dtype=x_start.dtype)
                 dt = (t_end - t_start) / infer_step
             elif x_start is None and x_end is not None:
                 x = self.norm_spec(x_end).transpose(1, 2).unsqueeze(1)  # [B, 1, M, T]
-                t = torch.full((x_end.shape[0],), t_end, device=x_end.device)
+                t = torch.full((x_end.shape[0],), t_end, device=x_end.device,
+                               dtype=x_end.dtype)
                 dt = -(t_end - t_start) / infer_step
 
             # sampling
@@ -394,7 +396,10 @@ class DiffusionEmbedding(nn.Module):
         device = x.device
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        # keep the frequency grid in x.dtype so half/bf16 inference stays
+        # dtype-consistent end to end (fp32 grid would promote x -> fp32 and
+        # break the following half Linear layers)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=x.dtype) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
@@ -565,7 +570,9 @@ class NaiveV2Diff(nn.Module):
         x = self.input_projection(x)  # x [B, residual_channel, T]
         x = F.gelu(x)
 
-        diffusion_step = self.diffusion_embedding(diffusion_step).unsqueeze(-1)
+        # Cast long time-step to x.dtype so the parameter-free embedding +
+        # following Linear layers stay in half/bf16 inference dtype.
+        diffusion_step = self.diffusion_embedding(diffusion_step.to(x.dtype)).unsqueeze(-1)
         condition = self.conditioner_projection(conditioner)
 
         if self.wavenet_like:
@@ -632,9 +639,12 @@ class SinusoidalPosEmb(nn.Module):
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
+        # Compute in the input's dtype when it is floating point (half/bf16
+        # inference); long time-steps (training) still use float32.
+        dtype = x.dtype if x.is_floating_point else torch.float32
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
+        emb = x[:, None].to(dtype) * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -736,7 +746,9 @@ class WaveNet(nn.Module):
         x = self.input_projection(x)  # [B, residual_channel, T]
 
         x = F.relu(x)
-        diffusion_step = self.diffusion_embedding(diffusion_step)
+        # Cast long time-step to x.dtype for half/bf16 inference (the
+        # parameter-free SinusoidalPosEmb computes in float32 otherwise).
+        diffusion_step = self.diffusion_embedding(diffusion_step.to(x.dtype))
         diffusion_step = self.mlp(diffusion_step)
         skip = []
         for layer in self.residual_layers:

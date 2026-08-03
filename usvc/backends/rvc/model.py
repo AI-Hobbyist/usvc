@@ -542,9 +542,9 @@ class RVCModel(nn.Module):
         resblock="1",
         resblock_kernel_sizes=(3, 7, 11),
         resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        upsample_rates=(10, 10, 2, 2),
+        upsample_rates=(12, 10, 2, 2),
         upsample_initial_channel=512,
-        upsample_kernel_sizes=(16, 16, 4, 4),
+        upsample_kernel_sizes=(24, 20, 4, 4),
         spk_embed_dim=1,
         gin_channels=256,
         sr=48000,
@@ -670,6 +670,70 @@ class RVCModel(nn.Module):
             "ids_slice": ids_slice,
             "phone_lengths": phone_lengths,
         }
+
+    def infer(
+        self,
+        phone,
+        phone_lengths,
+        pitch,
+        nsff0,
+        sid,
+        skip_head=None,
+        return_length=None,
+        return_length2=None,
+    ):
+        """RVC SynthesizerTrnMs256NSFsid.infer (verbatim from RVC models.py).
+
+        Args:
+            phone: [B, T, n_units] content features.
+            phone_lengths: [B] or [1] frame lengths.
+            pitch: [B, T] quantized f0 tokens (1-255).
+            nsff0: [B, T] continuous f0 for the NSF source (Hz).
+            sid: [B] speaker id (RVC convention; 1D).
+
+        Returns:
+            (o, x_mask, (z, z_p, m_p, logs_p)): wav [B, 1, L] + intermediates.
+        """
+        g = self.emb_g(sid).unsqueeze(-1)
+        if skip_head is not None and return_length is not None:
+            head = int(skip_head.item()) if isinstance(skip_head, torch.Tensor) else int(skip_head)
+            length = (
+                int(return_length.item())
+                if isinstance(return_length, torch.Tensor)
+                else int(return_length)
+            )
+            flow_head = max(head - 24, 0)
+            dec_head = head - flow_head
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            z = z[:, :, dec_head : dec_head + length]
+            x_mask = x_mask[:, :, dec_head : dec_head + length]
+            nsff0 = nsff0[:, head : head + length]
+        else:
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+        o = self.dec(z * x_mask, nsff0, g=g, n_res=return_length2)
+        return o, x_mask, (z, z_p, m_p, logs_p)
+
+    @staticmethod
+    def f0_to_coarse(f0, f0_min=50.0, f0_max=1100.0):
+        """RVC f0 quantization (infer/rtrvc.py get_f0_post, verbatim).
+
+        f0: [B, T] Hz -> [B, T] long tokens in [1, 255].
+        """
+        f0_mel_min = 1127 * torch.log(torch.tensor(1 + f0_min / 700, dtype=f0.dtype))
+        f0_mel_max = 1127 * torch.log(torch.tensor(1 + f0_max / 700, dtype=f0.dtype))
+        f0_mel = 1127 * torch.log(1 + f0 / 700)
+        f0_mel = torch.where(
+            f0_mel > 0,
+            (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
+            f0_mel,
+        )
+        f0_mel = f0_mel.clamp(min=1, max=255)
+        f0_coarse = torch.round(f0_mel).long()
+        return f0_coarse
 
 
 # ---------------------------------------------------------------------------

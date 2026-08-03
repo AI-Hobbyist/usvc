@@ -126,7 +126,7 @@ class TrainConfig:
             d = yaml.safe_load(f)
         return cls(
             backend=d["backend"],
-            dataset_dir=d["dataset_dir"],
+            dataset_dir=d.get("dataset_dir", "data/default"),
             exp_dir=d.get("exp_dir", "experiments/default"),
             val_dir=d.get("val_dir"),
             batch_size=d.get("batch_size", 32),

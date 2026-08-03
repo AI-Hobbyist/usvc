@@ -98,6 +98,5 @@ class DDSPModule(BaseSVCModule):
         with torch.no_grad():
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id, aug_shift=aug_shift,
-                frame_len=batch.frame_len,
             )
         return mel_gen
