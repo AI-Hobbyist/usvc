@@ -60,5 +60,23 @@ class DiffusionBackend(Backend):
             units = base.units
         return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
 
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
-        raise NotImplementedError("diffusion dataset wiring is P2")
+    def build_dataset(
+        self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
+    ):
+        from .dataset import DiffusionDataset
+
+        spec = self.feature_spec({})
+        encoder_kind = spec.units.params.get("kind", "contentvec")
+        return DiffusionDataset(
+            dataset_dir=dataset_dir,
+            split=split,
+            feature_hashes=feature_hashes,
+            max_frames=172,
+            augment=(split == "train"),
+            encoder_kind=encoder_kind,
+        )
+
+    def build_module(self, train_cfg):
+        from .module import DiffusionModule
+
+        return DiffusionModule(train_cfg)

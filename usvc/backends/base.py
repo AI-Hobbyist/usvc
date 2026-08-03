@@ -1,4 +1,4 @@
-"""Backend protocol (DSP-002 §2)."""
+"""Backend protocol (DSP-002 §2, extended for DSP-003 training)."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -19,5 +19,17 @@ class Backend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
+    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict):
+        """Build and return the dataset for this backend.
+
+        Args:
+            dataset_dir: preprocessed dataset root (has meta.json + features/).
+            split: 'train' | 'val'.
+            feature_hashes: {kind: hash} for locating feature files.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def build_module(self, train_cfg):
+        """Build and return the LightningModule for this backend."""
         raise NotImplementedError

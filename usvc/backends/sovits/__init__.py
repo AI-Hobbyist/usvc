@@ -62,5 +62,23 @@ class SoVitsBackend(Backend):
             units = base.units
         return FeatureSpec(mel=base.mel, spec=base.spec, f0=f0, rms=base.rms, units=units)
 
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
-        raise NotImplementedError("sovits dataset wiring is P3")
+    def build_dataset(
+        self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
+    ):
+        from .dataset import SoVITSDataset
+
+        spec = self.feature_spec({})
+        encoder_kind = spec.units.params.get("kind", "hubertsoft")
+        return SoVITSDataset(
+            dataset_dir=dataset_dir,
+            split=split,
+            feature_hashes=feature_hashes,
+            max_frames=790,
+            augment=(split == "train"),
+            encoder_kind=encoder_kind,
+        )
+
+    def build_module(self, train_cfg):
+        from .module import SoVITSModule
+
+        return SoVITSModule(train_cfg)

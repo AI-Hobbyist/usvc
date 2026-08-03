@@ -76,6 +76,24 @@ class RIFTDiTBackend(Backend):
         f0 = resolve_f0_config(train_cfg)
         return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
 
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
-        # P1: return SVCDataset(...). For now raise to signal unimplemented.
-        raise NotImplementedError("rift_dit dataset wiring is P1 (next phase)")
+    def build_dataset(
+        self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
+    ):
+        from .dataset import RIFTDataset
+
+        # Determine encoder_kind from feature spec (default contentvec_tta2x)
+        spec = self.feature_spec({})
+        encoder_kind = spec.units.params.get("kind", "contentvec_tta2x")
+        return RIFTDataset(
+            dataset_dir=dataset_dir,
+            split=split,
+            feature_hashes=feature_hashes,
+            max_frames=256,
+            augment=(split == "train"),
+            encoder_kind=encoder_kind,
+        )
+
+    def build_module(self, train_cfg):
+        from .module import RIFTModule
+
+        return RIFTModule(train_cfg)

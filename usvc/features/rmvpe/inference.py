@@ -77,7 +77,7 @@ class RMVPE:
                 audio.squeeze(0).cpu().float().numpy(),
                 orig_sr=sample_rate,
                 target_sr=SAMPLE_RATE,
-                res_type="soxr_hq",
+                res_type="soxr_lq",  # F0 is quality-insensitive; soxr_lq is ~12x faster
             )
             audio = torch.from_numpy(wav_np).to(device=device, dtype=self.dtype).unsqueeze(0)
 

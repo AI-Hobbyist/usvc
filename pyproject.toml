@@ -14,6 +14,9 @@ dependencies = [
     "local-attention>=1.11",# FCPE core mechanism (local windowed attention)
     "pyyaml>=6.0",
     "tqdm>=4.67",
+    "lightning>=2.4",        # unified training framework (all backends)
+    "schedulefree>=1.4",    # AdamWScheduleFree (rift_dit default optimizer)
+    "x-transformers>=2.0",  # RotaryEmbedding (rift_dit DiT)
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,11 @@
 """ddsp6 backend feature spec (DSP-002 §3.2).
 
-Distilled from DDSP-SVC-6.3 defaults. Same mel/f0/rms as rift_dit; units default
-to contentvec_tta2x (DDSP6.3 default), user can switch to hubertsoft.
+Distilled from DDSP-SVC-6.3 defaults (velocity_net LYNXNet2). Version-aware:
+  - version 6.1: units default to contentvec (non-tta2x, hop 320),
+    velocity_net LYNXNet, dims per 6.1 configs/reflow.yaml
+  - version 6.2: units default to contentvec_tta2x, velocity_net LYNXNet
+  - version 6.3: units default to contentvec_tta2x, velocity_net LYNXNet2
+Same mel/f0/rms as rift_dit; user can switch to hubertsoft.
 """
 from __future__ import annotations
 
@@ -45,7 +49,11 @@ class DDSP6Backend(Backend):
     def feature_spec(train_cfg: dict) -> FeatureSpec:
         base = DDSP6Backend.DEFAULT_FEATURES
         f0 = resolve_f0_config(train_cfg)
+        version = str(train_cfg.get("version", "6.3"))
         units_kind = train_cfg.get("units_kind")
+        # 6.1's default encoder is contentvec768l12 (no tta2x, hop 320).
+        if version == "6.1" and units_kind is None:
+            units_kind = "contentvec"
         if units_kind == "hubertsoft":
             units = FeatureConfig(
                 "units",
@@ -73,5 +81,23 @@ class DDSP6Backend(Backend):
             units = base.units
         return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
 
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
-        raise NotImplementedError("ddsp6 dataset wiring is P2")
+    def build_dataset(
+        self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
+    ):
+        from .dataset import DDSPDataset
+
+        spec = self.feature_spec({})
+        encoder_kind = spec.units.params.get("kind", "contentvec_tta2x")
+        return DDSPDataset(
+            dataset_dir=dataset_dir,
+            split=split,
+            feature_hashes=feature_hashes,
+            max_frames=172,
+            augment=(split == "train"),
+            encoder_kind=encoder_kind,
+        )
+
+    def build_module(self, train_cfg):
+        from .module import DDSPModule
+
+        return DDSPModule(train_cfg)

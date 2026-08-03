@@ -65,5 +65,23 @@ class RVCBackend(Backend):
             )
         return base
 
-    def build_dataset(self, dataset_dir: str, split: str, feature_hashes: dict[str, str]):
-        raise NotImplementedError("rvc dataset wiring is P3")
+    def build_dataset(
+        self, dataset_dir: str, split: str, feature_hashes: dict[str, str]
+    ):
+        from .dataset import RVCDataset
+
+        spec = self.feature_spec({})
+        encoder_kind = spec.units.params.get("kind", "contentvec")
+        return RVCDataset(
+            dataset_dir=dataset_dir,
+            split=split,
+            feature_hashes=feature_hashes,
+            max_frames=790,
+            augment=(split == "train"),
+            encoder_kind=encoder_kind,
+        )
+
+    def build_module(self, train_cfg):
+        from .module import RVCModule
+
+        return RVCModule(train_cfg)
