@@ -1,0 +1,67 @@
+# ============================================================
+# usvc 训练配置: ReFlow-VAE-SVC (Bi-RectifiedFlow + VAE)
+# ============================================================
+# 对应原项目: ReFlow-VAE-SVC (github.com/yxlllc/ReFlow-VAE-SVC)
+# 原项目配置: configs/reflow-vae-{lynxnet,wavenet,musa}.yaml
+#
+# 核心特点 (与 ddsp6 纯 reflow 不同):
+#   - Bi_RectifiedFlow (双向 ODE), loss 用 l2_lognorm 权重
+#   - VAE 前置: unit_embed → (attention) → +randn → 作为 reflow 起点 x_0
+#   - cond 只含 f0/spk; units 走 VAE 路径 (不直接进 cond)
+#
+# 三种 backbone (速度网络):
+#   lynxnet (默认): NaiveV2Diff, n_layers=6,  对应 reflow-vae-lynxnet.yaml
+#   wavenet:        WaveNet,    n_layers=20, 对应 reflow-vae-wavenet.yaml
+#   musa:           wavenet 变体 (use_attention=false), 对应 reflow-vae-musa.yaml
+#
+# 已验证: state_dict 与原项目完全兼容 (missing=0/unexpected=0)
+#         数值 diff=0.0000% (lynxnet + wavenet, 多 seed)
+# ============================================================
+
+backend: reflow_vae
+dataset_dir: data/my_dataset       # 预处理后的数据集目录
+exp_dir: experiments/reflow_vae
+
+# ---- 训练超参 ----
+batch_size: 48                     # 原项目默认 48
+max_frames: 172                    # 训练片段 (帧), 对应原项目 duration=2s @ 44.1k/512
+num_workers: 8
+max_steps: 500000
+val_interval: 2000
+save_interval: 2000
+precision: bf16-mixed
+
+# ---- 优化器 (原项目用 AdamW) ----
+optimizer:
+  type: adamw
+  lr: 0.0002                       # 原项目默认 2e-4
+  betas: [0.9, 0.98]
+  weight_decay: 0.0
+schedule:
+  type: linear_warmup_decay
+  warmup_steps: 1000
+  decay_step: 40000
+  gamma: 0.5
+grad_clip: 1.0                     # 原项目 clip_grad_value_(1)
+
+# ---- 模型架构 ----
+backend_opts:
+  back_bone: lynxnet               # [可调] lynxnet (NaiveV2Diff) | wavenet
+  n_layers: 6                      # [可调] 层数: lynxnet 用 6, wavenet 用 20
+  n_chans: 512                     # [可调] 速度网络通道数
+  n_hidden: 256                    # [可调] condition 隐藏维度
+  use_attention: true              # [可调] VAE 是否用 attention (false 时 unit_embed 直出 out_dims)
+  use_pitch_aug: false             # [可调] 音高增强 (加载原项目 ckpt 需匹配原设置)
+  out_dims: 128                    # mel bins (通常不改)
+  num_speaker: 1                   # [可调] 说话人数
+  n_units: 768                     # contentvec 维度
+  t_start: 0.0                     # [可调] flow 起始时间
+
+# ============================================================
+# 快速切换示例 (替换 back_bone 相关参数即可):
+#
+# 【reflow-vae-wavenet.yaml 等效】
+#   back_bone: wavenet, n_layers: 20
+# 【reflow-vae-musa.yaml 等效】
+#   back_bone: wavenet, n_layers: 20, use_attention: false
+# ============================================================

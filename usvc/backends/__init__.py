@@ -15,6 +15,7 @@ def get_backend(name: str):
         "diffusion": "usvc.backends.diffusion:DiffusionBackend",
         "sovits": "usvc.backends.sovits:SoVitsBackend",
         "rvc": "usvc.backends.rvc:RVCBackend",
+        "reflow_vae": "usvc.backends.reflow_vae:ReflowVAEBackend",
     }
     if name not in registry:
         raise ValueError(f"Unknown backend: {name}. Available: {list(registry)}")
@@ -25,4 +26,4 @@ def get_backend(name: str):
     return getattr(mod, cls_name)
 
 
-BACKENDS = ["rift_dit", "ddsp6", "diffusion", "sovits", "rvc"]
+BACKENDS = ["rift_dit", "ddsp6", "diffusion", "sovits", "rvc", "reflow_vae"]
