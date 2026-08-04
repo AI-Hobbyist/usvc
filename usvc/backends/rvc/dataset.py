@@ -82,11 +82,50 @@ class RVCDataset(BaseSVCDataset):
         pitch_token = self._f0_to_coarse(f0)
 
         T = units.shape[0]
+        # Fixed-length random crop for consistent batching: long audio crops to
+        # max_frames (random offset), short audio pads. RVC segment_size must fit.
+        mf = self.max_frames
+        if T > mf:
+            start = int(torch.randint(0, T - mf + 1, (1,)).item())
+            units = units[start : start + mf]
+            pitch_token = pitch_token[start : start + mf]
+            pitchf = pitchf[start : start + mf]
+            if spec is not None:
+                if spec.ndim == 3:
+                    spec = spec[0]
+                spec = spec[start : start + mf]
+            T = mf
+        elif T < mf:
+            pad_n = mf - T
+            units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
+            pitch_token = torch.nn.functional.pad(pitch_token, (0, pad_n))
+            pitchf = torch.nn.functional.pad(pitchf, (0, pad_n))
+            if spec is not None:
+                if spec.ndim == 3:
+                    spec = spec[0]
+                spec = torch.nn.functional.pad(spec, (0, 0, 0, pad_n))
+            T = mf
+        else:
+            if spec is not None and spec.ndim == 3:
+                spec = spec[0]
         units = units[:T]
         pitch_token = pitch_token[:T]
         pitchf = pitchf[:T]
         if spec is not None:
-            spec = spec[:, :T] if spec.ndim == 2 else spec[:T]
+            # crop frames, then flip to [spec_channels, T] so svc_collate
+            # (pad dim 0) yields [B, spec_channels, T] as models expect.
+            spec = spec[:T]
+            spec = spec.transpose(0, 1)
+        # Align wav to frame_len * hop (frame count may exceed
+        # wav samples by one frame due to len//hop + 1 convention).
+        # GAN wave slicing uses ids_slice*hop + segment <= T*hop.
+        if wav is not None:
+            hop = self.meta.hop
+            target_len = T * hop
+            if wav.shape[0] > target_len:
+                wav = wav[:target_len]
+            elif wav.shape[0] < target_len:
+                wav = torch.nn.functional.pad(wav, (0, target_len - wav.shape[0]))
 
         return {
             "units": units,

@@ -178,7 +178,14 @@ class InferenceEngine:
         cluster_ratio: float = 0.0,
         steps: int | None = None,
     ) -> np.ndarray:
-        """Convert a wav file; returns float32 wav at the backend sample rate."""
+        """Convert a wav file; returns float32 wav at the backend sample rate.
+
+        Long audio is split at silence boundaries to bound GPU memory and
+        avoid artifacts at chunk edges. Silence is detected via RMS energy;
+        chunks are inferred independently and concatenated. If a speech
+        segment exceeds the max chunk size, it is force-split at the lowest-
+        energy frame with a short crossfade.
+        """
         feats = self.features.extract(input_wav)
         units = feats["units"].to(self.device)  # [T, dim]
         f0 = feats["f0"].to(self.device)  # [T]
@@ -200,6 +207,123 @@ class InferenceEngine:
             units, index_path, index_ratio, cluster_path, cluster_ratio
         )
 
+        T = units.shape[0]
+        # Max chunk size by backend: GAN backends (rvc/sovits) allocate O(T) wav
+        # via NSF vocoder, so cap smaller. Flow backends (mel-domain) can go larger.
+        max_chunk_sec = 30
+        if self.backend_name in ("rvc", "sovits"):
+            max_chunk_sec = 20
+        max_chunk_frames = max_chunk_sec * self.sr // self.hop
+
+        if T <= max_chunk_frames:
+            return self._run_model(units, f0, rms, uv, spk).astype(np.float32)
+
+        # Silence-aware segmentation: split at silence boundaries.
+        boundaries = self._find_silence_boundaries(
+            rms, T, max_chunk_frames, crossfade_frames=2 * self.sr // self.hop
+        )
+
+        chunk_outputs = []
+        for start, end in boundaries:
+            chunk_units = units[start:end]
+            chunk_f0 = f0[start:end]
+            chunk_rms = rms[start:end] if rms is not None else None
+            chunk_uv = uv[start:end]
+            wav_chunk = self._run_model(chunk_units, chunk_f0, chunk_rms, chunk_uv, spk)
+            chunk_outputs.append(wav_chunk)
+
+        return self._stitch_chunks(boundaries, chunk_outputs)
+
+    def _find_silence_boundaries(
+        self,
+        rms: torch.Tensor | None,
+        T: int,
+        max_chunk_frames: int,
+        crossfade_frames: int,
+    ) -> list[tuple[int, int]]:
+        """Find [start, end) frame boundaries that split audio at silence.
+
+        Strategy:
+        1. If RMS available, find silence frames (energy below adaptive threshold).
+        2. Greedily accumulate segments up to max_chunk_frames.
+        3. When a segment would exceed max, prefer cutting at the nearest
+           silence frame before the limit; if none, force-cut at the lowest-
+           energy frame in the last 1s (these force-cuts use crossfade).
+
+        Returns list of (start, end) covering [0, T) with small overlaps at
+        force-cut boundaries (silence cuts have zero overlap).
+        """
+        min_silence_frames = int(0.15 * self.sr / self.hop)  # 150ms = silence
+        # Adaptive silence threshold: 10% of the 30th percentile RMS (robust
+        # to a few loud peaks). Falls back to absolute -40dB if all loud.
+        if rms is not None and T > 0:
+            rms_np = rms.float().cpu().numpy()
+            p30 = float(np.percentile(rms_np, 30))
+            silence_thresh = max(p30 * 0.10, 1e-4)
+            is_silence = rms_np < silence_thresh
+        else:
+            is_silence = np.zeros(T, dtype=bool)
+
+        # Mark valid silence-cut centers: frames in runs of silence >= min length.
+        silence_centers = np.zeros(T, dtype=bool)
+        if is_silence.any():
+            # Find runs of consecutive silence.
+            idx = 0
+            while idx < T:
+                if is_silence[idx]:
+                    run_start = idx
+                    while idx < T and is_silence[idx]:
+                        idx += 1
+                    run_len = idx - run_start
+                    if run_len >= min_silence_frames:
+                        # Mark the center frame of this silence run as a cut point.
+                        center = run_start + run_len // 2
+                        silence_centers[center] = True
+                else:
+                    idx += 1
+
+        boundaries: list[tuple[int, int]] = []
+        start = 0
+        while start < T:
+            ideal_end = start + max_chunk_frames
+            if ideal_end >= T:
+                boundaries.append((start, T))
+                break
+            # Look for a silence center in [start + 0.5*max, ideal_end].
+            search_lo = start + max_chunk_frames // 2
+            search_hi = ideal_end
+            silence_in_window = np.where(silence_centers[search_lo:search_hi])[0]
+            if len(silence_in_window) > 0:
+                # Pick the silence center closest to ideal_end (largest segment
+                # without exceeding max).
+                cut = search_lo + int(silence_in_window[-1]) + 1
+                boundaries.append((start, cut))
+                start = cut  # no overlap at silence cuts
+            else:
+                # No silence: force-cut at lowest-energy frame near the end.
+                # Use a 1s window before ideal_end to find the quietest point.
+                win = max(1 * self.sr // self.hop, crossfade_frames)
+                lo = max(start, ideal_end - win)
+                if rms is not None:
+                    seg_rms = rms[lo:ideal_end].float().cpu().numpy()
+                    rel = int(np.argmin(seg_rms))
+                    cut = lo + rel
+                else:
+                    cut = ideal_end - crossfade_frames
+                boundaries.append((start, cut))
+                start = cut - crossfade_frames  # overlap for crossfade
+
+        return boundaries
+
+    def _run_model(
+        self,
+        units: torch.Tensor,
+        f0: torch.Tensor,
+        rms: torch.Tensor | None,
+        uv: torch.Tensor,
+        spk: int,
+    ) -> np.ndarray:
+        """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
         spk_id = torch.zeros(1, dtype=torch.long, device=self.device) + spk
         frame_len = torch.tensor([T], device=self.device, dtype=torch.long)
@@ -251,6 +375,40 @@ class InferenceEngine:
             raise ValueError(self.backend_name)
 
         return wav[0, 0].float().cpu().numpy()
+
+    def _stitch_chunks(
+        self,
+        boundaries: list[tuple[int, int]],
+        chunks: list[np.ndarray],
+    ) -> np.ndarray:
+        """Stitch wav chunks according to their frame boundaries.
+
+        Adjacent boundaries either abut (silence cut: prev_end == next_start,
+        concatenate directly) or overlap (force cut: prev_end > next_start by
+        crossfade_frames, apply linear crossfade on the wav-domain overlap).
+        """
+        crossfade_samples = (2 * self.sr // self.hop) * self.hop
+        out = chunks[0].copy()
+        for i in range(1, len(chunks)):
+            cur = chunks[i]
+            prev_end = boundaries[i - 1][1]
+            cur_start = boundaries[i][0]
+            if cur_start >= prev_end:
+                # Abutting (silence cut): direct concatenation.
+                out = np.concatenate([out, cur])
+            else:
+                # Overlapping (force cut): linear crossfade.
+                overlap_frames = prev_end - cur_start
+                overlap = min(overlap_frames * self.hop, len(out), len(cur))
+                if overlap <= 0:
+                    out = np.concatenate([out, cur])
+                else:
+                    ramp = np.linspace(0, 1, overlap, dtype=np.float32)
+                    tail = out[-overlap:] * (1 - ramp)
+                    head = cur[:overlap] * ramp
+                    out[-overlap:] = tail + head
+                    out = np.concatenate([out, cur[overlap:]])
+        return out.astype(np.float32)
 
     def convert_file(self, input_wav: str | Path, output_wav: str | Path, **kwargs) -> None:
         """Convert and write the result to a wav file."""

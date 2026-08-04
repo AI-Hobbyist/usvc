@@ -27,16 +27,17 @@ def build_optimizer(
     opt_cfg: OptimizerConfig,
     sched_cfg: ScheduleConfig | None = None,
     max_steps: int | None = None,
-) -> Optimizer | tuple[Optimizer, LRScheduler | None]:
+):
     """Build optimizer (and optional scheduler).
 
-    Returns optimizer alone if sched_cfg is None or sched_cfg.type is None,
-    else returns (optimizer, scheduler).
+    Returns the optimizer alone when sched_cfg is None/type None; otherwise
+    returns a Lightning-compatible dict ``{"optimizer": opt, "lr_scheduler":
+    sched}`` (Lightning 2.4+ rejects the bare ``(opt, sched)`` tuple).
     """
     opt = _build_single(params, opt_cfg)
     sched = _build_scheduler(opt, sched_cfg, max_steps)
     if sched is not None:
-        return opt, sched
+        return {"optimizer": opt, "lr_scheduler": sched}
     return opt
 
 

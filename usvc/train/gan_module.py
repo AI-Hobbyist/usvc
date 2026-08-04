@@ -57,7 +57,10 @@ class BaseGANModule(LightningModule):
         opt_d.zero_grad()
         self.manual_backward(loss_d)
         if self.cfg.grad_clip is not None:
-            self.clip_gradients(opt_d, gradient_clip_val=self.cfg.grad_clip)
+            # Lightning's clip_gradients is incompatible with AMP + fused
+            # optimizers (plugin unscales internally); use torch-native clip.
+            for group in opt_d.param_groups:
+                torch.nn.utils.clip_grad_norm_(group["params"], self.cfg.grad_clip)
         opt_d.step()
 
         # --- Generator step (D fwd#2 on wave_gen with grad, reuses `out`) ---
@@ -66,7 +69,8 @@ class BaseGANModule(LightningModule):
         opt_g.zero_grad()
         self.manual_backward(loss_g)
         if self.cfg.grad_clip is not None:
-            self.clip_gradients(opt_g, gradient_clip_val=self.cfg.grad_clip)
+            for group in opt_g.param_groups:
+                torch.nn.utils.clip_grad_norm_(group["params"], self.cfg.grad_clip)
         opt_g.step()
 
         bs = self._bs(batch)

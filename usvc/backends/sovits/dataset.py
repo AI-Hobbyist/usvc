@@ -84,12 +84,55 @@ class SoVITSDataset(BaseSVCDataset):
         # uv from f0
         uv = (f0 > 0).float()
 
-        # Align frame-level features
+        # Align frame-level features; apply fixed-length crop/pad to spec so
+        # batching is consistent. NOTE: spec is [T, C] here (frames first);
+        # after transpose it becomes [C, T] and the base-class _crop() can no
+        # longer align it with units (shape[0] != T), so crop before transpose.
+        mf = self.max_frames
         T = units.shape[0]
+        if T > mf:
+            start = int(torch.randint(0, T - mf + 1, (1,), generator=self._rng).item())
+            units = units[start : start + mf]
+            f0 = f0[start : start + mf]
+            uv = uv[start : start + mf]
+            if spec is not None:
+                if spec.ndim == 3:
+                    spec = spec[0]
+                spec = spec[start : start + mf]
+            T = mf
+        elif T < mf:
+            pad_n = mf - T
+            units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
+            f0 = torch.nn.functional.pad(f0, (0, pad_n))
+            uv = torch.nn.functional.pad(uv, (0, pad_n))
+            if spec is not None:
+                if spec.ndim == 3:
+                    spec = spec[0]
+                spec = torch.nn.functional.pad(spec, (0, 0, 0, pad_n))
+            T = mf
+        else:
+            if spec is not None and spec.ndim == 3:
+                spec = spec[0]
         f0 = f0[:T]
         uv = uv[:T]
+        # Align wav to T*hop (frame count may exceed wav samples by one
+        # frame due to len//hop + 1 convention); GAN wave slicing needs
+        # ids_slice*hop + segment <= T*hop.
+        if wav is not None:
+            hop = self.meta.hop
+            target_len = T * hop
+            if wav.shape[0] > target_len:
+                wav = wav[:target_len]
+            elif wav.shape[0] < target_len:
+                wav = torch.nn.functional.pad(wav, (0, target_len - wav.shape[0]))
         if spec is not None:
-            spec = spec[:, :T] if spec.ndim == 2 else spec[:T]
+            # preprocessed spec is [T, spec_channels] (frames first);
+            # crop frames, then flip to [spec_channels, T] so svc_collate
+            # (pad dim 0) yields [B, spec_channels, T] as models expect.
+            if spec.ndim == 3:
+                spec = spec[0]
+            spec = spec[:T]
+            spec = spec.transpose(0, 1)
 
         return {
             "units": units,

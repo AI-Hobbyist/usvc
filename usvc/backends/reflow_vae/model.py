@@ -832,9 +832,9 @@ class Unit2Wav_VAE(nn.Module):
             if spk_mix_dict is not None:
                 for k, v in spk_mix_dict.items():
                     spk_id_torch = torch.LongTensor(np.array([[k]])).to(units.device)
-                    cond = cond + v * self.spk_embed(spk_id_torch - 1)
+                    cond = cond + v * self.spk_embed(spk_id_torch)
             else:
-                cond = cond + self.spk_embed(spk_id - 1)
+                cond = cond + self.spk_embed(spk_id)
         if self.aug_shift_embed is not None and aug_shift is not None:
             cond = cond + self.aug_shift_embed(aug_shift / 5)
 
@@ -875,9 +875,9 @@ class ReflowVAEModel(Unit2Wav_VAE):
         self.t_start = t_start
 
     def _fit_dims(self, f0, volume, spk_id):
-        """Normalize usvc SVCBatch shapes to the original project's convention
-        (f0/volume [B, T, 1], spk_id [B, 1], 1-based indexing as in the original
-        data loader)."""
+        """Normalize usvc SVCBatch shapes to the model's convention
+        (f0/volume [B, T, 1], spk_id [B, 1], 0-based indexing as in usvc
+        datasets)."""
         if f0 is not None and f0.dim() == 2:
             f0 = f0.unsqueeze(-1)
         if volume is not None and volume.dim() == 2:
@@ -894,8 +894,8 @@ class ReflowVAEModel(Unit2Wav_VAE):
             units:   [B, T, n_unit] content features.
             f0:      [B, T] or [B, T, 1] fundamental frequency (Hz).
             volume:  [B, T] or [B, T, 1] volume (rms).
-            spk_id:  [B] or [B, 1] speaker ids (original project convention:
-                     spk_embed indexes spk_id - 1).
+            spk_id:  [B] or [B, 1] speaker ids (usvc convention: 0-based,
+                     spk_embed indexes spk_id directly).
             gt_spec: [B, T, out_dims] target mel (raw, un-normalized).
             aug_shift: [B, 1] or None pitch augmentation shift (semitones).
             frame_len: ignored (kept for usvc SVCBatch interface parity).

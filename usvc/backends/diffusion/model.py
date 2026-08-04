@@ -584,13 +584,13 @@ class DiffusionModel(nn.Module):
 
         x = self.unit_embed(units) + self.f0_embed((1 + f0 / 700).log()) + self.volume_embed(volume)
         if self.spk_embed is not None and spk_id is not None:
-            # original Diffusion-SVC convention: 1-based speaker ids.
+            # usvc convention: 0-based speaker ids (dataset spk2idx).
             # spk_id is [B] (usvc SVCBatch); unsqueeze to [B, 1] so the
             # embedding broadcasts against x [B, T, n_hidden] correctly
             # regardless of T (embedding([B]) -> [B, H] would only align
             # when T == B by accident).
             spk = spk_id if spk_id.dim() > 1 else spk_id.unsqueeze(1)
-            x = x + self.spk_embed(spk - 1)
+            x = x + self.spk_embed(spk)
         if self.aug_shift_embed is not None and aug_shift is not None:
             x = x + self.aug_shift_embed(aug_shift / 5)
         return x

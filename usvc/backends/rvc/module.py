@@ -125,7 +125,7 @@ class RVCModule(BaseGANModule):
         # Slice real wave
         ids_slice = out["ids_slice"]
         segment = wave_gen.shape[-1]
-        hop = self.cfg.backend_opts.get("hop", 512)
+        hop = self.cfg.backend_opts.get("hop_length", 480)
 
         if wave.dim() == 2:
             wave_real = wave.unsqueeze(1)
@@ -193,7 +193,7 @@ class RVCModule(BaseGANModule):
         wave = batch.wav
         ids_slice = out["ids_slice"]
         segment = wave_gen.shape[-1]
-        hop = self.cfg.backend_opts.get("hop", 512)
+        hop = self.cfg.backend_opts.get("hop_length", 480)
 
         if wave.dim() == 2:
             wave_real = wave.unsqueeze(1)

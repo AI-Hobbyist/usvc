@@ -117,6 +117,18 @@ class BaseSVCModule(LightningModule):
         )
         return result
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm):
+        """Gradient clipping with torch-native clip_grad_norm_.
+
+        Lightning's automatic clipping is incompatible with AMP + fused
+        AdamW (the precision plugin unscales gradients internally, which the
+        fused kernel does itself). Use torch-native clipping instead.
+        """
+        if gradient_clip_val is None:
+            return
+        for group in optimizer.param_groups:
+            torch.nn.utils.clip_grad_norm_(group["params"], gradient_clip_val)
+
     # ---- Subclass hooks ----
 
     def forward_loss(self, batch: SVCBatch) -> tuple[torch.Tensor, dict[str, float]]:
