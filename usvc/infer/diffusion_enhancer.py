@@ -1,0 +1,196 @@
+"""Shallow diffusion enhancer for sovits (so-vits-svc ``-shd`` 浅扩散).
+
+数据流 (与 so-vits-svc 4.1 inference/infer_tool.py 一致):
+    sovits wav ──MelExtractor──▶ gt_spec (log-dB 域 mel)
+    gt_spec + units/f0/rms/spk ──DiffusionModel.sample(k_step)──▶ 去噪后 mel
+    去噪后 mel + f0 ──NSF-HiFiGAN──▶ 最终 wav
+
+关键点:
+  - DiffusionModel.sample(gt_spec=, k_step=) 内部做 q_sample 部分加噪到
+    k_step-1 再反向采样, 输出 denormalized (dB 域) mel [B, T, M]。
+  - mel 帧数与 units 帧数对齐 (sovits 输出 wav 长度 = T * hop)。
+  - 扩散采样保持 fp32 (数值敏感, 与 diffusion 后端推理一致)。
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+
+from ..backends.diffusion.model import DiffusionModel
+from ..data.feature_config import FeatureConfig
+from ..features.mel import MelExtractor
+from ..nn.vocoder import NSFHiFiGAN
+
+__all__ = ["DiffusionEnhancer"]
+
+
+def _load_ckpt_state(ckpt_path: str) -> dict:
+    """Load state dict from a torch ckpt (lightning or bare)."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict):
+        # lightning: {"state_dict": {...}, ...}; so-vits diffusion: {"model": {...}}
+        sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+    else:
+        sd = ckpt
+    if not isinstance(sd, dict):
+        raise RuntimeError(f"cannot interpret checkpoint: {ckpt_path}")
+    return sd
+
+
+class DiffusionEnhancer:
+    """Shallow diffusion enhancer for sovits.
+
+    Loads an independent diffusion checkpoint + NSF-HiFiGAN vocoder.
+    Given sovits output wav, extracts mel, runs k-step diffusion denoising,
+    and resynthesizes via the diffusion vocoder.
+    """
+
+    def __init__(
+        self,
+        diffusion_ckpt: str | Path,
+        diffusion_config: str | Path,
+        vocoder_dir: str | Path,
+        device: str = "cuda",
+        half: bool = False,
+        sr: int = 44100,
+        hop: int = 512,
+    ) -> None:
+        self.device = device
+        self.sr = sr
+        self.hop = hop
+
+        with open(diffusion_config) as f:
+            cfg = yaml.safe_load(f) or {}
+        mel_cfg = cfg.get("mel") or {}
+
+        # ---- 扩散模型 (与 usvc diffusion 后端同构) ----
+        self.diffusion_model = DiffusionModel(
+            n_units=int(cfg.get("n_units", 768)),
+            n_spk=int(cfg.get("n_spk", 1)),
+            out_dims=int(cfg.get("out_dims", 128)),
+            n_hidden=int(cfg.get("n_hidden", 256)),
+            use_pitch_aug=bool(cfg.get("use_pitch_aug", False)),
+            timesteps=int(cfg.get("timesteps", 1000)),
+            max_beta=float(cfg.get("max_beta", 0.02)),
+            spec_min=float(cfg.get("spec_min", -12)),
+            spec_max=float(cfg.get("spec_max", 2)),
+            cn_layers=int(cfg.get("cn_layers", 20)),
+            cn_chans=int(cfg.get("cn_chans", 384)),
+            mlp_factor=int(cfg.get("mlp_factor", 4)),
+            gradient_checkpointing=False,
+            k_step=int(cfg.get("k_step", 1000)),
+            denoiser=str(cfg.get("denoiser", "convnext")),
+            wn_layers=int(cfg.get("wn_layers", 20)),
+            wn_chans=int(cfg.get("wn_chans", 384)),
+        )
+        self._load_diffusion_weights(diffusion_ckpt)
+        self.diffusion_model.eval()
+        self.diffusion_model.to(device)
+        # 扩散采样保持 fp32 (DDPM/PLMS 迭代数值敏感, half 易 NaN)
+
+        # ---- mel 提取 (必须与扩散训练时的 mel 参数一致) ----
+        self.mel_extractor = MelExtractor(
+            FeatureConfig(
+                "mel",
+                {
+                    "n_fft": int(mel_cfg.get("n_fft", 2048)),
+                    "win_length": int(mel_cfg.get("win_length", 2048)),
+                    "n_mels": int(mel_cfg.get("n_mels", cfg.get("out_dims", 128))),
+                    "fmin": float(mel_cfg.get("fmin", 40.0)),
+                    "fmax": None if mel_cfg.get("fmax") is None else float(mel_cfg["fmax"]),
+                    "center": bool(mel_cfg.get("center", False)),
+                },
+            ),
+            sr=int(mel_cfg.get("sampling_rate", sr)),
+            hop=int(mel_cfg.get("hop", hop)),
+        ).to(device)
+
+        # ---- 声码器 (fp32, 数值安全) ----
+        vocoder_dir = Path(vocoder_dir)
+        self.vocoder = NSFHiFiGAN(
+            vocoder_dir / "config.json",
+            vocoder_dir / "model.ckpt",
+            device=device,
+            is_half=False,  # 浅扩散全程 fp32 (采样数值敏感)
+        )
+
+    def _load_diffusion_weights(self, ckpt_path: str | Path) -> None:
+        """Load diffusion state dict, stripping ``model.``/``module.`` prefixes."""
+        sd = _load_ckpt_state(str(ckpt_path))
+        if all(k.startswith("model.") for k in sd):
+            sd = {k[len("model."):]: v for k, v in sd.items()}
+        elif all(k.startswith("module.") for k in sd):
+            sd = {k[len("module."):]: v for k, v in sd.items()}
+        missing, unexpected = self.diffusion_model.load_state_dict(sd, strict=False)
+        # strict=False: 容忍非持久 buffer (sqrt_alphas_cumprod 等) 缺失;
+        # unexpected 只允许优化器/调度器残留。
+        if unexpected:
+            tolerable = [k for k in unexpected if k.startswith(("optimizer", "scheduler", "trainer", "callbacks", "hyper_parameters"))]
+            bad = [k for k in unexpected if k not in tolerable]
+            if bad:
+                raise RuntimeError(
+                    f"diffusion checkpoint keys don't match model: {bad[:8]}"
+                )
+        if missing:
+            # 非持久 buffer 会缺失, 其余才是真缺
+            real_missing = [k for k in missing if not k.startswith(
+                ("sqrt_alphas_cumprod", "sqrt_one_minus_alphas_cumprod")
+            )]
+            if real_missing:
+                raise RuntimeError(f"diffusion checkpoint missing keys: {real_missing[:8]}")
+
+    @torch.no_grad()
+    def enhance(
+        self,
+        units: torch.Tensor,
+        f0: torch.Tensor,
+        rms: torch.Tensor | None,
+        spk_id: int,
+        sovits_wav: torch.Tensor | np.ndarray,
+        k_step: int = 100,
+        infer_speedup: int = 10,
+        method: str = "ddim",
+    ) -> np.ndarray:
+        """sovits_wav [L] float32 (target sr) → enhanced_wav [L] float32.
+
+        Args:
+            units: [T, D] content features (device tensor, any dtype).
+            f0: [T] continuous f0 (Hz, pitch-shifted already).
+            rms: [T] volume or None (fallback computed from mel).
+            spk_id: 0-based speaker id (usvc convention).
+            sovits_wav: sovits 输出的 wav (长度为 T * hop)。
+        """
+        T = units.shape[0]
+
+        # 1) sovits 输出 wav → gt_spec (log-dB 域, 与扩散训练一致)
+        mel = self.mel_extractor.extract(sovits_wav)  # [T', M] float32 cpu
+        mel = mel[:T]
+        if mel.shape[0] < T:
+            mel = torch.nn.functional.pad(mel, (0, 0, 0, T - mel.shape[0]))
+        mel = mel.unsqueeze(0).to(self.device)  # [1, T, M]
+
+        # 2) 条件特征 (fp32)
+        units_b = units.float().unsqueeze(0).to(self.device)  # [1, T, D]
+        f0_b = f0.float().unsqueeze(0).to(self.device)        # [1, T]
+        if rms is not None:
+            vol_b = rms.float().unsqueeze(0).to(self.device)  # [1, T]
+        else:
+            # fallback: 从 mel 能量估计 volume (与 diffusion/module.py 一致)
+            vol_b = (mel.exp() - 1e-6).clamp(min=1e-6).sqrt().mean(dim=-1)
+        spk_b = torch.tensor([spk_id], dtype=torch.long, device=self.device)
+
+        # 3) 浅扩散: gt_spec 部分加噪到 k_step-1, 反向采样去噪
+        denoised = self.diffusion_model.sample(
+            units_b, f0_b, vol_b, spk_b,
+            gt_spec=mel,
+            k_step=k_step,
+            infer_speedup=infer_speedup,
+            method=method,
+        )  # [1, T, M] denormalized dB
+
+        # 4) 去噪 mel + f0 → 声码器合成
+        wav = self.vocoder.infer(denoised.float(), f0_b)
+        return wav[0, 0].float().cpu().numpy()

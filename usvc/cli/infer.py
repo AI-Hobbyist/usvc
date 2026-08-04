@@ -35,6 +35,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-ratio", type=float, default=0.0, help="retrieval blend ratio (0-1)")
     p.add_argument("--cluster-path", default=None, help="cluster model .pt (so-vits style)")
     p.add_argument("--cluster-ratio", type=float, default=0.0, help="cluster blend ratio (0-1)")
+    # 浅扩散 (so-vits -shd)
+    p.add_argument("--shd", "--shallow-diffusion", dest="shallow_diffusion",
+                   action="store_true", default=False,
+                   help="sovits shallow diffusion: enhance via an independent "
+                        "diffusion model (需要 --diffusion-ckpt/--diffusion-config)")
+    p.add_argument("--diffusion-ckpt", default=None, help="diffusion model checkpoint")
+    p.add_argument("--diffusion-config", default=None, help="diffusion model config yaml")
+    p.add_argument("--k-step", type=int, default=100, help="shallow diffusion steps (default 100)")
+    p.add_argument("--diffusion-method", default="ddim",
+                   help="sampling method: ddim|ddpm|plms (default ddim)")
+    p.add_argument("--diffusion-speedup", type=int, default=10,
+                   help="sampling speedup (default 10)")
     args = p.parse_args(argv)
 
     from ..infer.engine import InferenceEngine
@@ -42,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     engine = InferenceEngine(
         args.config, args.ckpt, vocoder_dir=args.vocoder_dir,
         device=args.device, half=args.half,
+        diffusion_ckpt=args.diffusion_ckpt,
+        diffusion_config=args.diffusion_config,
     )
 
     output = args.output
@@ -59,6 +73,10 @@ def main(argv: list[str] | None = None) -> int:
         cluster_path=args.cluster_path,
         cluster_ratio=args.cluster_ratio,
         steps=args.steps,
+        shallow_diffusion=args.shallow_diffusion,
+        k_step=args.k_step,
+        diffusion_method=args.diffusion_method,
+        diffusion_speedup=args.diffusion_speedup,
     )
     print(f"[usvc-infer] {args.input} -> {output} "
           f"(backend={engine.backend_name}, sr={engine.sr}, half={args.half})")

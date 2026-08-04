@@ -21,6 +21,7 @@ from ..nn.vocoder import NSFHiFiGAN
 from ..retrieval.predict import apply_cluster, retrieve
 from ..train.config import TrainConfig
 from ..train.dataset import SVCBatch
+from .diffusion_enhancer import DiffusionEnhancer
 from .features import InferFeatures
 
 # mel-domain backends use the shared NSF-HiFiGAN vocoder
@@ -60,6 +61,8 @@ class InferenceEngine:
         vocoder_dir: str | Path | None = None,
         device: str = "cuda",
         half: bool = False,
+        diffusion_ckpt: str | Path | None = None,
+        diffusion_config: str | Path | None = None,
     ) -> None:
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
@@ -110,6 +113,27 @@ class InferenceEngine:
                 vocoder_dir / "model.ckpt",
                 device=device,
                 is_half=self.module_half,
+            )
+
+        # Shallow-diffusion enhancer (optional; sovits only). Loaded when
+        # diffusion_ckpt is provided; used when convert(shallow_diffusion=True).
+        self.diffusion_enhancer = None
+        if diffusion_ckpt is not None or diffusion_config is not None:
+            if self.backend_name != "sovits":
+                raise ValueError(
+                    "shallow diffusion (diffusion_ckpt) is only supported for the "
+                    f"sovits backend, got backend={self.backend_name}"
+                )
+            if diffusion_ckpt is None or diffusion_config is None:
+                raise ValueError(
+                    "shallow diffusion requires both diffusion_ckpt and "
+                    "diffusion_config"
+                )
+            if vocoder_dir is None:
+                vocoder_dir = Path(__file__).resolve().parents[2] / "pretrained" / "nsf_hifigan"
+            self.diffusion_enhancer = DiffusionEnhancer(
+                diffusion_ckpt, diffusion_config, vocoder_dir,
+                device=device, half=half, sr=self.sr, hop=self.hop,
             )
 
     def _load_weights(self, module) -> None:
@@ -177,6 +201,10 @@ class InferenceEngine:
         cluster_path: str | Path | None = None,
         cluster_ratio: float = 0.0,
         steps: int | None = None,
+        shallow_diffusion: bool = False,
+        k_step: int = 100,
+        diffusion_method: str = "ddim",
+        diffusion_speedup: int = 10,
     ) -> np.ndarray:
         """Convert a wav file; returns float32 wav at the backend sample rate.
 
@@ -185,7 +213,15 @@ class InferenceEngine:
         chunks are inferred independently and concatenated. If a speech
         segment exceeds the max chunk size, it is force-split at the lowest-
         energy frame with a short crossfade.
+
+        shallow_diffusion: sovits only — enhance each chunk's wav via the
+        loaded DiffusionEnhancer (k-step partial denoising + re-synthesis).
         """
+        if shallow_diffusion and self.diffusion_enhancer is None:
+            raise ValueError(
+                "shallow_diffusion=True requires diffusion_ckpt + diffusion_config "
+                "at engine construction (sovits backend)"
+            )
         feats = self.features.extract(input_wav)
         units = feats["units"].to(self.device)  # [T, dim]
         f0 = feats["f0"].to(self.device)  # [T]
@@ -216,7 +252,12 @@ class InferenceEngine:
         max_chunk_frames = max_chunk_sec * self.sr // self.hop
 
         if T <= max_chunk_frames:
-            return self._run_model(units, f0, rms, uv, spk).astype(np.float32)
+            return self._run_model(
+                units, f0, rms, uv, spk,
+                shallow_diffusion=shallow_diffusion, k_step=k_step,
+                diffusion_method=diffusion_method,
+                diffusion_speedup=diffusion_speedup,
+            ).astype(np.float32)
 
         # Silence-aware segmentation: split at silence boundaries.
         boundaries = self._find_silence_boundaries(
@@ -229,7 +270,12 @@ class InferenceEngine:
             chunk_f0 = f0[start:end]
             chunk_rms = rms[start:end] if rms is not None else None
             chunk_uv = uv[start:end]
-            wav_chunk = self._run_model(chunk_units, chunk_f0, chunk_rms, chunk_uv, spk)
+            wav_chunk = self._run_model(
+                chunk_units, chunk_f0, chunk_rms, chunk_uv, spk,
+                shallow_diffusion=shallow_diffusion, k_step=k_step,
+                diffusion_method=diffusion_method,
+                diffusion_speedup=diffusion_speedup,
+            )
             chunk_outputs.append(wav_chunk)
 
         return self._stitch_chunks(boundaries, chunk_outputs)
@@ -322,6 +368,10 @@ class InferenceEngine:
         rms: torch.Tensor | None,
         uv: torch.Tensor,
         spk: int,
+        shallow_diffusion: bool = False,
+        k_step: int = 100,
+        diffusion_method: str = "ddim",
+        diffusion_speedup: int = 10,
     ) -> np.ndarray:
         """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
@@ -360,6 +410,15 @@ class InferenceEngine:
                 batch.uv,
                 batch.spk_id.unsqueeze(-1),
             )
+            if shallow_diffusion:
+                # 浅扩散: sovits wav → mel → k-step 去噪 → 声码器重合成
+                assert self.diffusion_enhancer is not None
+                return self.diffusion_enhancer.enhance(
+                    units, f0, rms, spk, wav[0, 0].float(),
+                    k_step=k_step,
+                    infer_speedup=diffusion_speedup,
+                    method=diffusion_method,
+                )
 
         elif self.backend_name == "rvc":
             pitch_token = self.module.generator.f0_to_coarse(batch.f0.float())
