@@ -52,6 +52,8 @@ class SoVITSDataset(BaseSVCDataset):
 
         # sovits needs spec (linear spectrogram) and wav
         self._spec_dir = self.dataset_dir / "spec" / feature_hashes.get("spec", "")
+        # rms (volume) for vol_embedding; may not exist in all datasets
+        self._rms_dir = self.dataset_dir / "rms" / feature_hashes.get("rms", "")
         self._audio_dir = self.dataset_dir / "audio"
 
         self.sr = self.meta.sr
@@ -71,6 +73,10 @@ class SoVITSDataset(BaseSVCDataset):
         # spec (linear spectrogram) — may not exist in all datasets
         spec_path = self._spec_dir / spk / pt_stem
         spec = self._load_pt(spec_path) if spec_path.exists() else None
+
+        # rms (volume) — may not exist in all datasets
+        rms_path = self._rms_dir / spk / pt_stem
+        rms = self._load_pt(rms_path) if rms_path.exists() else None
 
         # wav
         wav_path = self._audio_dir / spk / wav_stem
@@ -95,6 +101,8 @@ class SoVITSDataset(BaseSVCDataset):
             units = units[start : start + mf]
             f0 = f0[start : start + mf]
             uv = uv[start : start + mf]
+            if rms is not None:
+                rms = rms[start : start + mf]
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
@@ -105,6 +113,8 @@ class SoVITSDataset(BaseSVCDataset):
             units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
             f0 = torch.nn.functional.pad(f0, (0, pad_n))
             uv = torch.nn.functional.pad(uv, (0, pad_n))
+            if rms is not None:
+                rms = torch.nn.functional.pad(rms, (0, pad_n))
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
@@ -126,13 +136,18 @@ class SoVITSDataset(BaseSVCDataset):
             elif wav.shape[0] < target_len:
                 wav = torch.nn.functional.pad(wav, (0, target_len - wav.shape[0]))
         if spec is not None:
-            # preprocessed spec is [T, spec_channels] (frames first);
-            # crop frames, then flip to [spec_channels, T] so svc_collate
-            # (pad dim 0) yields [B, spec_channels, T] as models expect.
+            # Force-align spec frames to exactly T (units frame count).
+            # spec and units may differ by ±1 frame due to differing STFT
+            # conventions (spec uses center=True len//hop+1; units align via
+            # gather). Without this, collate sees [C, 47] vs [C, 48].
             if spec.ndim == 3:
-                spec = spec[0]
-            spec = spec[:T]
-            spec = spec.transpose(0, 1)
+                spec = spec[0]  # [T_spec, C]
+            spec_T = spec.shape[0]
+            if spec_T > T:
+                spec = spec[:T]
+            elif spec_T < T:
+                spec = torch.nn.functional.pad(spec, (0, 0, 0, T - spec_T))
+            spec = spec.transpose(0, 1)  # [C, T]
 
         return {
             "units": units,
@@ -140,5 +155,6 @@ class SoVITSDataset(BaseSVCDataset):
             "uv": uv,
             "mel": spec,  # store spec in mel field (SVCBatch.mel is generic target)
             "wav": wav,
+            "rms": rms,  # [T] volume (None if not preprocessed)
             "spk_id": self.spk2idx.get(spk, 0),
         }

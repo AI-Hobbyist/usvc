@@ -84,10 +84,15 @@ class TrainConfig:
     max_steps: int = 500_000
     val_interval: int = 2000
     save_interval: int = 2000
+    limit_val_batches: int | float | None = None  # 0 = skip validation
 
     # Resume
     resume: str | None = None
     pretrained: str | None = None
+
+    # Checkpoint strategy: keep N most recent complete checkpoints + last.
+    # Each checkpoint is full state (weights + optimizer) for perfect resume.
+    keep_last_n: int = 5        # keep N most recent + last (-1 = keep all)
 
     # Backend-specific
     backend_opts: dict = field(default_factory=dict)
@@ -141,7 +146,9 @@ class TrainConfig:
             max_steps=d.get("max_steps", 500_000),
             val_interval=d.get("val_interval", 2000),
             save_interval=d.get("save_interval", 2000),
+            limit_val_batches=d.get("limit_val_batches"),
             resume=d.get("resume"),
             pretrained=d.get("pretrained"),
+            keep_last_n=d.get("keep_last_n", 5),
             backend_opts=d.get("backend_opts", {}),
         )

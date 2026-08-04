@@ -409,6 +409,7 @@ class InferenceEngine:
                 batch.f0,
                 batch.uv,
                 batch.spk_id.unsqueeze(-1),
+                vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)
             )
             if shallow_diffusion:
                 # 浅扩散: sovits wav → mel → k-step 去噪 → 声码器重合成

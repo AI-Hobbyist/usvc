@@ -112,10 +112,16 @@ class RVCDataset(BaseSVCDataset):
         pitch_token = pitch_token[:T]
         pitchf = pitchf[:T]
         if spec is not None:
-            # crop frames, then flip to [spec_channels, T] so svc_collate
-            # (pad dim 0) yields [B, spec_channels, T] as models expect.
-            spec = spec[:T]
-            spec = spec.transpose(0, 1)
+            # Force-align spec frames to exactly T (units frame count).
+            # spec and units may differ by ±1 frame due to STFT conventions.
+            if spec.ndim == 3:
+                spec = spec[0]
+            spec_T = spec.shape[0]
+            if spec_T > T:
+                spec = spec[:T]
+            elif spec_T < T:
+                spec = torch.nn.functional.pad(spec, (0, 0, 0, T - spec_T))
+            spec = spec.transpose(0, 1)  # [C, T]
         # Align wav to frame_len * hop (frame count may exceed
         # wav samples by one frame due to len//hop + 1 convention).
         # GAN wave slicing uses ids_slice*hop + segment <= T*hop.

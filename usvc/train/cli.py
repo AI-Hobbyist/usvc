@@ -8,12 +8,42 @@ from __future__ import annotations
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import (
+    Callback,
     LearningRateMonitor,
     ModelCheckpoint,
 )
 from torch.utils.data import DataLoader
 
 from .config import TrainConfig
+
+
+class _PruneCheckpoints(Callback):
+    """Delete old epoch=*.ckpt files, keeping only the N most recent.
+
+    Lightning's save_top_k requires a monitor metric (which we lack when
+    validation is skipped). This callback manually prunes step checkpoints
+    after each save, keeping disk bounded. last.ckpt is never deleted.
+    """
+
+    def __init__(self, dirpath, keep_last_n=3):
+        self.dirpath = str(dirpath)
+        self.keep_last_n = keep_last_n
+
+    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
+        if self.keep_last_n < 0:
+            return  # -1 = keep all
+        import glob, os
+        # Only prune right after a checkpoint was saved.
+        ckpts = sorted(
+            glob.glob(os.path.join(self.dirpath, "epoch=*.ckpt")),
+            key=os.path.getmtime,
+        )
+        if len(ckpts) > self.keep_last_n:
+            for old in ckpts[: len(ckpts) - self.keep_last_n]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
 from .dataset import svc_collate
 from .callbacks import ScheduleFreeModeCallback
 
@@ -137,7 +167,7 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
             # (sovits/rvc) often store raw generator weights without the prefix.
             module_keys = set(module.state_dict().keys())
             # Detect candidate prefix: longest common suffix alignment
-            for prefix in ("generator.", "discriminator."):
+            for prefix in ("generator.", "discriminator.", "model."):
                 remapped = {}
                 for k, v in sd.items():
                     candidate = prefix + k
@@ -159,12 +189,23 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
         print(f"[pretrained] matched: {matched}/{len(module.state_dict())}")
 
     # Trainer
+    # Checkpoint strategy: keep complete checkpoints (weights + optimizer)
+    # for perfect resume from ANY checkpoint. Disk bounded via keep_last_n.
+    # save_weights_only=False preserves Adam momentum/variance so resume
+    # continues training exactly as if never interrupted.
     checkpoint_cb = ModelCheckpoint(
         dirpath=cfg.exp_dir,
         every_n_train_steps=cfg.save_interval,
         save_last=True,
-        save_top_k=-1,
-        save_weights_only=False,
+        save_top_k=-1,  # keep all; cleanup via _PruneCheckpoints
+        save_weights_only=False,  # full state: weights + optimizer (perfect resume)
+    )
+    # Prune old step checkpoints to keep disk bounded (save_top_k needs a
+    # monitor metric which we don't have without validation).
+    keep_n = int(getattr(cfg, "keep_last_n", 5))
+    prune_cb = _PruneCheckpoints(
+        dirpath=cfg.exp_dir,
+        keep_last_n=keep_n,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
@@ -180,7 +221,7 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
         devices="auto",
         precision=cfg.precision,
         gradient_clip_val=use_grad_clip,
-        callbacks=[checkpoint_cb, lr_monitor, ScheduleFreeModeCallback()],
+        callbacks=[checkpoint_cb, prune_cb, lr_monitor, ScheduleFreeModeCallback()],
         # val_check_interval: >1 = step count (if <= batches/epoch),
         # <=1 = epoch fraction. Clamp to per-epoch (1.0) when the requested
         # step interval exceeds the batches-per-epoch, to avoid
@@ -188,6 +229,7 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
         val_check_interval=_resolve_val_interval(cfg.val_interval, len(train_dl)),
         check_val_every_n_epoch=None if cfg.max_epochs else 1,
         num_sanity_val_steps=0,
+        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches is not None else 1.0,
         log_every_n_steps=10,
     )
 

@@ -33,7 +33,7 @@ class SoVITSModule(BaseGANModule):
         hidden_channels = opts.get("hidden_channels", 192)
 
         self.generator = SoVITSModel(
-            n_units=opts.get("n_units", 256),
+            n_units=opts.get("n_units", 768),  # contentvec768 (4.1 默认)
             spec_channels=spec_channels,
             inter_channels=inter_channels,
             hidden_channels=hidden_channels,
@@ -43,10 +43,11 @@ class SoVITSModule(BaseGANModule):
             n_layers_enc=opts.get("n_layers_enc", 6),
             n_sdp_layers0=opts.get("n_sdp_layers0", 6),
             n_sdp_layers=opts.get("n_sdp_layers", 6),
-            n_spk=opts.get("num_speaker", 1),
+            n_speakers=opts.get("num_speaker", 1),
             segment_size=opts.get("segment_size", 10240),
             gin_channels=opts.get("gin_channels", 768),
             use_automatic_f0_prediction=opts.get("use_automatic_f0_prediction", True),
+            vol_embedding=opts.get("vol_embedding", False),
         )
         self.discriminator = MultiPeriodDiscriminator(
             use_spectral_norm=opts.get("use_spectral_norm", False),
@@ -78,6 +79,7 @@ class SoVITSModule(BaseGANModule):
         return self.generator(
             batch.units, batch.f0, batch.mel, batch.wav, batch.spk_id,
             frame_len=batch.frame_len,
+            vol=batch.rms,  # [B, T] volume (only used if vol_embedding=True)
         )
 
     def generator_loss(self, batch: SVCBatch, out=None):

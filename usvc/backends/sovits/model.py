@@ -1357,6 +1357,7 @@ class SoVITSModel(nn.Module):
         wave: torch.Tensor,    # [B, 1, L] real wave (unused in gen; for API parity)
         spk_id: torch.Tensor,  # [B]
         frame_len: torch.Tensor | None = None,  # [B] units frame lengths
+        vol: torch.Tensor | None = None,  # [B, T] volume (only if vol_embedding)
     ) -> dict:
         """Training forward. Returns dict of tensors for loss computation.
 
@@ -1384,7 +1385,12 @@ class SoVITSModel(nn.Module):
         uv = (f0 > 0).float()
 
         x_mask = torch.unsqueeze(sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
-        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2)
+        vol_emb = (
+            self.emb_vol(vol[:, :, None]).transpose(1, 2)
+            if vol is not None and self.vol_embedding
+            else 0
+        )
+        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol_emb
 
         # f0 prediction
         if self.use_automatic_f0_prediction:

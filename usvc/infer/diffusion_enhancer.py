@@ -64,27 +64,31 @@ class DiffusionEnhancer:
 
         with open(diffusion_config) as f:
             cfg = yaml.safe_load(f) or {}
+        # 扩散模型参数在 backend_opts 下 (usvc train config 格式) 或顶层
+        opts = cfg.get("backend_opts", cfg)
         mel_cfg = cfg.get("mel") or {}
+        self.diffusion_n_units = int(opts.get("n_units", cfg.get("n_units", 768)))
+        self.diffusion_units_kind = opts.get("units_kind", cfg.get("units_kind", "contentvec"))
 
         # ---- 扩散模型 (与 usvc diffusion 后端同构) ----
         self.diffusion_model = DiffusionModel(
-            n_units=int(cfg.get("n_units", 768)),
-            n_spk=int(cfg.get("n_spk", 1)),
-            out_dims=int(cfg.get("out_dims", 128)),
-            n_hidden=int(cfg.get("n_hidden", 256)),
-            use_pitch_aug=bool(cfg.get("use_pitch_aug", False)),
-            timesteps=int(cfg.get("timesteps", 1000)),
-            max_beta=float(cfg.get("max_beta", 0.02)),
-            spec_min=float(cfg.get("spec_min", -12)),
-            spec_max=float(cfg.get("spec_max", 2)),
-            cn_layers=int(cfg.get("cn_layers", 20)),
-            cn_chans=int(cfg.get("cn_chans", 384)),
-            mlp_factor=int(cfg.get("mlp_factor", 4)),
+            n_units=int(opts.get("n_units", cfg.get("n_units", 768))),
+            n_spk=int(opts.get("n_spk", cfg.get("n_spk", 1))),
+            out_dims=int(opts.get("out_dims", cfg.get("out_dims", 128))),
+            n_hidden=int(opts.get("n_hidden", cfg.get("n_hidden", 256))),
+            use_pitch_aug=bool(opts.get("use_pitch_aug", cfg.get("use_pitch_aug", False))),
+            timesteps=int(opts.get("timesteps", cfg.get("timesteps", 1000))),
+            max_beta=float(opts.get("max_beta", cfg.get("max_beta", 0.02))),
+            spec_min=float(opts.get("spec_min", cfg.get("spec_min", -12))),
+            spec_max=float(opts.get("spec_max", cfg.get("spec_max", 2))),
+            cn_layers=int(opts.get("cn_layers", cfg.get("cn_layers", 20))),
+            cn_chans=int(opts.get("cn_chans", cfg.get("cn_chans", 384))),
+            mlp_factor=int(opts.get("mlp_factor", cfg.get("mlp_factor", 4))),
             gradient_checkpointing=False,
-            k_step=int(cfg.get("k_step", 1000)),
-            denoiser=str(cfg.get("denoiser", "convnext")),
-            wn_layers=int(cfg.get("wn_layers", 20)),
-            wn_chans=int(cfg.get("wn_chans", 384)),
+            k_step=int(opts.get("k_step", cfg.get("k_step", 1000))),
+            denoiser=str(opts.get("denoiser", cfg.get("denoiser", "convnext"))),
+            wn_layers=int(opts.get("wn_layers", cfg.get("wn_layers", 20))),
+            wn_chans=int(opts.get("wn_chans", cfg.get("wn_chans", 384))),
         )
         self._load_diffusion_weights(diffusion_ckpt)
         self.diffusion_model.eval()
@@ -107,6 +111,26 @@ class DiffusionEnhancer:
             sr=int(mel_cfg.get("sampling_rate", sr)),
             hop=int(mel_cfg.get("hop", hop)),
         ).to(device)
+
+        # ---- contentvec units 提取器 (浅扩散可能用不同编码器) ----
+        # sovits 主模型用 hubertsoft(256维), 扩散模型可能用 contentvec(768维)。
+        # 从 sovits 输出 wav 重新提取扩散模型需要的 units (second_encoding 简化版)。
+        self.units_extractor = None
+        if self.diffusion_units_kind != "hubertsoft":
+            from ..features.units import UnitsExtractor
+            units_fc = FeatureConfig(
+                "units",
+                {
+                    "kind": self.diffusion_units_kind,
+                    "sr_in": 16000,
+                    "hop_native": 320,
+                    "align_mode": "gather",
+                    "model_ckpt": cfg.get("units_ckpt", "pretrained/contentvec/pytorch_model.bin"),
+                },
+            )
+            self.units_extractor = UnitsExtractor(
+                units_fc, sr, hop, device, dtype=torch.float32
+            )
 
         # ---- 声码器 (fp32, 数值安全) ----
         vocoder_dir = Path(vocoder_dir)
@@ -164,6 +188,21 @@ class DiffusionEnhancer:
             sovits_wav: sovits 输出的 wav (长度为 T * hop)。
         """
         T = units.shape[0]
+
+        # 0) 如果扩散模型用不同编码器 (如 contentvec 768维), 从 sovits 输出 wav
+        # 重新提取 units (sovits 用 hubertsoft 256维, 维度不匹配会崩)。
+        if self.units_extractor is not None:
+            import soundfile as sf_resample  # noqa: F401 (not used directly)
+            from ..io.audio import load_audio
+            wav_np = sovits_wav if isinstance(sovits_wav, np.ndarray) else sovits_wav.cpu().numpy()
+            # UnitsExtractor 需要 16k wav, 从目标 sr 重采样
+            import librosa
+            wav16k = librosa.resample(wav_np.astype(np.float32), orig_sr=self.sr, target_sr=16000)
+            wav16k_t = torch.from_numpy(wav16k).float().to(self.device)
+            units = self.units_extractor.extract(wav16k_t)  # [T, D]
+            units = units[:T]
+            if units.shape[0] < T:
+                units = torch.nn.functional.pad(units, (0, 0, 0, T - units.shape[0]))
 
         # 1) sovits 输出 wav → gt_spec (log-dB 域, 与扩散训练一致)
         mel = self.mel_extractor.extract(sovits_wav)  # [T', M] float32 cpu

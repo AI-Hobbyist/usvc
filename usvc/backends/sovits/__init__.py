@@ -29,11 +29,12 @@ def _default_spec() -> FeatureSpec:
         units=FeatureConfig(
             "units",
             {
-                "kind": "hubertsoft",
+                "kind": "contentvec",
+                "layer": 12,
                 "sr_in": 16000,
                 "hop_native": 320,
                 "align_mode": "gather",
-                "model_ckpt": "pretrained/hubert/hubert-soft-0d54a1f4.pt",
+                "model_ckpt": "pretrained/contentvec/pytorch_model.bin",
             },
         ),
     )
@@ -46,20 +47,20 @@ class SoVitsBackend(Backend):
     def feature_spec(train_cfg: dict) -> FeatureSpec:
         base = SoVitsBackend.DEFAULT_FEATURES
         f0 = resolve_f0_config(train_cfg)
-        if train_cfg.get("units_kind") == "contentvec":
+        if train_cfg.get("units_kind") == "hubertsoft":
+            # 4.0 兼容: hubertsoft (256 维)
             units = FeatureConfig(
                 "units",
                 {
-                    "kind": "contentvec",
-                    "layer": 12,
+                    "kind": "hubertsoft",
                     "sr_in": 16000,
                     "hop_native": 320,
                     "align_mode": "gather",
-                    "model_ckpt": "pretrained/contentvec/pytorch_model.bin",
+                    "model_ckpt": "pretrained/hubert/hubert-soft-0d54a1f4.pt",
                 },
             )
         else:
-            units = base.units
+            units = base.units  # 默认 contentvec (4.1 推荐)
         return FeatureSpec(mel=base.mel, spec=base.spec, f0=f0, rms=base.rms, units=units)
 
     def build_dataset(
@@ -68,7 +69,7 @@ class SoVitsBackend(Backend):
         from .dataset import SoVITSDataset
 
         spec = self.feature_spec({})
-        encoder_kind = spec.units.params.get("kind", "hubertsoft")
+        encoder_kind = spec.units.params.get("kind", "contentvec")
         return SoVITSDataset(
             dataset_dir=dataset_dir,
             split=split,
