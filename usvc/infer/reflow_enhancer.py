@@ -133,6 +133,9 @@ class ReflowEnhancer:
                 out_dims=int(opts.get("out_dims", 128)),
                 n_layers=int(opts.get("n_layers", 6)),
                 n_chans=int(opts.get("n_chans", 768)),
+                n_units=int(opts.get("n_units", opts.get("n_unit", self.n_units))),
+                n_spk=int(opts.get("num_speaker", opts.get("n_spk", 1))),
+                n_hidden=int(opts.get("n_hidden", 256)),
             )
             self._load_shallow_weights(reflow_ckpt)
             self.shallow_model.eval()
@@ -227,6 +230,10 @@ class ReflowEnhancer:
         # Strip the lightning "model." prefix if present.
         if any(k.startswith("model.") for k in sd):
             sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+        # drop shape-mismatched keys (e.g. DDSP6 conditioner_projection 128→256)
+        model_sd = self.shallow_model.state_dict()
+        sd = {k: v for k, v in sd.items()
+              if k in model_sd and v.shape == model_sd[k].shape}
         missing, unexpected = self.shallow_model.load_state_dict(sd, strict=False)
         if missing:
             print(f"[reflow_shallow] missing keys: {len(missing)} (e.g. {missing[:3]})")
@@ -374,11 +381,15 @@ class ReflowEnhancer:
         # 3-4) shallow diffusion
         with torch.no_grad():
             if self._mode == "shallow":
-                # ReflowShallowModel: condition = sovits/rvc mel directly.
-                # No DDSP synthesis; the model was trained on
-                # (corrupt(mel) → clean mel) so this is in-distribution.
+                # ReflowShallowModel v2: condition = units/f0/vol embeddings
+                # (mel-independent), gt_spec = sovits/rvc mel.  The reflow
+                # ODE starts from (t_start*sovits_mel + noise) and integrates
+                # toward the clean-mel manifold guided by the mel-free
+                # condition — a true shallow diffusion (DDPM-equivalent).
                 denoised = self.shallow_model.sample(
-                    mel, t_start=t_start, infer_step=infer_step, method=method,
+                    units_b, f0_b.squeeze(-1), vol_b.squeeze(-1), mel,
+                    t_start=t_start, infer_step=infer_step, method=method,
+                    spk_id=spk_b,
                 )  # [1, T, M] denormalized (dB domain)
             else:
                 # DDSP6 mode: DDSP synthesis (condition) + reflow toward the

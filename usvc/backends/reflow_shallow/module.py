@@ -1,7 +1,11 @@
-"""ReflowShallowModule — LightningModule for the reflow_shallow backend.
+"""ReflowShallowModule — LightningModule for the reflow_shallow backend (v2).
 
-Training: corrupt(real_mel) → condition, real_mel → target, reflow_loss.
-Inference (sample): shallow-diffuse the (corrupted) mel via t_start ODE.
+Training: condition = units/f0/vol embeddings (mel-independent), target =
+real_mel, reflow_loss.  This is the DDPM-equivalent shallow-diffusion
+formulation: the condition does NOT carry mel information, so at inference
+the sovits_mel (gt_spec) genuinely participates in the ODE trajectory.
+
+Inference (sample): shallow-diffuse the input mel via t_start ODE.
 """
 from __future__ import annotations
 
@@ -9,14 +13,13 @@ import torch
 
 from ...train.config import TrainConfig
 from ...train.module import BaseSVCModule
-from .corrupt import corrupt_mel
 from .model import ReflowShallowModel
 
 __all__ = ["ReflowShallowModule"]
 
 
 class ReflowShallowModule(BaseSVCModule):
-    """LightningModule wrapping ReflowShallowModel."""
+    """LightningModule wrapping ReflowShallowModel (v2)."""
 
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
@@ -25,29 +28,35 @@ class ReflowShallowModule(BaseSVCModule):
             out_dims=int(opts.get("out_dims", opts.get("n_mels", 128))),
             n_layers=int(opts.get("n_layers", 6)),
             n_chans=int(opts.get("n_chans", 768)),
+            n_units=int(opts.get("n_units", opts.get("n_unit", 768))),
+            n_spk=int(opts.get("num_speaker", opts.get("n_spk", 1))),
+            n_hidden=int(opts.get("n_hidden", 256)),
         )
-        # t_start lower bound for training-time sampling (bias toward the
-        # shallow regime the model operates in at inference).  0.0 = uniform.
+        # t_start lower bound for training-time sampling.  0.0 = uniform.
         self.t_start = float(opts.get("t_start", 0.0))
-        # corruption strength range (random per-batch)
-        self.corrupt_strength = opts.get(
-            "corrupt_strength", (0.3, 1.0)
-        )
-        if isinstance(self.corrupt_strength, (int, float)):
-            self.corrupt_strength = (0.0, float(self.corrupt_strength))
+        # inference t_start for validation sample
+        self.infer_t_start = float(opts.get("infer_t_start", 0.5))
 
     def forward_loss(self, batch):
         mel = batch.mel  # [B, T, M] clean target
         if mel is None:
             raise RuntimeError("reflow_shallow requires mel in the batch")
-        # build the corrupted condition online
-        cond = corrupt_mel(mel, strength_range=self.corrupt_strength)
-        loss, sub = self.model.forward_loss(cond, mel, t_start=self.t_start)
+        units = batch.units  # [B, T, D]
+        f0 = batch.f0  # [B, T]
+        rms = batch.rms  # [B, T] or None
+        spk = batch.spk_id  # [B] or None
+        loss, sub = self.model.forward_loss(
+            units, f0, rms, mel, spk_id=spk, t_start=self.t_start,
+        )
         return loss, sub
 
     def sample(self, batch):
-        """Shallow-diffuse the batch mel (validation; uses t_start=0.8)."""
+        """Shallow-diffuse the batch mel (validation)."""
         mel = batch.mel
         if mel is None:
             return None
-        return self.model.sample(mel, t_start=0.8, infer_step=10)
+        return self.model.sample(
+            batch.units, batch.f0, batch.rms, mel,
+            t_start=self.infer_t_start, infer_step=10,
+            spk_id=batch.spk_id,
+        )

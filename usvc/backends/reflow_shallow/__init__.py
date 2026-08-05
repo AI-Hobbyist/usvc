@@ -28,6 +28,10 @@ def _default_spec() -> FeatureSpec:
             {"extractor": "rmvpe", "uv_policy": "raw", "model_ckpt": "pretrained/rmvpe/model.pt"},
         ),
         rms=FeatureConfig("rms", {"win_length": 1024}),
+        units=FeatureConfig(
+            "units",
+            {"kind": "contentvec", "layer": 12, "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": "pretrained/contentvec/pytorch_model.bin"},
+        ),
     )
 
 

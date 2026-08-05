@@ -47,29 +47,31 @@ def corrupt_mel(
 
     out = mel.clone()
     # mel is in dB domain (~[-12, 2]); noise magnitude scales with strength.
-    noise_scale_db = 0.15  # max ~0.15 dB noise at full strength
+    # Calibrated against real sovits output: |sovits_mel - clean_mel| ≈ 2-4 dB
+    # in the [-12, 2] range, so noise_scale must be O(1) dB, not 0.15.
+    noise_scale_db = 2.0  # ~2 dB noise at full strength (matches real artefacts)
 
     # 1) Gaussian noise (applied always, scaled by strength)
     noise = torch.randn_like(out) * (noise_scale_db * s)
     out = out + noise
 
-    # 2) Random frequency band masking (per-sample, ~0.5 prob)
-    #    Zero out 1-3 random mel bands of width 2-8 bins (push toward mel.min()-0.5).
+    # 2) Random frequency band masking (per-sample, ~0.7 prob)
+    #    Zero out 1-5 random mel bands of width 3-12 bins (push toward mel.min()-0.5).
     mask_floor = float(mel.min().item()) - 0.5
-    do_mask = torch.rand(B, device=device) < 0.5
+    do_mask = torch.rand(B, device=device) < 0.7
     if do_mask.any():
         idx = torch.where(do_mask)[0]
         for i in idx.tolist():
-            n_bands = int(torch.randint(1, 4, (1,)).item())  # 1-3 bands
+            n_bands = int(torch.randint(1, 6, (1,)).item())  # 1-5 bands
             for _ in range(n_bands):
-                bw = int(torch.randint(2, 9, (1,)).item())   # width 2-8
+                bw = int(torch.randint(3, 13, (1,)).item())   # width 3-12
                 start = int(torch.randint(0, max(M - bw, 1), (1,)).item())
                 out[i, :, start:start + bw] = mask_floor
 
-    # 3) High-frequency harmonic jitter (per-sample, ~0.5 prob)
+    # 3) High-frequency harmonic jitter (per-sample, ~0.7 prob)
     #    Add structured noise to the upper half of the spectrum.
     hf_start = M // 2
-    do_jitter = torch.rand(B, device=device) < 0.5
+    do_jitter = torch.rand(B, device=device) < 0.7
     if do_jitter.any() and hf_start < M:
         idx = torch.where(do_jitter)[0]
         hf = out[idx, :, hf_start:]
@@ -80,7 +82,7 @@ def corrupt_mel(
             raw = torch.nn.functional.avg_pool1d(
                 raw.transpose(1, 2), kernel_size=3, stride=1, padding=1
             ).transpose(1, 2)
-        jitter = raw * (0.3 * s[idx].view(-1, 1, 1))
+        jitter = raw * (1.5 * s[idx].view(-1, 1, 1))  # ~1.5 dB HF jitter
         out[idx, :, hf_start:] = hf + jitter
 
     if squeeze:

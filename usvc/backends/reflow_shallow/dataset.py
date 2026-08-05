@@ -1,8 +1,11 @@
-"""reflow_shallow dataset: reads preprocessed features for shallow-diffusion training.
+"""reflow_shallow dataset (v2): reads mel + units + f0 + rms.
 
-Unlike DDSP6, this backend needs only mel (the corruption target/source),
-f0 and rms (kept for inference-feature parity).  No units required — the
-reflow velocity network is conditioned on mel alone.
+v2 uses units/f0/vol embeddings as the reflow condition (mel-independent),
+so units are now required (contentvec 768-d, same as sovits/ddsp6).
+
+Feature reuse: mel/f0/rms/units hashes come from the backend feature_spec,
+which matches the sovits/ddsp6 config family (44.1k/512, contentvec768) so
+preprocessed features are shared where configs coincide.
 """
 from __future__ import annotations
 
@@ -18,11 +21,7 @@ __all__ = ["ReflowShallowDataset"]
 
 
 class ReflowShallowDataset(BaseSVCDataset):
-    """Dataset for the reflow_shallow backend.
-
-    Reads: mel/{hash}/{spk}/{fn}.pt, f0/, rms/.  No units.
-    Force-aligns all features to mel's frame count.
-    """
+    """Dataset for the reflow_shallow backend (v2, needs units)."""
 
     def __init__(
         self,
@@ -54,6 +53,8 @@ class ReflowShallowDataset(BaseSVCDataset):
         self._mel_dir = self.dataset_dir / "mel" / feature_hashes.get("mel", "")
         self._f0_dir = self.dataset_dir / "f0" / feature_hashes.get("f0", "")
         self._rms_dir = self.dataset_dir / "rms" / feature_hashes.get("rms", "")
+        units_hash = feature_hashes.get("units", "")
+        self._units_dir = self.dataset_dir / "units" / self.encoder_kind / units_hash
 
         self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
 
@@ -64,21 +65,18 @@ class ReflowShallowDataset(BaseSVCDataset):
         mel = self._load_pt(self._mel_dir / spk / stem)
         f0 = self._load_pt(self._f0_dir / spk / stem)
         rms = self._load_pt(self._rms_dir / spk / stem)
+        units = self._load_pt(self._units_dir / spk / stem)
 
         T = mel.shape[0]
         f0 = f0[:T]
         rms = rms[:T]
-
-        # The shared collate (BaseSVCDataset) requires a "units" key for
-        # frame_len bookkeeping; reflow_shallow does not use it, so emit a
-        # 1-D placeholder aligned to T frames.
-        units_dummy = mel.new_zeros(T, 1)
+        units = units[:T]
 
         return {
             "mel": mel,
             "f0": f0,
             "rms": rms,
-            "units": units_dummy,
+            "units": units,
             "spk_id": self.spk2idx.get(spk, 0),
         }
 
