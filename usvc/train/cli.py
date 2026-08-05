@@ -80,32 +80,51 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
     # meta.features structure: {"mel":[{hash,...}], "f0":[...], "units":{enc:[{hash,...}]}}
     # Build flat {kind: hash} for dataset construction.
     from ..data.meta import load_meta
+    from ..data.feature_config import FeatureConfig
 
     meta = load_meta(cfg.dataset_dir)
-    # Determine which units encoder this backend needs (contentvec_tta2x /
-    # contentvec / hubertsoft) so the correct nested hash is selected.
-    # feature_spec reads config overrides (units_kind, f0_extractor, mel bins).
+    # Build the backend's expected FeatureSpec and use each FeatureConfig's
+    # stable hash to pick the correct entry from meta.features.  This handles
+    # the case where the same dataset has multiple mel hashes (e.g. sovits
+    # 80-bin mel AND reflow_shallow 128-bin mel coexist).
     spec_cfg = dict(cfg.backend_opts or {})
+    want_spec = backend.feature_spec(spec_cfg)
     units_kind = (
-        backend.feature_spec(spec_cfg).units.params.get("kind", "contentvec")
-        if backend.feature_spec(spec_cfg).units
-        else None
+        want_spec.units.params.get("kind", "contentvec")
+        if want_spec.units else None
     )
+
+    def _match_hash(kind: str, fc: FeatureConfig | None, entries: list) -> str:
+        """Return the meta entry hash whose config hash matches fc, falling
+        back to entries[0] if no match (e.g. config-stripped meta)."""
+        if fc is None or not entries:
+            return entries[0]["hash"] if entries else ""
+        want = fc.hash()
+        for e in entries:
+            if e.get("hash") == want:
+                return e["hash"]
+        # Fallback: compare config dicts for best-effort match
+        for e in entries:
+            if e.get("config", {}).get("n_mels") == fc.params.get("n_mels"):
+                return e["hash"]
+        return entries[0]["hash"]
+
     feature_hashes: dict[str, str] = {}
     for kind, entries in meta.features.items():
         if kind == "units":
             # nested: {encoder_kind: [{hash,...}]}
-            if units_kind is not None and units_kind in (entries or {}):
-                enc_entries = entries[units_kind]
-                if enc_entries:
-                    feature_hashes["units"] = enc_entries[0]["hash"]
-                    continue
-            for enc_kind, enc_entries in (entries or {}).items():
-                if enc_entries:
-                    feature_hashes["units"] = enc_entries[0]["hash"]
-                    break
+            enc_map = entries or {}
+            if units_kind is not None and units_kind in enc_map:
+                feature_hashes["units"] = _match_hash(
+                    kind, want_spec.units, enc_map[units_kind])
+            else:
+                for enc_kind, enc_entries in enc_map.items():
+                    if enc_entries:
+                        feature_hashes["units"] = enc_entries[0]["hash"]
+                        break
         elif isinstance(entries, list) and entries:
-            feature_hashes[kind] = entries[0]["hash"]
+            fc = getattr(want_spec, kind, None)  # mel / f0 / rms / spec
+            feature_hashes[kind] = _match_hash(kind, fc, entries)
     cfg.feature_hashes = feature_hashes
 
     # Build datasets
@@ -155,38 +174,61 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
     # Load pretrained weights (if specified, before resume)
     if cfg.pretrained:
         import torch
+        from pathlib import Path
 
-        ckpt = torch.load(cfg.pretrained, map_location="cpu", weights_only=True)
-        sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
-        # Try direct load first; if too few keys match, attempt prefix remapping
-        # (e.g. base model has 'enc_p.*' but module expects 'generator.enc_p.*')
-        missing, unexpected = module.load_state_dict(sd, strict=False)
-        matched = len(module.state_dict()) - len(missing)
-        if matched < len(module.state_dict()) * 0.5:
-            # Heuristic: GAN modules wrap generator/discriminator; base models
-            # (sovits/rvc) often store raw generator weights without the prefix.
-            module_keys = set(module.state_dict().keys())
-            # Detect candidate prefix: longest common suffix alignment
+        # Collect all pretrained state_dicts.  so-vits-svc base models ship
+        # G_0.pth (generator) and D_0.pth (discriminator) separately; if the
+        # user points at G_0.pth we also try to load the sibling D_0.pth.
+        pretrained_paths = [Path(cfg.pretrained)]
+        p = Path(cfg.pretrained)
+        if p.name == "G_0.pth":
+            d0 = p.with_name("D_0.pth")
+            if d0.exists():
+                pretrained_paths.append(d0)
+
+        merged_sd: dict = {}
+        for pp in pretrained_paths:
+            _c = torch.load(pp, map_location="cpu", weights_only=True)
+            merged_sd.update(_c.get("state_dict", _c.get("model", _c)))
+        sd = merged_sd
+        module_sd = module.state_dict()
+
+        def _safe_load(remapped_sd):
+            """load_state_dict that skips shape-mismatched keys (e.g. emb_g
+            when finetuning a multi-speaker base down to 1 speaker)."""
+            filtered = {
+                k: v for k, v in remapped_sd.items()
+                if k in module_sd and v.shape == module_sd[k].shape
+            }
+            missing, unexpected = module.load_state_dict(filtered, strict=False)
+            matched = len(module_sd) - len(missing)
+            return matched, missing, unexpected
+
+        # Remap keys: base models (sovits/rvc) store raw G/D weights without
+        # the ``generator.``/``discriminator.`` wrapper prefix.  Match each key
+        # individually against the module state_dict, trying (no prefix,
+        # generator., discriminator., model.) in order.  This lets a single
+        # checkpoint that mixes G and D keys (e.g. merged G_0+D_0) load both
+        # subtrees in one pass.
+        module_keys = set(module_sd.keys())
+        remapped = {}
+        for k, v in sd.items():
+            if k in module_keys:
+                remapped[k] = v
+                continue
             for prefix in ("generator.", "discriminator.", "model."):
-                remapped = {}
-                for k, v in sd.items():
-                    candidate = prefix + k
-                    if candidate in module_keys:
-                        remapped[candidate] = v
-                    else:
-                        remapped[k] = v
-                new_missing, new_unexpected = module.load_state_dict(
-                    remapped, strict=False
-                )
-                new_matched = len(module.state_dict()) - len(new_missing)
-                if new_matched > matched:
-                    sd, missing, unexpected = remapped, new_missing, new_unexpected
-                    matched = new_matched
+                cand = prefix + k
+                if cand in module_keys:
+                    remapped[cand] = v
+                    break
+            else:
+                remapped[k] = v  # leave as-is (will be "unexpected")
+        matched, missing, unexpected = _safe_load(remapped)
         if missing:
             print(f"[pretrained] missing keys: {len(missing)}")
         if unexpected:
             print(f"[pretrained] unexpected keys: {len(unexpected)}")
-        print(f"[pretrained] matched: {matched}/{len(module.state_dict())}")
+        print(f"[pretrained] matched: {matched}/{len(module_sd)}")
 
     # Trainer
     # Checkpoint strategy: keep complete checkpoints (weights + optimizer)

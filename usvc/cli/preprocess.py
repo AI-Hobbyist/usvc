@@ -14,6 +14,7 @@ from pathlib import Path
 from ..backends.ddsp6 import DDSP6Backend
 from ..backends.diffusion import DiffusionBackend
 from ..backends.reflow_vae import ReflowVAEBackend
+from ..backends.reflow_shallow import ReflowShallowBackend
 from ..backends.rift_dit import RIFTDiTBackend
 from ..backends.rvc import RVCBackend
 from ..backends.sovits import SoVitsBackend
@@ -28,6 +29,7 @@ _BACKENDS = {
     "sovits": SoVitsBackend,
     "rvc": RVCBackend,
     "reflow_vae": ReflowVAEBackend,
+    "reflow_shallow": ReflowShallowBackend,
 }
 
 

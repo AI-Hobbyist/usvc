@@ -1,0 +1,52 @@
+# ============================================================
+# usvc 训练配置: reflow_shallow (独立 reflow 浅扩散增强器)
+# ============================================================
+# 用途: 给 sovits/RVC 输出做浅扩散增强 (去电音/瑕疵精炼)。
+# 原理: condition = corrupt(真实mel) 模拟 sovits 瑕疵, target = 真实mel。
+#       推理时 condition = sovits/rvc 输出 mel, reflow 精炼 → 干净 mel。
+#
+# 与 DDSP6 reflow 的区别:
+#   - 无 DDSP 合成器 (纯 reflow)
+#   - condition = 瑕疵 mel (目标音色), 不是 DDSP 通用音色 mel → 无音色泄漏
+#   - 可从 DDSP6 底模迁移 reflow_model 权重 (dim_cond=128 完全兼容)
+#
+# 数据: 复用 sovits 数据集 (mel/f0/rms, 44.1k/512/128mel), 无需 units。
+# ============================================================
+
+backend: reflow_shallow
+dataset_dir: data/my_dataset       # 必填: 预处理后的数据集目录 (含 meta.json)
+exp_dir: experiments/reflow_shallow  # 输出目录
+
+# ---- 训练超参 ----
+batch_size: 48                     # [可调] A10G 24GB 安全
+max_frames: 128                    # [可调] 训练片段长度(帧), ~2s @ 44.1k/512
+num_workers: 2                     # [可调] 8+ 会 SIGTERM, 2 稳定
+max_steps: 100000                  # [可调] 浅扩散增强器收敛快, 1-3万步通常够; 微调改小
+val_interval: 2000                 # [可调] 验证间隔(步)
+save_interval: 2000                # [可调] checkpoint 保存间隔(步)
+limit_val_batches: 0               # 跳过验证 (sample 慢; 开启设 1.0)
+keep_last_n: 5                     # 保留最近 N 个 checkpoint + last
+precision: bf16-mixed              # bf16 AMP (已验证近无损)
+
+# ---- 优化器 ----
+optimizer:
+  type: adamw
+  lr: 0.0006                       # 原项目默认 6e-4
+  betas: [0.9, 0.98]
+  weight_decay: 0.0
+schedule:
+  type: null                       # reflow 用常数 lr (原项目无 scheduler)
+
+# ---- 后端选项 ----
+backend_opts:
+  out_dims: 128                    # mel 维度
+  n_layers: 6                      # LYNXNet2 层数 (与 6.3_6x512_6x768 底模匹配)
+  n_chans: 768                     # LYNXNet2 通道数 (与底模匹配)
+  t_start: 0.0                     # 训练 t 采样下界 [0,1); 0=uniform; 浅扩散可设 0.5 偏置
+  corrupt_strength: [0.3, 1.0]     # 瑕疵模拟强度范围 (随机)
+
+# 从 DDSP6 底模迁移 reflow_model 权重 (可选; 加载后微调)
+# 顶层字段 (TrainConfig.pretrained); CLI 加载时 strict=False
+pretrained: /home/waas/pretrained/base_models/ddsp6/6.3_6x512_6x768/model.pt
+
+grad_clip: 1.0                     # flow 后端梯度裁剪

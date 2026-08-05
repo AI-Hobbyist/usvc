@@ -24,6 +24,38 @@ from ..train.dataset import SVCBatch
 from .diffusion_enhancer import DiffusionEnhancer
 from .features import InferFeatures
 
+
+def _resample_wav(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Soxr-based wav resampling (high quality, linear phase)."""
+    if orig_sr == target_sr:
+        return np.asarray(wav, dtype=np.float32)
+    import soxr
+    return soxr.resample(np.asarray(wav, dtype=np.float32), orig_sr, target_sr)
+
+
+def _resample_f0(f0: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Align a [T] f0 trajectory to ``target_frames`` via linear interpolation."""
+    T = f0.shape[0]
+    if T == target_frames:
+        return f0
+    f0_np = f0.detach().float().cpu().numpy()
+    src = np.arange(T, dtype=np.float32)
+    dst = np.linspace(0, T - 1, target_frames, dtype=np.float32)
+    out = np.interp(dst, src, f0_np).astype(np.float32)
+    return torch.from_numpy(out).to(f0.device).to(f0.dtype)
+
+
+def _resample_units(units: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Align [T, D] content features to ``target_frames`` via linear interp."""
+    T = units.shape[0]
+    if T == target_frames:
+        return units
+    u = units.detach().float().cpu().numpy()  # [T, D]
+    src = np.arange(T, dtype=np.float32)
+    dst = np.linspace(0, T - 1, target_frames, dtype=np.float32)
+    out = np.stack([np.interp(dst, src, u[:, d]) for d in range(u.shape[1])], axis=1)
+    return torch.from_numpy(out.astype(np.float32)).to(units.device).to(units.dtype)
+
 # mel-domain backends use the shared NSF-HiFiGAN vocoder
 MEL_DOMAIN = ("rift_dit", "ddsp6", "diffusion", "reflow_vae")
 # wav-domain backends decode waveform directly from the generator
@@ -63,6 +95,9 @@ class InferenceEngine:
         half: bool = False,
         diffusion_ckpt: str | Path | None = None,
         diffusion_config: str | Path | None = None,
+        reflow_ckpt: str | Path | None = None,
+        reflow_config: str | Path | None = None,
+        t_start: float = 0.5,
     ) -> None:
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
@@ -115,26 +150,54 @@ class InferenceEngine:
                 is_half=self.module_half,
             )
 
-        # Shallow-diffusion enhancer (optional; sovits only). Loaded when
-        # diffusion_ckpt is provided; used when convert(shallow_diffusion=True).
+        self.t_start = float(t_start)
+
+        # Shallow-diffusion enhancers (optional; sovits and rvc).  Two enhancer
+        # backends are supported and may coexist:
+        #   - DiffusionEnhancer (Diffusion-SVC, k-step DDPM denoising)
+        #   - ReflowEnhancer   (DDSP6 RectifiedFlow, t_start shallow flow)
+        # ``convert(shallow_diffusion=True)`` picks whichever is loaded; if
+        # both are loaded, reflow is preferred (faster, ~10 steps).
         self.diffusion_enhancer = None
-        if diffusion_ckpt is not None or diffusion_config is not None:
-            if self.backend_name != "sovits":
+        self.reflow_enhancer = None
+        if (diffusion_ckpt is not None or diffusion_config is not None) or (
+            reflow_ckpt is not None or reflow_config is not None
+        ):
+            if self.backend_name not in ("sovits", "rvc"):
                 raise ValueError(
-                    "shallow diffusion (diffusion_ckpt) is only supported for the "
-                    f"sovits backend, got backend={self.backend_name}"
-                )
-            if diffusion_ckpt is None or diffusion_config is None:
-                raise ValueError(
-                    "shallow diffusion requires both diffusion_ckpt and "
-                    "diffusion_config"
+                    "shallow diffusion is only supported for the "
+                    f"sovits/rvc backends, got backend={self.backend_name}"
                 )
             if vocoder_dir is None:
                 vocoder_dir = Path(__file__).resolve().parents[2] / "pretrained" / "nsf_hifigan"
-            self.diffusion_enhancer = DiffusionEnhancer(
-                diffusion_ckpt, diffusion_config, vocoder_dir,
-                device=device, half=half, sr=self.sr, hop=self.hop,
-            )
+            if diffusion_ckpt is not None or diffusion_config is not None:
+                if diffusion_ckpt is None or diffusion_config is None:
+                    raise ValueError(
+                        "shallow diffusion requires both diffusion_ckpt and "
+                        "diffusion_config"
+                    )
+                self.diffusion_enhancer = DiffusionEnhancer(
+                    diffusion_ckpt, diffusion_config, vocoder_dir,
+                    device=device, half=half, sr=self.sr, hop=self.hop,
+                )
+            if reflow_ckpt is not None or reflow_config is not None:
+                if reflow_ckpt is None or reflow_config is None:
+                    raise ValueError(
+                        "reflow shallow diffusion requires both reflow_ckpt "
+                        "and reflow_config"
+                    )
+                from .reflow_enhancer import ReflowEnhancer
+                self.reflow_enhancer = ReflowEnhancer(
+                    reflow_ckpt, reflow_config, vocoder_dir,
+                    device=device, half=half, sr=self.sr, hop=self.hop,
+                )
+
+    @property
+    def _shallow_enhancer(self):
+        """Return the active shallow-diffusion enhancer (reflow preferred)."""
+        if self.reflow_enhancer is not None:
+            return self.reflow_enhancer
+        return self.diffusion_enhancer
 
     def _load_weights(self, module) -> None:
         sd = _load_ckpt_state(self.ckpt_path)
@@ -205,6 +268,7 @@ class InferenceEngine:
         k_step: int = 100,
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
+        t_start: float | None = None,
     ) -> np.ndarray:
         """Convert a wav file; returns float32 wav at the backend sample rate.
 
@@ -214,14 +278,18 @@ class InferenceEngine:
         segment exceeds the max chunk size, it is force-split at the lowest-
         energy frame with a short crossfade.
 
-        shallow_diffusion: sovits only — enhance each chunk's wav via the
-        loaded DiffusionEnhancer (k-step partial denoising + re-synthesis).
+        shallow_diffusion: enhance each chunk's wav via the loaded enhancer
+            (DiffusionEnhancer k-step denoising, or ReflowEnhancer t_start
+            shallow flow — whichever is loaded, reflow preferred).
+        t_start: reflow ODE start time in [0,1); overrides the engine default.
+            Ignored when only the diffusion enhancer is loaded.
         """
-        if shallow_diffusion and self.diffusion_enhancer is None:
+        if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError(
-                "shallow_diffusion=True requires diffusion_ckpt + diffusion_config "
-                "at engine construction (sovits backend)"
+                "shallow_diffusion=True requires diffusion_ckpt+diffusion_config "
+                "or reflow_ckpt+reflow_config at engine construction (sovits/rvc)"
             )
+        _t_start = self.t_start if t_start is None else float(t_start)
         feats = self.features.extract(input_wav)
         units = feats["units"].to(self.device)  # [T, dim]
         f0 = feats["f0"].to(self.device)  # [T]
@@ -257,6 +325,7 @@ class InferenceEngine:
                 shallow_diffusion=shallow_diffusion, k_step=k_step,
                 diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup,
+                t_start=_t_start,
             ).astype(np.float32)
 
         # Silence-aware segmentation: split at silence boundaries.
@@ -275,6 +344,7 @@ class InferenceEngine:
                 shallow_diffusion=shallow_diffusion, k_step=k_step,
                 diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup,
+                t_start=_t_start,
             )
             chunk_outputs.append(wav_chunk)
 
@@ -372,6 +442,7 @@ class InferenceEngine:
         k_step: int = 100,
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
+        t_start: float = 0.5,
     ) -> np.ndarray:
         """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
@@ -412,13 +483,10 @@ class InferenceEngine:
                 vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)
             )
             if shallow_diffusion:
-                # 浅扩散: sovits wav → mel → k-step 去噪 → 声码器重合成
-                assert self.diffusion_enhancer is not None
-                return self.diffusion_enhancer.enhance(
+                return self._enhance_wav(
                     units, f0, rms, spk, wav[0, 0].float(),
-                    k_step=k_step,
-                    infer_speedup=diffusion_speedup,
-                    method=diffusion_method,
+                    k_step=k_step, diffusion_method=diffusion_method,
+                    diffusion_speedup=diffusion_speedup, t_start=t_start,
                 )
 
         elif self.backend_name == "rvc":
@@ -430,11 +498,80 @@ class InferenceEngine:
                 batch.f0,  # continuous f0 for the NSF source
                 batch.spk_id,
             )
+            if shallow_diffusion:
+                return self._enhance_wav(
+                    units, f0, rms, spk, wav[0, 0].float(),
+                    k_step=k_step, diffusion_method=diffusion_method,
+                    diffusion_speedup=diffusion_speedup, t_start=t_start,
+                )
 
         else:  # pragma: no cover
             raise ValueError(self.backend_name)
 
         return wav[0, 0].float().cpu().numpy()
+
+    def _enhance_wav(
+        self,
+        units: torch.Tensor,
+        f0: torch.Tensor,
+        rms: torch.Tensor | None,
+        spk: int,
+        gen_wav: torch.Tensor,
+        k_step: int = 100,
+        diffusion_method: str = "ddim",
+        diffusion_speedup: int = 10,
+        t_start: float = 0.5,
+    ) -> np.ndarray:
+        """Dispatch to the loaded shallow enhancer (diffusion or reflow).
+
+        Handles the RVC sample-rate bridge: RVC runs at 48k/32k/40k while
+        the enhancers operate at 44.1k/hop512.  The input wav is resampled
+        to the enhancer domain and the output back to the backend rate.
+        """
+        enh = self._shallow_enhancer
+        enh_sr = enh.sr  # enhancer domain sample rate (44100)
+        backend_sr = self.sr
+
+        if self.reflow_enhancer is not None:
+            # ---- ReflowEnhancer (DDSP6 RectifiedFlow, t_start shallow flow)
+            wav_in = gen_wav
+            f0_in = f0
+            units_in = units
+            rms_in = rms
+            if backend_sr != enh_sr:
+                wav_in = _resample_wav(gen_wav.cpu().numpy(), backend_sr, enh_sr)
+                wav_in = torch.from_numpy(wav_in).to(gen_wav.dtype).to(self.device)
+                # align frame-domain tensors (units/f0/rms) to enhancer frames
+                enh_frames = wav_in.shape[-1] // enh.hop
+                f0_in = _resample_f0(f0, enh_frames)
+                units_in = _resample_units(units, enh_frames)
+                if rms_in is not None:
+                    rms_in = _resample_f0(rms_in, enh_frames)
+            enh_out = self.reflow_enhancer.enhance(
+                units_in, f0_in, rms_in, spk, wav_in,
+                t_start=t_start,
+            )
+            if backend_sr != enh_sr:
+                enh_out = _resample_wav(enh_out, enh_sr, backend_sr)
+            return enh_out.astype(np.float32)
+
+        # ---- DiffusionEnhancer (Diffusion-SVC, k-step DDPM denoising)
+        # operates in the backend domain (sovits is already 44.1k); for rvc
+        # at 48k we still feed 44.1k since sovits/diffusion enhancers expect
+        # 44.1k — the DiffusionEnhancer extracts its own mel at enh_sr.
+        wav_in = gen_wav
+        if backend_sr != enh_sr:
+            wav_in = _resample_wav(gen_wav.cpu().numpy(), backend_sr, enh_sr)
+            wav_in = torch.from_numpy(wav_in).to(gen_wav.dtype).to(self.device)
+        enh_out = self.diffusion_enhancer.enhance(
+            units, f0, rms, spk, wav_in,
+            k_step=k_step,
+            infer_speedup=diffusion_speedup,
+            method=diffusion_method,
+        )
+        if backend_sr != enh_sr:
+            enh_out = _resample_wav(enh_out, enh_sr, backend_sr)
+        return enh_out.astype(np.float32)
 
     def _stitch_chunks(
         self,

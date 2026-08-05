@@ -25,10 +25,13 @@ exp_dir: experiments/reflow_vae
 # ---- 训练超参 ----
 batch_size: 48                     # 原项目默认 48
 max_frames: 172                    # 训练片段 (帧), 对应原项目 duration=2s @ 44.1k/512
-num_workers: 8
+num_workers: 2                     # [可调] 8+ 会 SIGTERM, 2 稳定
 max_steps: 500000
 val_interval: 2000
 save_interval: 2000
+limit_val_batches: 0               # 跳过验证 (sample 慢; 开启设 1.0)
+# Checkpoint 策略: 保留完整 checkpoint (权重+优化器), 可从任意 checkpoint 完美 resume
+keep_last_n: 5                    # 保留最近 N 个 checkpoint + last (-1 = 全保留)
 precision: bf16-mixed
 
 # ---- 优化器 (原项目用 AdamW) ----

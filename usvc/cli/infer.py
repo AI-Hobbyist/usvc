@@ -35,11 +35,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-ratio", type=float, default=0.0, help="retrieval blend ratio (0-1)")
     p.add_argument("--cluster-path", default=None, help="cluster model .pt (so-vits style)")
     p.add_argument("--cluster-ratio", type=float, default=0.0, help="cluster blend ratio (0-1)")
-    # 浅扩散 (so-vits -shd)
+    # 浅扩散 (so-vits -shd; 也支持 rvc)
     p.add_argument("--shd", "--shallow-diffusion", dest="shallow_diffusion",
                    action="store_true", default=False,
-                   help="sovits shallow diffusion: enhance via an independent "
-                        "diffusion model (需要 --diffusion-ckpt/--diffusion-config)")
+                   help="shallow diffusion: enhance sovits/rvc output via an "
+                        "independent diffusion model + PC vocoder "
+                        "(需要 --diffusion-ckpt/--diffusion-config)")
     p.add_argument("--diffusion-ckpt", default=None, help="diffusion model checkpoint")
     p.add_argument("--diffusion-config", default=None, help="diffusion model config yaml")
     p.add_argument("--k-step", type=int, default=100, help="shallow diffusion steps (default 100)")
@@ -47,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="sampling method: ddim|ddpm|plms (default ddim)")
     p.add_argument("--diffusion-speedup", type=int, default=10,
                    help="sampling speedup (default 10)")
+    # reflow shallow diffusion (DDSP6 RectifiedFlow; sovits/rvc)
+    p.add_argument("--reflow-ckpt", default=None,
+                   help="DDSP6 reflow model checkpoint (enables reflow enhancer)")
+    p.add_argument("--reflow-config", default=None,
+                   help="DDSP6 reflow model config yaml")
+    p.add_argument("--t-start", type=float, default=0.5,
+                   help="reflow ODE start time [0,1): 0=full gen, ->1=keep gt "
+                        "(default 0.5; only used with --reflow-ckpt)")
     args = p.parse_args(argv)
 
     from ..infer.engine import InferenceEngine
@@ -56,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device, half=args.half,
         diffusion_ckpt=args.diffusion_ckpt,
         diffusion_config=args.diffusion_config,
+        reflow_ckpt=args.reflow_ckpt,
+        reflow_config=args.reflow_config,
+        t_start=args.t_start,
     )
 
     output = args.output
@@ -77,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         k_step=args.k_step,
         diffusion_method=args.diffusion_method,
         diffusion_speedup=args.diffusion_speedup,
+        t_start=args.t_start,
     )
     print(f"[usvc-infer] {args.input} -> {output} "
           f"(backend={engine.backend_name}, sr={engine.sr}, half={args.half})")

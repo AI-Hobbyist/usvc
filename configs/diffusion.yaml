@@ -24,10 +24,13 @@ exp_dir: experiments/diffusion     # 输出目录
 # ---- 训练超参 ----
 batch_size: 48                     # [可调] 原项目默认 48; A10G 24GB 安全
 max_frames: 256                    # [可调] 训练片段长度(帧)
-num_workers: 8                     # [可调] dataloader worker 数
+num_workers: 2                     # [可调] 8+ 会 SIGTERM, 2 稳定
 max_steps: 500000                  # [可调] 总训练步数
 val_interval: 2000                 # [可调] 验证间隔(步)
 save_interval: 2000                # [可调] checkpoint 保存间隔(步)
+limit_val_batches: 0               # 跳过验证 (sample 慢; 开启设 1.0)
+# Checkpoint 策略: 保留完整 checkpoint (权重+优化器), 可从任意 checkpoint 完美 resume
+keep_last_n: 5                    # 保留最近 N 个 checkpoint + last (-1 = 全保留)
 precision: bf16-mixed              # [可调] bf16 AMP (已验证近无损)
 
 # ---- 优化器 ----
