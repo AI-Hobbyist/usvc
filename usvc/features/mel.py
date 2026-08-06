@@ -131,15 +131,21 @@ class MelExtractor:
                 w = torch.from_numpy(w).float()
             norms.append(w.to(dev).float())
 
+        # Skip degenerate clips (empty / too short for a single frame).  They
+        # cannot be reflect-padded and would crash the whole batch.
+        keep = [w for w in norms if w.shape[0] >= 2]
+        if not keep:
+            return [torch.zeros(1, self.n_mels, device=dev) for _ in norms]
+
         # Per-clip reflect-pad (correct boundary), then right-zero-pad to max.
         if pad:
             padded = [
                 torch.nn.functional.pad(w.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
-                for w in norms
+                for w in keep
             ]
         else:
-            padded = norms
-        lens = [w.shape[0] for w in norms]  # original lengths, for frame counts
+            padded = keep
+        lens = [w.shape[0] for w in keep]  # original lengths, for frame counts
         lmax = max(p.shape[0] for p in padded)
         batched = torch.zeros(len(padded), lmax, device=dev)
         for i, p in enumerate(padded):

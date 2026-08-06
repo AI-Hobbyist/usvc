@@ -177,12 +177,17 @@ def run_training(cfg: TrainConfig, resume: str | None = None):
         from pathlib import Path
 
         # Collect all pretrained state_dicts.  so-vits-svc base models ship
-        # G_0.pth (generator) and D_0.pth (discriminator) separately; if the
-        # user points at G_0.pth we also try to load the sibling D_0.pth.
+        # G_0.pth (generator) and D_0.pth (discriminator) separately; RVC
+        # ships f0G48k.pth / f0D48k.pth.  If the user points at the
+        # generator file we also try to load the sibling discriminator file.
         pretrained_paths = [Path(cfg.pretrained)]
         p = Path(cfg.pretrained)
         if p.name == "G_0.pth":
             d0 = p.with_name("D_0.pth")
+            if d0.exists():
+                pretrained_paths.append(d0)
+        elif "G" in p.stem and "D" not in p.stem:
+            d0 = p.with_name(p.name.replace("G", "D", 1))
             if d0.exists():
                 pretrained_paths.append(d0)
 

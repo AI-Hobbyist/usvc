@@ -105,7 +105,7 @@ def _run_alternating(module_cls, cfg, B, T, seg, hop, rvc, n_steps=8):
         pytest.param(
             RVCModule,
             {"segment_size": 36, "num_speaker": 200, "spk_embed_dim": 200,
-             "n_units": 768, "spec_channels": 1025, "sr": 48000, "hop": 480},
+             "n_units": 768, "spec_channels": 1025, "sr": 48000, "hop_length": 480},
             2, 36, 480, True,
             id="rvc",
         ),

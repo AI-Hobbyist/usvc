@@ -37,3 +37,7 @@ meta.json
 
 # Benchmark reports (regenerate locally)
 *_report.json
+.pi-subagents
+logs
+usvc-spec
+experiments

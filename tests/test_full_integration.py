@@ -185,27 +185,27 @@ def test_all_features_44100(tmp_path: Path) -> None:
 
 
 def test_sovits_backend(tmp_path: Path) -> None:
-    """so-vits: 80-mel + spec + hubertsoft units."""
-    print("\n=== TEST: so-vits backend (80mel + spec + hubertsoft) ===")
+    """so-vits: 80-mel + spec + contentvec units (4.1 default)."""
+    print("\n=== TEST: so-vits backend (80mel + spec + contentvec768) ===")
     src = tmp_path / "voice_src2"
     ds = tmp_path / "ds_sovits"
     _make_voice_audio(src)
     _stage_dataset(ds, src, sr=44100, hop=512)
 
-    spec = SoVitsBackend.feature_spec({})
+    spec = SoVitsBackend.feature_spec({})  # 默认 contentvec (4.1)
     spec.f0.params["model_ckpt"] = RMVPE
-    spec.units.params["model_ckpt"] = HSOFT
+    spec.units.params["model_ckpt"] = CVEC
     engine = PreprocessEngine(ds)
     engine.run([spec], device="cpu")
 
     mel = _load_feature(ds, "mel", "spk_a", "a1")
     spec_t = _load_feature(ds, "spec", "spk_a", "a1")
-    hs = _load_units(ds, "hubertsoft", "spk_a", "a1")
+    cv = _load_units(ds, "contentvec", "spk_a", "a1")
     assert mel.shape[1] == 80, f"so-vits mel should be 80, got {mel.shape[1]}"
     assert spec_t.shape[1] == 1025, f"spec should be n_fft/2+1=1025, got {spec_t.shape[1]}"
-    assert hs.shape[1] == 256, f"hubertsoft dim should be 256"
-    assert mel.shape[0] == spec_t.shape[0] == hs.shape[0], "frame mismatch"
-    print(f"  mel={tuple(mel.shape)}(80mel) spec={tuple(spec_t.shape)} hs={tuple(hs.shape)}(256d) ✓")
+    assert cv.shape[1] == 768, f"contentvec dim should be 768"
+    assert mel.shape[0] == spec_t.shape[0] == cv.shape[0], "frame mismatch"
+    print(f"  mel={tuple(mel.shape)}(80mel) spec={tuple(spec_t.shape)} cv={tuple(cv.shape)}(768d) ✓")
     print("PASS test_sovits_backend")
 
 
@@ -287,11 +287,11 @@ def test_long_audio_alignment(tmp_path: Path) -> None:
 
 
 def test_all_backends_declared() -> None:
-    """All 5 backends have DEFAULT_FEATURES and implement feature_spec."""
+    """All 6 backends have DEFAULT_FEATURES and implement feature_spec."""
     print("\n=== TEST: all backends declared ===")
     from usvc.cli.preprocess import _BACKENDS
 
-    assert set(_BACKENDS.keys()) == {"rift_dit", "ddsp6", "diffusion", "sovits", "rvc"}
+    assert set(_BACKENDS.keys()) == {"rift_dit", "ddsp6", "diffusion", "sovits", "rvc", "reflow_vae", "reflow_shallow"}
     for name, cls in _BACKENDS.items():
         s = cls.feature_spec({})
         assert len(s.all_required()) >= 3, f"{name} needs >=3 features"
