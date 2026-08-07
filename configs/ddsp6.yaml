@@ -60,7 +60,7 @@ backend_opts:
   # t_start: 0.0                   # [可调] flow 起始时间 (6.1 用 0.7)
   # use_norm: true                 # [可调] 是否使用 LayerNorm
   # use_attention: false           # [可调] 是否使用注意力
-  # use_pitch_aug: true            # [可调] 音高增强
+  use_pitch_aug: true             # [可调] 音高增强 (原项目默认开; 预处理时生成 aug_mel/aug_shift)
   num_speaker: 1                   # [可调] 说话人数
   n_units: 768                     # [可调] 内容编码器维度: 768 (contentvec) / 256 (hubertsoft)
 

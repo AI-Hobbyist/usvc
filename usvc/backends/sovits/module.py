@@ -80,6 +80,7 @@ class SoVITSModule(BaseGANModule):
             batch.units, batch.f0, batch.mel, batch.wav, batch.spk_id,
             frame_len=batch.frame_len,
             vol=batch.rms,  # [B, T] volume (only used if vol_embedding=True)
+            uv=batch.uv,  # [B, T] voicing from raw f0 (pre-interpolation)
         )
 
     def generator_loss(self, batch: SVCBatch, out=None):

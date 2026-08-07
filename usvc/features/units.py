@@ -114,6 +114,7 @@ class UnitsExtractor:
         T_target must equal mel/f0/rms frame count, which is derived from the
         audio length at the dataset sample rate (not the 16kHz encoder input rate).
         We convert wav16k_len back to the equivalent dataset-sr length.
+        Uses floor mapping to match so-vits-svc repeat_expand_2d_left.
         """
         # Map dataset hop frame index -> native encoder frame index.
         ratio = (self.hop / self.sr) / (self.hop_native / self.sr_in)
@@ -121,8 +122,9 @@ class UnitsExtractor:
         wav_ds_len = int(round(wav16k_len * self.sr / self.sr_in))
         T_target = frame_len_for(wav_ds_len, self.hop)  # same formula as mel/f0
         T_native = units.shape[0]
+        # floor mapping (matches so-vits repeat_expand_2d_left: src[floor(i*ratio)])
         idx = torch.clamp(
-            torch.round(ratio * torch.arange(T_target, device=units.device)).long(),
+            torch.floor(ratio * torch.arange(T_target, device=units.device)).long(),
             max=T_native - 1,
         )
         return units[idx]

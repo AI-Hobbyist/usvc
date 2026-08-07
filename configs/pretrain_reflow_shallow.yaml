@@ -1,0 +1,45 @@
+# ============================================================
+# usvc 预训练配置: reflow_shallow 通用底模 (110h 纯歌声)
+# ============================================================
+# 目标: 说话人无关的 mel 精炼器 (清亮、不闷哑、不电音)
+#   - 从零训练 (无 DDSP6 迁移污染)
+#   - t_start=0.5 浅层偏置 (对齐推理区间, 修复 l2_lognorm 高频训练不足)
+#   - infer_step 20 (ReflowEnhancer 默认)
+# 数据: data/singing (55598 纯歌声, 44.1k/512, mel 128-bin)
+# ============================================================
+
+backend: reflow_shallow
+dataset_dir: data/singing
+exp_dir: experiments/pretrain_reflow_shallow
+
+batch_size: 48
+max_frames: 128
+num_workers: 2
+max_steps: 120000
+val_interval: 10000
+save_interval: 10000
+limit_val_batches: 0
+keep_last_n: 3
+precision: bf16-mixed
+
+optimizer:
+  type: adamw
+  lr: 0.0004
+  betas: [0.9, 0.98]
+  weight_decay: 0.0
+schedule:
+  type: null
+
+# 从零训练: 无 pretrained (消除 DDSP6 频谱先验污染)
+
+backend_opts:
+  out_dims: 128
+  n_layers: 6
+  n_chans: 768
+  n_units: 768            # contentvec 维度
+  num_speaker: 1
+  n_hidden: 256           # condition 嵌入维度 (= LYNXNet2 dim_cond)
+  t_start: 0.5            # 训练 t 采样下界 (浅层偏置, 对齐推理区间 [0.5,1))
+  infer_t_start: 0.5      # 验证/sample 时的 t_start
+
+grad_clip: 1.0

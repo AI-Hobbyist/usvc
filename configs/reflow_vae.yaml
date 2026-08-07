@@ -54,7 +54,7 @@ backend_opts:
   n_chans: 512                     # [可调] 速度网络通道数
   n_hidden: 256                    # [可调] condition 隐藏维度
   use_attention: true              # [可调] VAE 是否用 attention (false 时 unit_embed 直出 out_dims)
-  use_pitch_aug: false             # [可调] 音高增强 (加载原项目 ckpt 需匹配原设置)
+  use_pitch_aug: false             # [可调] 音高增强; 置 true 时预处理会生成 aug_mel/aug_shift 并在训练时 50% 使用 (需重新预处理)
   out_dims: 128                    # mel bins (通常不改)
   num_speaker: 1                   # [可调] 说话人数
   n_units: 768                     # contentvec 维度

@@ -61,8 +61,23 @@ class RIFTModule(BaseSVCModule):
         )
         return loss, {"flow_loss": loss.item()}
 
-    def sample(self, batch: SVCBatch):
-        """Generate mel via ODE sampling for validation."""
+    def sample(
+        self,
+        batch: SVCBatch,
+        ds_cfg_strength: float = 0.0,
+        spk_cfg_strength: float = 0.0,
+        skip_cfg_strength: float = 0.0,
+        cfg_rescale: float = 0.7,
+        bad_cvec: torch.Tensor | None = None,
+        steps: int | None = None,
+    ):
+        """Generate mel via ODE sampling.
+
+        CFG (classifier-free guidance) parameters are passed through to
+        RIFTDiTModel.sample; defaults keep validation CFG-free. bad_cvec is
+        required when ds_cfg_strength > 0 (RIFT-SVC semantics).
+        steps: ODE integration steps (default eval_sample_steps).
+        """
         with torch.no_grad():
             result = self.model.sample(
                 batch.mel,
@@ -71,7 +86,12 @@ class RIFTModule(BaseSVCModule):
                 batch.rms,
                 batch.units,
                 batch.frame_len,
-                steps=self.eval_sample_steps,
+                steps=steps if steps is not None else self.eval_sample_steps,
+                bad_cvec=bad_cvec,
+                ds_cfg_strength=ds_cfg_strength,
+                spk_cfg_strength=spk_cfg_strength,
+                skip_cfg_strength=skip_cfg_strength,
+                cfg_rescale=cfg_rescale,
             )
         # sample returns (mel_gen, trajectory)
         if isinstance(result, tuple):

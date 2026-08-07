@@ -7,6 +7,7 @@ Optional fields (mel, wav, rms, uv, aug_shift) are filled per-backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -147,6 +148,9 @@ class BaseSVCDataset(Dataset):
         self.augment = augment
         self.keys: list[str] = []
         self._rng = torch.Generator().manual_seed(seed)
+        # Pitch-aug dirs (None = feature not preprocessed -> no augmentation).
+        self._aug_mel_dir: Path | None = None
+        self._aug_shift_dir: Path | None = None
 
     def __len__(self) -> int:
         return len(self.keys)
@@ -170,6 +174,37 @@ class BaseSVCDataset(Dataset):
 
     def _augment(self, item: dict) -> dict:
         """Override for backend-specific augmentation (pitch shift, vol aug, etc.)."""
+        return item
+
+    def _pitch_augment(self, item: dict) -> dict:
+        """Pitch augmentation (DDSP-SVC style): 50% chance swap in the
+        pre-computed aug_mel and shift f0 by the file's recorded aug_shift.
+
+        Requires aug_mel/aug_shift features preprocessed (else no-op).
+        """
+        if not self.augment or self._aug_mel_dir is None or self._aug_shift_dir is None:
+            return item
+        # Always attach aug_shift so svc_collate never sees a missing key in a
+        # mixed batch (it keys off samples[0]). 0 = no shift = un-augmented.
+        # Shape [1, 1] per sample -> collate pads to [B, 1, 1], matching the
+        # original DDSP-SVC convention (data_loaders.py: [[shift]]), so
+        # aug_shift_embed(aug_shift/5) yields [B, 1, dim] broadcastable to x.
+        if torch.rand(1, generator=self._rng).item() >= 0.5:
+            item["aug_shift"] = torch.zeros(1, 1)
+            return item  # 50% un-augmented
+        spk, fn = item["key"]
+        stem = fn.rsplit(".", 1)[0] + ".pt"
+        aug_mel_path = self._aug_mel_dir / spk / stem
+        aug_shift_path = self._aug_shift_dir / spk / stem
+        if not aug_mel_path.is_file() or not aug_shift_path.is_file():
+            item["aug_shift"] = torch.zeros(1, 1)
+            return item
+        aug_mel = self._load_pt(aug_mel_path)
+        shift = self._load_pt(aug_shift_path).item()
+        T = item["mel"].shape[0]
+        item["mel"] = aug_mel[:T]
+        item["f0"] = item["f0"] * (2.0 ** (shift / 12.0))
+        item["aug_shift"] = torch.tensor([[shift]], dtype=torch.float32)
         return item
 
     def _crop(self, item: dict) -> dict:

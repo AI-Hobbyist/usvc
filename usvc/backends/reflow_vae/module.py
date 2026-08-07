@@ -59,8 +59,11 @@ class ReflowVAEModule(BaseSVCModule):
         )
         return loss, sub
 
-    def sample(self, batch: SVCBatch):
-        """Generate mel for validation via VAE latent + ODE sampling."""
+    def sample(self, batch: SVCBatch, steps: int | None = None):
+        """Generate mel for validation via VAE latent + ODE sampling.
+
+        steps: ODE integration steps (default 10).
+        """
         units = batch.units
         f0 = batch.f0
         volume = batch.rms if batch.rms is not None else None
@@ -74,5 +77,6 @@ class ReflowVAEModule(BaseSVCModule):
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id, aug_shift=aug_shift,
                 frame_len=batch.frame_len,
+                infer_step=steps if steps is not None else 10,
             )
         return mel_gen

@@ -487,11 +487,16 @@ class TextEncoder(nn.Module):
         pitch,
         lengths,
         skip_head=None,
+        vol_emb: torch.Tensor | None = None,
     ):
         if pitch is None:
             x = self.emb_phone(phone)
         else:
             x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        if vol_emb is not None:
+            # [b, t, h] volume embedding (vol_embedding mode; same slot as
+            # so-vits emb_vol, added pre-encoder)
+            x = x + vol_emb
         x = x * math.sqrt(self.hidden_channels)  # [b, t, h]
         x = self.lrelu(x)
         x = torch.transpose(x, 1, -1)  # [b, h, t]
@@ -549,6 +554,7 @@ class RVCModel(nn.Module):
         gin_channels=256,
         sr=48000,
         is_half=False,
+        vol_embedding=False,
         **kwargs,
     ):
         super().__init__()
@@ -607,6 +613,9 @@ class RVCModel(nn.Module):
             inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels
         )
         self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
+        self.vol_embedding = vol_embedding
+        if vol_embedding:
+            self.emb_vol = nn.Linear(1, hidden_channels)
 
     def remove_weight_norm(self):
         self.dec.remove_weight_norm()
@@ -623,6 +632,7 @@ class RVCModel(nn.Module):
         wave: torch.Tensor | None = None,   # [B, 1, L] real wave (unused; API parity)
         spk_id: torch.Tensor | None = None,  # [B] speaker id
         frame_len: torch.Tensor | None = None,  # [B] units frame lengths
+        vol: torch.Tensor | None = None,  # [B, T] volume (only if vol_embedding)
     ) -> dict:
         """Training forward. Returns dict for loss computation.
 
@@ -651,7 +661,12 @@ class RVCModel(nn.Module):
         # RVC aligns spec length to units length (same as sovits)
         spec_lengths = phone_lengths
 
-        m_p, logs_p, x_mask = self.enc_p(units, pitch_token, phone_lengths)
+        vol_emb = (
+            self.emb_vol(vol[:, :, None])  # [B, T, 1] -> [B, T, h]
+            if vol is not None and self.vol_embedding
+            else None
+        )
+        m_p, logs_p, x_mask = self.enc_p(units, pitch_token, phone_lengths, vol_emb=vol_emb)
         z, m_q, logs_q, y_mask = self.enc_q(spec, spec_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
         z_slice, pitchf_slice, ids_slice = rand_slice_segments_with_pitch(
@@ -681,6 +696,7 @@ class RVCModel(nn.Module):
         skip_head=None,
         return_length=None,
         return_length2=None,
+        vol: torch.Tensor | None = None,
     ):
         """RVC SynthesizerTrnMs256NSFsid.infer (verbatim from RVC models.py).
 
@@ -695,6 +711,11 @@ class RVCModel(nn.Module):
             (o, x_mask, (z, z_p, m_p, logs_p)): wav [B, 1, L] + intermediates.
         """
         g = self.emb_g(sid).unsqueeze(-1)
+        vol_emb = (
+            self.emb_vol(vol[:, :, None])  # [B, T, 1] -> [B, T, h]
+            if vol is not None and self.vol_embedding
+            else None
+        )
         if skip_head is not None and return_length is not None:
             head = int(skip_head.item()) if isinstance(skip_head, torch.Tensor) else int(skip_head)
             length = (
@@ -704,14 +725,14 @@ class RVCModel(nn.Module):
             )
             flow_head = max(head - 24, 0)
             dec_head = head - flow_head
-            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head)
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head, vol_emb=vol_emb)
             z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
             z = z[:, :, dec_head : dec_head + length]
             x_mask = x_mask[:, :, dec_head : dec_head + length]
             nsff0 = nsff0[:, head : head + length]
         else:
-            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, vol_emb=vol_emb)
             z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
         o = self.dec(z * x_mask, nsff0, g=g, n_res=return_length2)

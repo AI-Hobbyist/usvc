@@ -22,8 +22,9 @@ def _default_spec() -> FeatureSpec:
         spec=FeatureConfig("spec", {"n_fft": 2048, "win_length": 2048, "center": False}),
         f0=FeatureConfig(
             "f0",
-            {"extractor": "rmvpe", "uv_policy": "raw", "model_ckpt": "pretrained/rmvpe/model.pt"},
+            {"extractor": "rmvpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
         ),
+        rms=FeatureConfig("rms", {"win_length": 2048}),
         units=FeatureConfig(
             "units",
             {
@@ -50,6 +51,7 @@ class RVCBackend(Backend):
                 mel=base.mel,
                 spec=base.spec,
                 f0=base.f0,
+                rms=base.rms,
                 units=FeatureConfig(
                     "units",
                     {

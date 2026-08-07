@@ -8,12 +8,31 @@ from __future__ import annotations
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ...data.meta import load_meta
 from ...train.dataset import BaseSVCDataset
 
-__all__ = ["SoVITSDataset"]
+__all__ = ["SoVITSDataset", "interp_unvoiced_f0"]
+
+
+def interp_unvoiced_f0(f0: torch.Tensor) -> torch.Tensor:
+    """Linear-interpolate unvoiced (f0==0) frames (so-vits/RVC convention).
+
+    Callers must capture the raw voicing mask (uv = f0 > 0) BEFORE calling
+    this: sovits keeps emb_uv conditioned on the true unvoiced frames while
+    the NSF source receives the fully-voiced interpolated f0.
+    """
+    voiced = f0 > 0
+    if not voiced.any():
+        return f0
+    device, dtype = f0.device, f0.dtype
+    f0_np = f0.detach().float().cpu().numpy()
+    unvoiced_idx = np.where(~(f0_np > 0))[0]
+    voiced_idx = np.where(f0_np > 0)[0]
+    f0_np[unvoiced_idx] = np.interp(unvoiced_idx, voiced_idx, f0_np[voiced_idx])
+    return torch.from_numpy(f0_np).to(device=device, dtype=dtype)
 
 
 class SoVITSDataset(BaseSVCDataset):
@@ -87,8 +106,10 @@ class SoVITSDataset(BaseSVCDataset):
             wav, _ = sf.read(str(wav_path), dtype="float32")
             wav = torch.from_numpy(wav)
 
-        # uv from f0
+        # uv from raw f0 (must be captured before interpolation: emb_uv keeps
+        # the true voicing while the NSF source gets fully-voiced f0)
         uv = (f0 > 0).float()
+        f0 = interp_unvoiced_f0(f0)
 
         # Align frame-level features; apply fixed-length crop/pad to spec so
         # batching is consistent. NOTE: spec is [T, C] here (frames first);

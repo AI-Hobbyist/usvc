@@ -130,7 +130,7 @@ class TrainConfig:
     # SAME values, so from_yaml merges any top-level occurrence into backend_opts
     # (backend_opts wins on conflict to keep existing configs working).
     _FEATURE_OVERRIDE_KEYS = (
-        "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+        "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt", "uv_policy",
         "n_mels", "fmin", "fmax", "rvc_version", "version",
     )
 

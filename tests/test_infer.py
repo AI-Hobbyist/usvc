@@ -350,3 +350,47 @@ class TestEngine:
         out = engine.convert(str(wav_in), spk=0, trans=0)
         assert not np.isnan(out).any()
         assert 0.7 < out.shape[0] / sr < 1.4
+
+    def test_engine_rvc_original_weights_format(self, tmp_path):
+        """原版 RVC 权重格式 (顶层 model 键 + 裸 generator key) 能被 engine 加载.
+
+        同时验证: emb_g shape 不匹配 (num_speaker 不同) 时跳过而非报错,
+        enc_q 缺失 (发布版剔除) 时容忍.
+        """
+        import torch
+        from usvc.backends import get_backend
+        from usvc.train.config import TrainConfig
+        from usvc.infer.engine import InferenceEngine
+        from usvc.infer.features import synth_test_wav
+
+        backend, sr = "rvc", 48000
+        opts = {"n_units": 768, "num_speaker": 1, "sr": 48000, "segment_size": 20,
+                "inter_channels": 64, "hidden_channels": 64, "filter_channels": 128}
+        # 构建 module 拿到 generator state_dict, 剥离 generator. 前缀模拟原版格式
+        cfg = TrainConfig(backend=backend)
+        cfg.backend_opts = opts
+        module = get_backend(backend)().build_module(cfg)
+        gen_sd = module.generator.state_dict()
+        bare = {k.removeprefix("generator."): v for k, v in gen_sd.items()}
+        # emb_g 用 109 说话人 (shape 不匹配 num_speaker=1)
+        bare["emb_g.weight"] = torch.randn(109, 256)
+        # 剔除 enc_q (原版发布版做法)
+        bare = {k: v for k, v in bare.items() if not k.startswith("enc_q.")}
+        torch.save({"model": bare, "iteration": 0, "learning_rate": 1e-4},
+                   tmp_path / "orig_rvc.pth")
+
+        cfg_path = tmp_path / "rvc_orig.yaml"
+        _write_cfg(backend, opts, cfg_path)
+        wav_in = tmp_path / "in.wav"
+        synth_test_wav(wav_in, sr=sr, duration=1.0, f0_base=220.0)
+        engine = InferenceEngine(cfg_path, tmp_path / "orig_rvc.pth", device="cuda")
+        out = engine.convert(str(wav_in), spk=0, trans=0)
+        assert not np.isnan(out).any()
+        assert 0.7 < out.shape[0] / sr < 1.4
+
+        # 恢复 enc_q 后也应能加载 (完整版原版权重)
+        bare2 = {k.removeprefix("generator."): v for k, v in gen_sd.items()}
+        bare2["emb_g.weight"] = torch.randn(109, 256)
+        torch.save({"model": bare2}, tmp_path / "orig_rvc_full.pth")
+        engine2 = InferenceEngine(cfg_path, tmp_path / "orig_rvc_full.pth", device="cuda")
+        assert engine2.module.generator is not None

@@ -17,6 +17,7 @@ class DiffusionModule(BaseSVCModule):
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
         opts = cfg.backend_opts
+        self.k_step = opts.get("k_step", 1000)
 
         self.model = DiffusionModel(
             n_units=opts.get("n_units", 768),
@@ -25,7 +26,7 @@ class DiffusionModule(BaseSVCModule):
             timesteps=opts.get("timesteps", 1000),
             n_hidden=opts.get("n_hidden", 256),
             use_pitch_aug=opts.get("use_pitch_aug", False),
-            k_step=opts.get("k_step", 1000),
+            k_step=self.k_step,
             denoiser=opts.get("denoiser", "convnext"),
             wn_layers=opts.get("wn_layers", 20),
             wn_chans=opts.get("wn_chans", 384),
@@ -52,7 +53,12 @@ class DiffusionModule(BaseSVCModule):
         )
         return loss, sub
 
-    def sample(self, batch: SVCBatch):
+    def sample(self, batch: SVCBatch, steps: int | None = None):
+        """Sample mel from condition (full diffusion from noise).
+
+        steps: total sampling steps (default k_step//10, i.e. infer_speedup=10
+        as in Diffusion-SVC). Converts to the model's infer_speedup interval.
+        """
         units = batch.units
         f0 = batch.f0
         volume = batch.rms if batch.rms is not None else None
@@ -61,9 +67,14 @@ class DiffusionModule(BaseSVCModule):
         if volume is None:
             volume = (batch.mel.exp() - 1e-6).clamp(min=1e-6).sqrt().mean(dim=-1)
 
+        kwargs = {}
+        if steps is not None:
+            kwargs["infer_speedup"] = max(1, self.k_step // max(1, steps))
+
         with torch.no_grad():
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id,
                 aug_shift=batch.aug_shift,
+                **kwargs,
             )
         return mel_gen

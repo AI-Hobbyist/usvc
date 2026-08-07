@@ -63,6 +63,7 @@ class RVCModule(BaseGANModule):
             sr=sr,
             upsample_rates=up,
             upsample_kernel_sizes=k,
+            vol_embedding=opts.get("vol_embedding", False),
         )
         self.discriminator = MultiPeriodDiscriminatorV2(
             use_spectral_norm=opts.get("use_spectral_norm", False),
@@ -105,7 +106,8 @@ class RVCModule(BaseGANModule):
         """
         units, pitch_token, pitchf, spec, wave, spk_id = self._prepare_inputs(batch)
         return self.generator(
-            units, pitch_token, pitchf, spec, wave, spk_id, frame_len=batch.frame_len
+            units, pitch_token, pitchf, spec, wave, spk_id, frame_len=batch.frame_len,
+            vol=batch.rms,  # [B, T] volume (only used if vol_embedding=True)
         )
 
     def generator_loss(self, batch: SVCBatch, out=None):
@@ -222,6 +224,7 @@ class RVCModule(BaseGANModule):
                 (units.shape[0],), units.shape[1], device=units.device, dtype=torch.long
             )
             out, *_ = self.generator.infer(
-                units, phone_lengths, pitch_token, pitchf, spk_id
+                units, phone_lengths, pitch_token, pitchf, spk_id,
+                vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)
             )
         return out

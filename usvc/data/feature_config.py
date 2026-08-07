@@ -28,7 +28,7 @@ class FeatureConfig:
     must NOT be here, or the hash becomes machine-specific.
     """
 
-    kind: str  # "mel" | "f0" | "rms" | "spec" | "units"
+    kind: str  # "mel" | "f0" | "rms" | "spec" | "units" | "aug_shift" | "aug_mel"
     params: dict[str, Any] = field(default_factory=dict)
 
     def hash(self) -> str:
@@ -37,7 +37,8 @@ class FeatureConfig:
         # (window centered at k*hop + (win-hop)//2). Bumping this tag invalidates
         # stale .pt artifacts produced by the old symmetric n_fft//2 padding so
         # they are recomputed on the corrected grid. units/f0 are unaffected.
-        if self.kind in ("mel", "spec", "rms"):
+        # aug_mel uses the same grid (keyshift keeps the frame grid).
+        if self.kind in ("mel", "spec", "rms", "aug_mel"):
             blob["_grid"] = "nvstft_v2"
         return hashlib.sha256(_stable_json(blob).encode()).hexdigest()[:16]
 
@@ -67,9 +68,25 @@ class FeatureSpec:
     rms: FeatureConfig | None = None
     spec: FeatureConfig | None = None
     units: FeatureConfig | None = None
+    aug_shift: FeatureConfig | None = None
+    aug_mel: FeatureConfig | None = None
 
     def all_required(self) -> list[FeatureConfig]:
-        return [c for c in (self.mel, self.f0, self.rms, self.spec, self.units) if c is not None]
+        # aug_shift MUST precede aug_mel: preprocessing computes aug_mel by
+        # reading the per-file aug_shift scalar (run() processes in this order).
+        return [
+            c
+            for c in (
+                self.mel,
+                self.f0,
+                self.rms,
+                self.spec,
+                self.units,
+                self.aug_shift,
+                self.aug_mel,
+            )
+            if c is not None
+        ]
 
     def as_hash_map(self) -> dict[str, str]:
         """Map feature kind -> hash, for dataset construction."""
@@ -80,6 +97,8 @@ class FeatureSpec:
             ("rms", self.rms),
             ("spec", self.spec),
             ("units", self.units),
+            ("aug_shift", self.aug_shift),
+            ("aug_mel", self.aug_mel),
         ):
             if cfg is not None:
                 out[name] = cfg.hash()

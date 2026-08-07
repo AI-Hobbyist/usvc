@@ -24,7 +24,7 @@ def _default_spec() -> FeatureSpec:
         ),
         f0=FeatureConfig(
             "f0",
-            {"extractor": "rmvpe", "uv_policy": "raw", "model_ckpt": "pretrained/rmvpe/model.pt"},
+            {"extractor": "rmvpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
         ),
         rms=FeatureConfig("rms", {"win_length": 1024}),  # DDSP6 volume_smooth_size
         units=FeatureConfig(
@@ -48,7 +48,7 @@ class DDSP6Backend(Backend):
     @staticmethod
     def feature_spec(train_cfg: dict) -> FeatureSpec:
         base = DDSP6Backend.DEFAULT_FEATURES
-        f0 = resolve_f0_config(train_cfg)
+        f0 = resolve_f0_config(train_cfg, default_uv_policy="interp")
         version = str(train_cfg.get("version", "6.3"))
         units_kind = train_cfg.get("units_kind")
         # 6.1's default encoder is contentvec768l12 (no tta2x, hop 320).
@@ -79,7 +79,19 @@ class DDSP6Backend(Backend):
             )
         else:
             units = base.units
-        return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
+        spec = FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=units)
+        # Pitch augmentation (DDSP-SVC default ON): offline aug_mel + per-file
+        # keyshift; dataset applies them 50% of the time during training.
+        if train_cfg.get("use_pitch_aug"):
+            spec = FeatureSpec(
+                mel=base.mel,
+                f0=f0,
+                rms=base.rms,
+                units=units,
+                aug_shift=FeatureConfig("aug_shift", {"range": [-5.0, 5.0]}),
+                aug_mel=FeatureConfig("aug_mel", dict(base.mel.params)),
+            )
+        return spec
 
     def build_dataset(
         self, dataset_dir: str, split: str, feature_hashes: dict[str, str]

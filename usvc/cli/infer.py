@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-ratio", type=float, default=0.0, help="retrieval blend ratio (0-1)")
     p.add_argument("--cluster-path", default=None, help="cluster model .pt (so-vits style)")
     p.add_argument("--cluster-ratio", type=float, default=0.0, help="cluster blend ratio (0-1)")
+    p.add_argument("--rms-mix-rate", type=float, default=1.0,
+                   help="output RMS envelope match to input (1.0=off, 0.0=fully input envelope)")
+    p.add_argument("--protect", type=float, default=0.5,
+                   help="blend source units back on speech frames (<0.5 enables, 0.33 typical; "
+                        "only meaningful with --index-path/--cluster-path)")
     # 浅扩散 (so-vits -shd; 也支持 rvc)
     p.add_argument("--shd", "--shallow-diffusion", dest="shallow_diffusion",
                    action="store_true", default=False,
@@ -90,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
         diffusion_method=args.diffusion_method,
         diffusion_speedup=args.diffusion_speedup,
         t_start=args.t_start,
+        rms_mix_rate=args.rms_mix_rate,
+        protect=args.protect,
     )
     print(f"[usvc-infer] {args.input} -> {output} "
           f"(backend={engine.backend_name}, sr={engine.sr}, half={args.half})")

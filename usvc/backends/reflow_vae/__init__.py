@@ -45,7 +45,19 @@ class ReflowVAEBackend(Backend):
             )
         else:
             units = base.units
-        return FeatureSpec(mel=mel, f0=f0, rms=base.rms, units=units)
+        spec = FeatureSpec(mel=mel, f0=f0, rms=base.rms, units=units)
+        # Pitch augmentation (off by default; enable via config).
+        # aug_mel must use the SAME mel config as ``mel``.
+        if train_cfg.get("use_pitch_aug"):
+            spec = FeatureSpec(
+                mel=mel,
+                f0=f0,
+                rms=base.rms,
+                units=units,
+                aug_shift=FeatureConfig("aug_shift", {"range": [-5.0, 5.0]}),
+                aug_mel=FeatureConfig("aug_mel", dict(mel.params)),
+            )
+        return spec
 
     def build_dataset(
         self, dataset_dir: str, split: str, feature_hashes: dict[str, str]

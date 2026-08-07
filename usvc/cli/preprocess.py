@@ -157,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         # affect preprocessing, while training reads only backend_opts).
         backend_opts = dict(raw.get("backend_opts", {}) or {})
         _OVERRIDE = (
-            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
-            "n_mels", "fmin", "fmax", "rvc_version", "version",
+            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt", "uv_policy",
+            "n_mels", "fmin", "fmax", "rvc_version", "version", "use_pitch_aug",
         )
         for k in _OVERRIDE:
             if k in raw and k not in backend_opts:

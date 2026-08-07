@@ -50,6 +50,9 @@ class DiffusionDataset(BaseSVCDataset):
         self._units_dir = (
             self.dataset_dir / "units" / encoder_kind / feature_hashes.get("units", "")
         )
+        # Pitch augmentation (present only when use_pitch_aug preprocessed them).
+        self._aug_mel_dir = self.dataset_dir / "aug_mel" / feature_hashes.get("aug_mel", "")
+        self._aug_shift_dir = self.dataset_dir / "aug_shift" / feature_hashes.get("aug_shift", "")
 
         self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
 
@@ -74,3 +77,8 @@ class DiffusionDataset(BaseSVCDataset):
             "units": units,
             "spk_id": self.spk2idx.get(spk, 0),
         }
+
+    def _augment(self, item: dict) -> dict:
+        """Pitch augmentation (Diffusion-SVC style): 50% chance use aug_mel
+        + shift f0 by 2^(shift/12)."""
+        return self._pitch_augment(item)

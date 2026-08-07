@@ -2,8 +2,13 @@
 
 Supports RMVPE and FCPE. Output is aligned to the dataset hop frame rate
 (T = len//hop + 1), matching mel's frame count for length-consistent slicing.
-UV policy is "raw" by default (f0==0 at unvoiced); backends needing interpolated
-f0 do it online.
+
+uv_policy (from FeatureConfig params, default "raw"):
+  - "raw":    unvoiced frames keep f0==0 (used by rift_dit, sovits, reflow_*)
+  - "interp": unvoiced frames filled by linear interpolation of the voiced
+              frames (same as RVC / DDSP-SVC / Diffusion-SVC preprocess;
+              used by rvc, ddsp6, diffusion). Interpolation happens on the
+              native ~100Hz grid, before resampling to the hop grid.
 
 Both extractors natively output ~100Hz frames; we linearly interpolate to the
 dataset hop rate (same alignment logic regardless of extractor).
@@ -76,6 +81,8 @@ class F0Extractor:
         # FCPE-specific
         self.fcpe_threshold = float(fc.params.get("fcpe_threshold", 0.006))
         self.fcpe_decoder = str(fc.params.get("fcpe_decoder", "local_argmax"))
+        self.uv_policy = fc.params.get("uv_policy", "raw")
+        assert self.uv_policy in ("raw", "interp"), f"unsupported uv_policy: {self.uv_policy}"
 
         if self.extractor == "rmvpe":
             ckpt = fc.params.get("model_ckpt", "pretrained/rmvpe/model.pt")
@@ -102,6 +109,9 @@ class F0Extractor:
             # FCPE output: [1, T_native, 1] -> [T_native]
             f0_native = f0_out.float().squeeze().cpu().numpy().astype(np.float32)
 
+        if self.uv_policy == "interp":
+            f0_native = self._interp_unvoiced(f0_native)
+
         return self._align_to_hop(f0_native, n_frames)
 
     @torch.inference_mode()
@@ -126,8 +136,24 @@ class F0Extractor:
             ratio = padded.shape[1] / f0_b.shape[1]
             actual_native = int(round(_lens[i].item() / ratio))
             f0_native = f0_b[i, :actual_native]
+            if self.uv_policy == "interp":
+                f0_native = self._interp_unvoiced(f0_native)
             results.append(self._align_to_hop(f0_native, nf))
         return results
+
+    def _interp_unvoiced(self, f0_native: np.ndarray) -> np.ndarray:
+        """Fill unvoiced (f0==0) frames with linear interpolation of voiced frames.
+
+        Identical to RVC / DDSP-SVC / Diffusion-SVC preprocess:
+            uv = f0 == 0; f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        Runs on the native extractor grid before resampling to the hop grid.
+        If there are no voiced frames at all, returns the input unchanged.
+        """
+        f0 = np.asarray(f0_native, dtype=np.float32).copy()
+        uv = f0 == 0
+        if len(f0[~uv]) > 0:
+            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        return f0
 
     def _align_to_hop(self, f0_native: np.ndarray, n_frames: int) -> torch.Tensor:
         """Linear-interp native 100Hz frames to dataset hop frames."""

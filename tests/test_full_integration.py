@@ -175,12 +175,13 @@ def test_all_features_44100(tmp_path: Path) -> None:
         f"male f0 ({np.mean(male_f0):.0f}) should < female ({np.mean(female_f0):.0f})"
     )
     print(f"  pitch ordering: male={np.mean(male_f0):.0f}Hz < female={np.mean(female_f0):.0f}Hz ✓")
-    # Verify dedupe: exactly one mel hash, one f0 hash, two rms hashes.
+    # Verify dedupe: one mel hash; f0 has raw (rift_dit) + interp (ddsp6/diffusion)
+    # hashes; two rms hashes.
     meta_features = engine.meta.features
     assert len(meta_features["mel"]) == 1, f"mel should dedupe to 1 hash, got {len(meta_features['mel'])}"
-    assert len(meta_features["f0"]) == 1, f"f0 should dedupe to 1 hash"
+    assert len(meta_features["f0"]) == 2, f"f0 should have 2 hashes (raw + interp)"
     assert len(meta_features["rms"]) == 2, f"rms should have 2 hashes (win2048 + win1024)"
-    print("  dedupe: mel=1 f0=1 rms=2(hashes) contentvec=2(tta2x+plain) ✓")
+    print("  dedupe: mel=1 f0=2(raw+interp) rms=2(hashes) contentvec=2(tta2x+plain) ✓")
     print("PASS test_all_features_44100")
 
 

@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from ..backends import get_backend
+from ..backends.sovits.dataset import interp_unvoiced_f0
 from ..io.audio import save_audio
 from ..nn.vocoder import NSFHiFiGAN
 from ..retrieval.predict import apply_cluster, retrieve
@@ -56,6 +57,26 @@ def _resample_units(units: torch.Tensor, target_frames: int) -> torch.Tensor:
     out = np.stack([np.interp(dst, src, u[:, d]) for d in range(u.shape[1])], axis=1)
     return torch.from_numpy(out.astype(np.float32)).to(units.device).to(units.dtype)
 
+
+def _change_rms(data1: np.ndarray, sr1: int, data2: np.ndarray, sr2: int, rate: float) -> np.ndarray:
+    """RVC pipeline.change_rms (numpy port): match output RMS envelope to input.
+
+    data1 = source (input) wav at sr1, data2 = converted wav at sr2.
+    rate=1.0 -> untouched; rate=0.0 -> fully input envelope.
+    """
+    import librosa
+
+    rms1 = librosa.feature.rms(y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2)[0]
+    rms2 = librosa.feature.rms(y=data2, frame_length=sr2 // 2 * 2, hop_length=sr2 // 2)[0]
+    n = data2.shape[0]
+    # Interpolate both envelopes to the output sample grid (np.interp clamps
+    # at the endpoints, matching F.interpolate's linear behavior).
+    env1 = np.interp(np.linspace(0, len(rms1) - 1, n), np.arange(len(rms1)), rms1)
+    env2 = np.interp(np.linspace(0, len(rms2) - 1, n), np.arange(len(rms2)), rms2)
+    env2 = np.maximum(env2, 1e-6)
+    out = data2 * (env1 ** (1 - rate)) * (env2 ** (rate - 1))
+    return np.asarray(out, dtype=np.float32)
+
 # mel-domain backends use the shared NSF-HiFiGAN vocoder
 MEL_DOMAIN = ("rift_dit", "ddsp6", "diffusion", "reflow_vae")
 # wav-domain backends decode waveform directly from the generator
@@ -75,7 +96,9 @@ _DEFAULT_SR_HOP = {
 def _load_ckpt_state(ckpt_path: str) -> dict:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict):
-        sd = ckpt.get("state_dict", ckpt)
+        # Accept common top-level wrappers: lightning (state_dict), original
+        # RVC/so-vits (model), and bare weight dicts (weight / no wrapper).
+        sd = ckpt.get("state_dict", ckpt.get("model", ckpt.get("weight", ckpt)))
     else:
         sd = ckpt
     if not isinstance(sd, dict):
@@ -113,6 +136,15 @@ class InferenceEngine:
         self.hop = int(opts.get("hop_length", opts.get("block_size", opts.get("hop", _DEFAULT_SR_HOP[self.backend_name][1]))))
         self.n_mels = int(opts.get("n_mel_channels", opts.get("out_dims", opts.get("n_mels", 128))))
 
+        # rift_dit CFG (classifier-free guidance) inference params.
+        # Default OFF (0.0); enable via config backend_opts to match RIFT-SVC
+        # defaults (ds=0.2, spk=0.8, skip=0.0, rescale=0.7).
+        # Note: spk CFG requires drop_spk_prob>0 at training time to be effective.
+        self.cfg_ds_strength = float(opts.get("ds_cfg_strength", 0.0))
+        self.cfg_spk_strength = float(opts.get("spk_cfg_strength", 0.0))
+        self.cfg_skip_strength = float(opts.get("skip_cfg_strength", 0.0))
+        self.cfg_rescale = float(opts.get("cfg_rescale", 0.7))
+
         # Backend module + weights.
         backend_cls = get_backend(self.backend_name)
         self.module = backend_cls().build_module(self.cfg)
@@ -132,7 +164,7 @@ class InferenceEngine:
         # Keep this filter list in sync with TrainConfig._FEATURE_OVERRIDE_KEYS
         # so inference uses the same units/f0/mel encoder as the trained ckpt.
         spec = backend_cls.feature_spec({k: v for k, v in opts.items() if k in (
-            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt", "uv_policy",
             "n_mels", "fmin", "fmax", "rvc_version", "version",
         )})
         self.features = InferFeatures(
@@ -204,21 +236,49 @@ class InferenceEngine:
 
     def _load_weights(self, module) -> None:
         sd = _load_ckpt_state(self.ckpt_path)
-        # Accept both bare-model ckpts and lightning ckpts (module-prefixed).
-        missing, unexpected = module.load_state_dict(sd, strict=False)
+        module_sd = module.state_dict()
+
+        # Remap bare keys -> prefixed keys: original RVC/so-vits checkpoints
+        # store weights without the ``generator.``/``model.`` wrapper. Match
+        # each key individually against the module state_dict, trying (no
+        # prefix, generator., model.) in order (same strategy as
+        # train/cli.py pretrained loading).
+        module_keys = set(module_sd.keys())
+        remapped: dict = {}
+        for k, v in sd.items():
+            if k in module_keys:
+                remapped[k] = v
+                continue
+            for prefix in ("generator.", "model."):
+                cand = prefix + k
+                if cand in module_keys:
+                    remapped[cand] = v
+                    break
+            else:
+                remapped[k] = v  # leave as-is (reported as unexpected below)
+
+        # Shape-filter: keys whose shape mismatches the module (e.g. emb_g
+        # when num_speaker differs from the checkpoint) are skipped instead
+        # of crashing load_state_dict.
+        skipped_shape = {
+            k for k, v in remapped.items()
+            if k in module_sd and v.shape != module_sd[k].shape
+        }
+        filtered = {k: v for k, v in remapped.items() if k not in skipped_shape}
+        missing, unexpected = module.load_state_dict(filtered, strict=False)
         # strict=False tolerates optimizer/discriminator-only keys in lightning
         # ckpts (sovits/rvc have discriminator + generator keys; generator is
         # required). Filter expected suffixes: bare model ckpts may drop
         # discriminator, so only *required* model keys must be present.
         if self.backend_name in WAV_DOMAIN:
-            gen_keys = [k for k in sd if k.startswith("generator.")]
+            gen_keys = [k for k in remapped if k.startswith("generator.")]
             if not gen_keys:
                 raise RuntimeError(
                     f"checkpoint has no 'generator.*' keys (sovits/rvc need the "
                     f"generator state); got {list(sd)[:5]}"
                 )
         else:
-            model_keys = [k for k in sd if k.startswith("model.")]
+            model_keys = [k for k in remapped if k.startswith("model.")]
             if not model_keys:
                 raise RuntimeError(
                     f"checkpoint has no 'model.*' keys; got {list(sd)[:5]}"
@@ -234,12 +294,17 @@ class InferenceEngine:
         # architecture (e.g. different n_units / n_mels / num_speaker) that
         # lacks module keys without a shape clash would otherwise load with
         # UNINITIALIZED weights and produce garbage. Only truly optional keys
-        # (discriminator / optimizer / criterion buffers) may be missing.
+        # (discriminator / optimizer / criterion buffers / shape-skipped /
+        # training-only enc_q) may be missing.
         if missing:
             _OPTIONAL_PREFIXES = (
                 "discriminator.", "optimizer.", "criterion.", "loss.", "metrics.",
+                "generator.enc_q.",  # released RVC weights omit training-only enc_q
             )
-            real_missing = [k for k in missing if not k.startswith(_OPTIONAL_PREFIXES)]
+            real_missing = [
+                k for k in missing
+                if k not in skipped_shape and not k.startswith(_OPTIONAL_PREFIXES)
+            ]
             if real_missing:
                 raise RuntimeError(
                     f"checkpoint is missing {len(real_missing)} module weight(s); "
@@ -288,6 +353,8 @@ class InferenceEngine:
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
         t_start: float | None = None,
+        rms_mix_rate: float = 1.0,
+        protect: float = 0.5,
     ) -> np.ndarray:
         """Convert a wav file; returns float32 wav at the backend sample rate.
 
@@ -302,6 +369,12 @@ class InferenceEngine:
             shallow flow — whichever is loaded, reflow preferred).
         t_start: reflow ODE start time in [0,1); overrides the engine default.
             Ignored when only the diffusion enhancer is loaded.
+        rms_mix_rate: RVC-style output RMS envelope match (1.0 = untouched;
+            0.0 = fully input envelope).
+        protect: RVC-style source-feature blend on speech frames (>= 0.5 =
+            disabled; 0.33 typical). Uses rms > threshold as the speech-frame
+            criterion (rvc f0 is interpolated so it is never 0 except digital
+            silence). Only meaningful with index/cluster enhancement.
         """
         if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError(
@@ -326,9 +399,14 @@ class InferenceEngine:
             f0 = f0 * (2.0 ** (trans / 12))
 
         # Feature retrieval / cluster enhancement (RVC / so-vits style).
+        # protect: keep the pre-enhancement units as the source features and
+        # blend them back on speech frames afterwards.
+        units_src = units
         units = self._enhance_units(
             units, index_path, index_ratio, cluster_path, cluster_ratio
         )
+        if protect < 0.5 and rms is not None and units is not units_src:
+            units = self._protect_units(units, units_src, rms, protect)
 
         T = units.shape[0]
         # Max chunk size by backend: GAN backends (rvc/sovits) allocate O(T) wav
@@ -339,35 +417,63 @@ class InferenceEngine:
         max_chunk_frames = max_chunk_sec * self.sr // self.hop
 
         if T <= max_chunk_frames:
-            return self._run_model(
+            out = self._run_model(
                 units, f0, rms, uv, spk,
                 shallow_diffusion=shallow_diffusion, k_step=k_step,
                 diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup,
                 t_start=_t_start,
+                steps=steps,
             ).astype(np.float32)
-
-        # Silence-aware segmentation: split at silence boundaries.
-        boundaries = self._find_silence_boundaries(
-            rms, T, max_chunk_frames, crossfade_frames=2 * self.sr // self.hop
-        )
-
-        chunk_outputs = []
-        for start, end in boundaries:
-            chunk_units = units[start:end]
-            chunk_f0 = f0[start:end]
-            chunk_rms = rms[start:end] if rms is not None else None
-            chunk_uv = uv[start:end]
-            wav_chunk = self._run_model(
-                chunk_units, chunk_f0, chunk_rms, chunk_uv, spk,
-                shallow_diffusion=shallow_diffusion, k_step=k_step,
-                diffusion_method=diffusion_method,
-                diffusion_speedup=diffusion_speedup,
-                t_start=_t_start,
+        else:
+            # Silence-aware segmentation: split at silence boundaries.
+            boundaries = self._find_silence_boundaries(
+                rms, T, max_chunk_frames, crossfade_frames=2 * self.sr // self.hop
             )
-            chunk_outputs.append(wav_chunk)
 
-        return self._stitch_chunks(boundaries, chunk_outputs)
+            chunk_outputs = []
+            for start, end in boundaries:
+                chunk_units = units[start:end]
+                chunk_f0 = f0[start:end]
+                chunk_rms = rms[start:end] if rms is not None else None
+                chunk_uv = uv[start:end]
+                wav_chunk = self._run_model(
+                    chunk_units, chunk_f0, chunk_rms, chunk_uv, spk,
+                    shallow_diffusion=shallow_diffusion, k_step=k_step,
+                    diffusion_method=diffusion_method,
+                    diffusion_speedup=diffusion_speedup,
+                    t_start=_t_start,
+                    steps=steps,
+                )
+                chunk_outputs.append(wav_chunk)
+
+            out = self._stitch_chunks(boundaries, chunk_outputs)
+
+        # RVC pipeline: optional output RMS envelope match to the input wav.
+        if rms_mix_rate != 1.0:
+            out = _change_rms(feats["wav"], feats["sr"], out, self.sr, rms_mix_rate)
+        return out
+
+    def _protect_units(
+        self,
+        units: torch.Tensor,
+        units_src: torch.Tensor,
+        rms: torch.Tensor,
+        protect: float,
+    ) -> torch.Tensor:
+        """Blend pre-enhancement (source) units back on speech frames.
+
+        RVC pipeline formula: pitchff=1 on voiced frames (keep enhanced units),
+        pitchff=protect on unvoiced frames (mix source back). RVC's f0 is
+        interpolated so pitchf==0 only in digital silence; we use rms > 1e-4
+        as the speech-frame criterion instead (unvoiced consonants have
+        energy, so they are covered). Silence frames keep enhanced units.
+        """
+        pitchff = torch.where(
+            rms > 1e-4, torch.full_like(rms, protect), torch.ones_like(rms)
+        )
+        pitchff = pitchff.unsqueeze(-1)  # [T, 1]
+        return units * pitchff + units_src * (1 - pitchff)
 
     def _find_silence_boundaries(
         self,
@@ -462,6 +568,7 @@ class InferenceEngine:
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
         t_start: float = 0.5,
+        steps: int | None = None,
     ) -> np.ndarray:
         """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
@@ -484,19 +591,35 @@ class InferenceEngine:
         if self.backend_name == "rift_dit":
             src_mel = torch.zeros(1, T, self.n_mels, device=self.device, dtype=units.dtype)
             batch.mel = src_mel
-            mel = self.module.sample(batch)
+            # RIFT-SVC bad_cvec: cvec downsampled 2x then interpolated back to
+            # full length (infer.py:124-128) — the "degraded" condition for ds CFG.
+            bad_cvec = None
+            if self.cfg_ds_strength > 1e-5:
+                bad_cvec = _resample_units(batch.units[0, ::2, :], T).unsqueeze(0)
+            mel = self.module.sample(
+                batch,
+                ds_cfg_strength=self.cfg_ds_strength,
+                spk_cfg_strength=self.cfg_spk_strength,
+                skip_cfg_strength=self.cfg_skip_strength,
+                cfg_rescale=self.cfg_rescale,
+                bad_cvec=bad_cvec,
+                steps=steps,
+            )
             if isinstance(mel, tuple):
                 mel = mel[0]
             wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
 
         elif self.backend_name in ("ddsp6", "diffusion", "reflow_vae"):
-            mel = self.module.sample(batch)
+            mel = self.module.sample(batch, steps=steps)
             wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
 
         elif self.backend_name == "sovits":
+            # NSF source gets fully-voiced f0 (so-vits convention); uv keeps
+            # the raw voicing computed by InferFeatures from the raw f0.
+            f0_interp = interp_unvoiced_f0(batch.f0[0]).unsqueeze(0)
             wav, _ = self.module.generator.infer(
                 batch.units.transpose(1, 2),  # [B, D, T]
-                batch.f0,
+                f0_interp,
                 batch.uv,
                 batch.spk_id.unsqueeze(-1),
                 vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)

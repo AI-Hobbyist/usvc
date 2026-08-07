@@ -57,6 +57,9 @@ class DDSPDataset(BaseSVCDataset):
         self._units_dir = (
             self.dataset_dir / "units" / encoder_kind / feature_hashes.get("units", "")
         )
+        # Pitch augmentation (present only when use_pitch_aug preprocessed them).
+        self._aug_mel_dir = self.dataset_dir / "aug_mel" / feature_hashes.get("aug_mel", "")
+        self._aug_shift_dir = self.dataset_dir / "aug_shift" / feature_hashes.get("aug_shift", "")
 
         self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
 
@@ -84,9 +87,7 @@ class DDSPDataset(BaseSVCDataset):
         }
 
     def _augment(self, item: dict) -> dict:
-        """DDSP pitch augmentation would use pre-computed aug_mel/aug_vol.
-
-        For now, no augmentation (aug features not in our preprocessing).
-        Original DDSP: 50% chance use aug_mel/aug_vol + shift f0 by 2^(shift/12).
+        """DDSP pitch augmentation: 50% chance use precomputed aug_mel/aug_vol
+        + shift f0 by 2^(shift/12) (original DDSP-SVC behaviour).
         """
-        return item
+        return self._pitch_augment(item)

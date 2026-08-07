@@ -50,6 +50,8 @@ class RVCDataset(BaseSVCDataset):
         )
         self._f0_dir = self.dataset_dir / "f0" / feature_hashes.get("f0", "")
         self._spec_dir = self.dataset_dir / "spec" / feature_hashes.get("spec", "")
+        # rms (volume) for vol_embedding; may not exist in all datasets
+        self._rms_dir = self.dataset_dir / "rms" / feature_hashes.get("rms", "")
         self._audio_dir = self.dataset_dir / "audio"
 
         self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
@@ -66,6 +68,10 @@ class RVCDataset(BaseSVCDataset):
         # spec (linear spectrogram)
         spec_path = self._spec_dir / spk / pt_stem
         spec = self._load_pt(spec_path) if spec_path.exists() else None
+
+        # rms (volume) for vol_embedding; may not exist in all datasets
+        rms_path = self._rms_dir / spk / pt_stem
+        rms = self._load_pt(rms_path) if rms_path.exists() else None
 
         # wav
         wav_path = self._audio_dir / spk / wav_stem
@@ -90,6 +96,8 @@ class RVCDataset(BaseSVCDataset):
             units = units[start : start + mf]
             pitch_token = pitch_token[start : start + mf]
             pitchf = pitchf[start : start + mf]
+            if rms is not None:
+                rms = rms[start : start + mf]
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
@@ -100,6 +108,8 @@ class RVCDataset(BaseSVCDataset):
             units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
             pitch_token = torch.nn.functional.pad(pitch_token, (0, pad_n))
             pitchf = torch.nn.functional.pad(pitchf, (0, pad_n))
+            if rms is not None:
+                rms = torch.nn.functional.pad(rms, (0, pad_n))
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
@@ -111,6 +121,8 @@ class RVCDataset(BaseSVCDataset):
         units = units[:T]
         pitch_token = pitch_token[:T]
         pitchf = pitchf[:T]
+        if rms is not None:
+            rms = rms[:T]
         if spec is not None:
             # Force-align spec frames to exactly T (units frame count).
             # spec and units may differ by ±1 frame due to STFT conventions.
@@ -140,6 +152,7 @@ class RVCDataset(BaseSVCDataset):
             "mel": spec,
             "wav": wav,
             "spk_id": self.spk2idx.get(spk, 0),
+            "rms": rms,  # volume [T] or None (vol_embedding)
         }
 
     @staticmethod

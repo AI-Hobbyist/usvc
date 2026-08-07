@@ -94,8 +94,11 @@ class DDSPModule(BaseSVCModule):
         )
         return loss, sub
 
-    def sample(self, batch: SVCBatch):
-        """Generate mel for validation via DDSP + reflow sampling."""
+    def sample(self, batch: SVCBatch, steps: int | None = None):
+        """Generate mel for validation via DDSP + reflow sampling.
+
+        steps: ODE integration steps (default 10, matches DDSP-SVC infer).
+        """
         units = batch.units
         f0 = batch.f0
         volume = batch.rms if batch.rms is not None else None
@@ -108,5 +111,6 @@ class DDSPModule(BaseSVCModule):
         with torch.no_grad():
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id, aug_shift=aug_shift,
+                infer_step=steps if steps is not None else 10,
             )
         return mel_gen

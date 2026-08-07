@@ -31,7 +31,7 @@ def lsgan_disc_loss(
     for dr, df in zip(real_logits, fake_logits):
         loss = loss + F.mse_loss(dr, torch.ones_like(dr))
         loss = loss + F.mse_loss(df, torch.zeros_like(df))
-    return loss / len(real_logits)
+    return loss  # sum over discriminators (matches so-vits/RVC, NOT /N)
 
 
 def lsgan_gen_loss(fake_logits: list[torch.Tensor]) -> torch.Tensor:
@@ -42,7 +42,7 @@ def lsgan_gen_loss(fake_logits: list[torch.Tensor]) -> torch.Tensor:
     loss = 0.0
     for df in fake_logits:
         loss = loss + F.mse_loss(df, torch.ones_like(df))
-    return loss / len(fake_logits)
+    return loss  # sum over discriminators (matches so-vits/RVC, NOT /N)
 
 
 def feature_match_loss(

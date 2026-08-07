@@ -1358,6 +1358,7 @@ class SoVITSModel(nn.Module):
         spk_id: torch.Tensor,  # [B]
         frame_len: torch.Tensor | None = None,  # [B] units frame lengths
         vol: torch.Tensor | None = None,  # [B, T] volume (only if vol_embedding)
+        uv: torch.Tensor | None = None,  # [B, T] voicing from raw f0 (pre-interp)
     ) -> dict:
         """Training forward. Returns dict of tensors for loss computation.
 
@@ -1369,7 +1370,7 @@ class SoVITSModel(nn.Module):
             z_mask: [B, 1, T_spec] posterior mask
             ids_slice: [B] frame slice indices for wave/mel slicing
             pred_lf0/norm_lf0/lf0: f0 prediction outputs (if enabled)
-            uv: [B, T] voiced flag derived from f0
+            uv: [B, T] voiced flag (from raw f0, pre-interpolation)
             c_lengths: [B] unit lengths
         """
         # speaker embedding: so-vits passes spk_id [B, 1]; accept [B] too
@@ -1382,7 +1383,8 @@ class SoVITSModel(nn.Module):
             else torch.full((c.size(0),), c.size(2), device=c.device, dtype=torch.long)
         )
         spec_lengths = c_lengths  # so-vits aligns spec to units length
-        uv = (f0 > 0).float()
+        if uv is None:
+            uv = (f0 > 0).float()  # fallback; only correct for raw (uninterp) f0
 
         x_mask = torch.unsqueeze(sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
         vol_emb = (

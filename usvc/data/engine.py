@@ -172,7 +172,14 @@ class PreprocessEngine:
         #    single-clip pipelined (its conv is padding-sensitive).
         #  - units: neural model, GPU-only via the pipelined path (conv is too
         #    padding-sensitive for batch — needs <0.5% which limits batch to ~3).
-        if fc.kind == "rms":
+        #  - aug_shift: cheap per-file scalar (random keyshift, reproducible).
+        #  - aug_mel: per-file keyshift (window size differs per shift) —
+        #    cannot share one fused stft, so sequential per-clip extraction.
+        if fc.kind == "aug_shift":
+            count += self._run_aug_shift(fc, pending, out_root)
+        elif fc.kind == "aug_mel":
+            count += self._run_aug_mel(fc, extractor, pending, out_root, sr)
+        elif fc.kind == "rms":
             count += self._run_cpu_parallel(fc, extractor, pending, out_root, sr)
         elif fc.kind == "mel":
             count += self._run_mel_batch(fc, extractor, pending, out_root, sr)
@@ -184,6 +191,66 @@ class PreprocessEngine:
             count += self._run_sequential(fc, extractor, pending, cache16k, out_root, sr)
 
         self.meta.register(fc, count)
+
+    def _run_aug_shift(self, fc, pending, out_root) -> int:
+        """Generate one random keyshift (semitones) per clip, stored as a
+        scalar [1] tensor. Deterministic: seeded by sha256(spk:stem) so
+        re-preprocessing reproduces identical shifts.
+        """
+        import hashlib
+        import random
+        from pathlib import Path
+
+        lo, hi = fc.params.get("range", [-5.0, 5.0])
+        done = 0
+        with tqdm(total=len(pending), desc=f"aug_shift@{fc.hash()}", leave=False) as pbar:
+            for spk, fn, _ in pending:
+                stem = Path(fn).stem
+                seed = int(hashlib.sha256(f"aug_shift:{spk}:{stem}".encode()).hexdigest()[:8], 16)
+                shift = random.Random(seed).uniform(lo, hi)
+                out_path = out_root / spk / (stem + ".pt")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(torch.tensor([shift], dtype=torch.float32), out_path)
+                done += 1
+                pbar.update(1)
+        return done
+
+    def _run_aug_mel(self, fc, extractor, pending, out_root, sr) -> int:
+        """Extract keyshifted mel per clip using its recorded aug_shift scalar.
+
+        The per-file keyshift lives under aug_shift/{hash}/{spk}/{stem}.pt.
+        Sequential path: each clip may have a different keyshift (scaled
+        window), so no fused batch stft is possible.
+        """
+        from pathlib import Path
+
+        shift_entries = self.meta.features.get("aug_shift", [])
+        if shift_entries:
+            shift_hash = shift_entries[0]["hash"]
+        else:
+            # Fallback (e.g. augmented-only preprocess): hash is deterministic.
+            shift_hash = FeatureConfig("aug_shift", {"range": [-5.0, 5.0]}).hash()
+        shift_root = self.dataset_dir / "aug_shift" / shift_hash
+
+        done = 0
+        with tqdm(total=len(pending), desc=f"aug_mel@{fc.hash()}", leave=False) as pbar:
+            for spk, fn, _ in pending:
+                stem = Path(fn).stem
+                shift_path = shift_root / spk / (stem + ".pt")
+                if not shift_path.is_file():
+                    pbar.update(1)
+                    continue  # no aug_shift for this clip -> skip
+                shift = torch.load(shift_path, map_location="cpu", weights_only=True).item()
+                wav = torch.from_numpy(
+                    load_audio(self.audio_dir / spk / fn, sr=sr, quality="fast")
+                ).float()
+                feat = extractor.extract(wav, keyshift=shift)
+                out_path = out_root / spk / (stem + ".pt")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(feat.cpu().contiguous(), out_path)
+                done += 1
+                pbar.update(1)
+        return done
 
     def _run_sequential(self, fc, extractor, pending, cache16k, out_root, sr) -> int:
         from concurrent.futures import ThreadPoolExecutor
@@ -380,8 +447,10 @@ class PreprocessEngine:
         return done
 
     def _build_extractor(self, fc: FeatureConfig, sr: int, hop: int, *, device: str, dtype: str = "fp32"):
-        if fc.kind == "mel":
+        if fc.kind in ("mel", "aug_mel"):
             return MelExtractor(fc, sr, hop).to(device)
+        if fc.kind == "aug_shift":
+            return None  # pure per-file scalar generation; no model needed
         if fc.kind == "f0":
             return F0Extractor(fc, sr, hop, device=device, dtype=dtype)
         if fc.kind == "rms":
