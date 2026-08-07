@@ -29,8 +29,8 @@ class RIFTModule(BaseSVCModule):
             ff_mult=opts.get("ff_mult", 4),
             n_mel_channels=opts.get("n_mel_channels", 128),
             num_speaker=opts.get("num_speaker", 1),
-            cvec_dim=opts.get("cvec_dim", 256),
-            kernel_size=opts.get("kernel_size", 3),
+            cvec_dim=opts.get("cvec_dim", 768),       # RIFT-SVC default; 256 only for hubertsoft
+            kernel_size=opts.get("kernel_size", 31),     # RIFT-SVC dit-base default (depthwise conv receptive field)
             zero_null_spk=opts.get("zero_null_spk", True),
             time_schedule=opts.get("time_schedule", "lognorm"),
             loss_type=opts.get("loss_type", "l2"),

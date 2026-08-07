@@ -78,7 +78,8 @@ def test_mel_extractor_shape():
     wav = np.random.randn(44100 * 2).astype("float32") * 0.1  # 2s
     mel = ext.extract(wav)
     assert mel.dim() == 2 and mel.shape[1] == 128, mel.shape
-    expected_T = 44100 * 2 // 512 + 1
+    # nvSTFT center=False grid: (L-hop)//hop+1 == L//hop for L>=hop.
+    expected_T = 44100 * 2 // 512
     assert mel.shape[0] == expected_T, f"mel T {mel.shape[0]} != {expected_T}"
     print(f"PASS test_mel_extractor_shape (mel={tuple(mel.shape)})")
 
@@ -90,18 +91,19 @@ def test_rms_extractor_shape():
     ext = RmsExtractor(fc, sr=44100, hop=512)
     wav = np.random.randn(44100 * 2).astype("float32") * 0.1
     rms = ext.extract(wav)
-    expected_T = 44100 * 2 // 512 + 1
+    expected_T = 44100 * 2 // 512
     assert rms.shape[0] == expected_T, f"rms T {rms.shape[0]} != {expected_T}"
     print(f"PASS test_rms_extractor_shape (rms={tuple(rms.shape)})")
 
 
 def test_frame_len_consistency():
     # The central invariant: mel/f0/rms/units(gather) all share frame_len_for(n, hop).
+    # nvSTFT center=False grid: frame_len_for = (L-hop)//hop+1 == L//hop (L>=hop).
     from usvc.io.audio import frame_len_for
 
     for n in (44100, 48000, 102400, 1):
         hop = 512
-        assert frame_len_for(n, hop) == n // hop + 1
+        assert frame_len_for(n, hop) == max(1, n // hop), (n, frame_len_for(n, hop))
     print("PASS test_frame_len_consistency")
 
 
@@ -136,6 +138,30 @@ def test_engine_dedup_logic(tmp_path: Path):
     print("PASS test_engine_dedup_logic")
 
 
+def test_mel_grid_matches_ddsp6_internal():
+    """H1 regression: features/mel.py output MUST share the exact nvSTFT frame
+    grid (window centers, frame count) with the ddsp6-internal MelExtractor,
+    because ddsp_loss = F.mse_loss(ddsp_mel, gt_spec) compares them frame-by-frame.
+    """
+    from usvc.features.mel import MelExtractor
+    from usvc.backends.ddsp6.model import MelExtractor as DDSPMelExtractor
+
+    sr, hop, n_fft, win, n_mels = 44100, 512, 2048, 2048, 128
+    fc = FeatureConfig("mel", {"n_fft": n_fft, "win_length": win, "n_mels": n_mels,
+                               "fmin": 40.0, "fmax": 16000.0, "center": False})
+    usvc_ext = MelExtractor(fc, sr, hop)
+    ddsp_ext = DDSPMelExtractor(sr=sr, n_fft=n_fft, win_size=win, hop_length=hop,
+                                n_mels=n_mels, fmin=40.0, fmax=16000.0)
+    for L in (44100, 51200, 88200, 100000):  # hop multiples + non-multiples
+        wav = torch.randn(L) * 0.1
+        m_usvc = usvc_ext.extract(wav)                 # [T, M]
+        m_ddsp = ddsp_ext.extract(wav.unsqueeze(0)).squeeze(0)  # [T, M]
+        assert m_usvc.shape == m_ddsp.shape, (L, m_usvc.shape, m_ddsp.shape)
+        assert torch.allclose(m_usvc, m_ddsp, atol=1e-5), \
+            f"mel grid mismatch at L={L}: max diff {(m_usvc-m_ddsp).abs().max()}"
+    print("PASS test_mel_grid_matches_ddsp6_internal")
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -144,6 +170,7 @@ if __name__ == "__main__":
     test_mel_extractor_shape()
     test_rms_extractor_shape()
     test_frame_len_consistency()
+    test_mel_grid_matches_ddsp6_internal()
     with tempfile.TemporaryDirectory() as td:
         test_meta_roundtrip(Path(td))
     with tempfile.TemporaryDirectory() as td:

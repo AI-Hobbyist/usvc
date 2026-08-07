@@ -761,12 +761,21 @@ class RectifiedFlow(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
 
-    def reflow_loss(self, x_1, t, cond, loss_type='l2_lognorm'):
+    def reflow_loss(self, x_1, t, cond, loss_type='l2_lognorm', mask=None):
         x_0 = torch.randn_like(x_1)
         x_t = x_0 + t[:, None, None, None] * (x_1 - x_0)
         v_pred = self.velocity_fn(x_t, 1000 * t, cond)
 
-        if loss_type == 'l1':
+        if mask is not None:
+            # Average only over real frames (RIFT-SVC rf.py ``loss[mask]``).
+            # x_1 is [B, 1, M, T] (T last); mask is [B, T] -> [B, 1, 1, T].
+            m = mask.to(x_1.dtype)[:, None, None, :]
+            elem = F.mse_loss(x_1 - x_0, v_pred, reduction='none')
+            if loss_type == 'l2_lognorm':
+                weights = 0.398942 / t / (1 - t) * torch.exp(-0.5 * torch.log(t / (1 - t)) ** 2)
+                elem = weights[:, None, None, None] * elem
+            loss = (elem * m).sum() / (m.sum() * elem.shape[1] * elem.shape[2] + 1e-8)
+        elif loss_type == 'l1':
             loss = (x_1 - x_0 - v_pred).abs().mean()
         elif loss_type == 'l2':
             loss = F.mse_loss(x_1 - x_0, v_pred)
@@ -799,7 +808,8 @@ class RectifiedFlow(nn.Module):
                 infer_step=10,
                 method='euler',
                 t_start=0.0,
-                use_tqdm=True):
+                use_tqdm=True,
+                mask=None):
         cond = condition.transpose(1, 2)  # [B, H, T]
         b, device = condition.shape[0], condition.device
         if t_start < 0.0:
@@ -809,7 +819,7 @@ class RectifiedFlow(nn.Module):
             x_1 = x_1.transpose(1, 2)[:, None, :, :]  # [B, 1, M, T]
             t = t_start + (1.0 - t_start) * torch.rand(b, device=device)
             t = torch.clip(t, 1e-7, 1 - 1e-7)
-            return self.reflow_loss(x_1, t, cond=cond)
+            return self.reflow_loss(x_1, t, cond=cond, mask=mask)
         else:
             shape = (cond.shape[0], 1, self.out_dims, cond.shape[2])  # [B, 1, M, T]
 
@@ -997,7 +1007,7 @@ class Unit2Wav(nn.Module):
 
     def forward(self, units, f0, volume, spk_id=None, spk_mix_dict=None, aug_shift=None, vocoder=None,
                 gt_spec=None, infer=True, return_wav=False, infer_step=10, method='euler', t_start=0.0,
-                silence_front=0, use_tqdm=True):
+                silence_front=0, use_tqdm=True, frame_len=None):
 
         '''
         input:
@@ -1020,7 +1030,11 @@ class Unit2Wav(nn.Module):
         if not infer:
             ddsp_loss = F.mse_loss(ddsp_mel, gt_spec)
             if t_start < 1.0:
-                reflow_loss = self.reflow_model(ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False)
+                # Mask padding frames in the reflow loss so the velocity net is
+                # not trained on pad frames (mel=0 dB target). gt_spec is [B, T, M].
+                from ...train.objective import lens_to_mask
+                _mask = lens_to_mask(frame_len, length=gt_spec.shape[1]) if frame_len is not None else None
+                reflow_loss = self.reflow_model(ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False, mask=_mask)
             else:
                 reflow_loss = torch.tensor(0)
             return ddsp_loss, reflow_loss
@@ -1110,7 +1124,7 @@ class DDSP6Model(Unit2Wav):
 
         ddsp_loss, reflow_loss = super().forward(
             units, f0, volume, spk_id=spk_id, aug_shift=aug_shift,
-            gt_spec=gt_spec, infer=False, t_start=t_start,
+            gt_spec=gt_spec, infer=False, t_start=t_start, frame_len=frame_len,
         )
         reflow_loss = reflow_loss.to(ddsp_loss.device)
         total = lambda_ddsp * ddsp_loss + reflow_loss

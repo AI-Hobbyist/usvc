@@ -248,7 +248,14 @@ class Wav2MelModule(torch.nn.Module):
 
         # extract
         mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
-        n_frames = int(audio.shape[1] // self.hop_size) + 1
+        # n_frames MUST be derived from the *resampled* length (16k domain), not
+        # the original input length: mel is computed on audio_res at hop_size
+        # (160) frames. Using audio.shape[1] for a non-16k input (e.g. 44.1k)
+        # inflates n_frames ~2.76x and the tail gets filled with a constant
+        # repeat of the last mel frame, corrupting the global (non-causal)
+        # attention f0 output. When sample_rate==sampling_rate, audio_res IS
+        # audio so this is equivalent to the old formula.
+        n_frames = int(audio_res.shape[1] // self.hop_size) + 1
         if n_frames > int(mel.shape[1]):
             mel = torch.cat((mel, mel[:, -1:, :]), 1)
         if n_frames < int(mel.shape[1]):
@@ -479,7 +486,8 @@ class Wav2Mel:
 
         # extract
         mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
-        n_frames = int(audio.shape[1] // self.hop_size) + 1
+        # See Wav2MelModule: derive n_frames from the resampled (16k) length.
+        n_frames = int(audio_res.shape[1] // self.hop_size) + 1
         if n_frames > int(mel.shape[1]):
             mel = torch.cat((mel, mel[:, -1:, :]), 1)
         if n_frames < int(mel.shape[1]):

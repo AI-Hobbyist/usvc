@@ -34,13 +34,23 @@ _VERSION_DEFAULTS = {
 
 
 def _resolve_opts(opts: dict) -> dict:
-    """Version defaults overlaid by explicit backend_opts."""
+    """Version defaults overlaid by explicit backend_opts.
+
+    Returns a dict containing the version defaults PLUS every other key present
+    in ``opts`` (n_units / num_speaker / out_dims / sampling_rate / hop_length
+    / etc.), so downstream ``opts.get(...)`` calls can actually read user
+    overrides. Previously only keys already in the version-defaults dict
+    survived, which silently dropped multi-speaker / units-dim overrides.
+    """
     version = str(opts.get("version", "6.3"))
     if version not in _VERSION_DEFAULTS:
         raise ValueError(f"ddsp6 version must be one of {list(_VERSION_DEFAULTS)}, got {version!r}")
     resolved = dict(_VERSION_DEFAULTS[version])
+    # Merge ALL user opts on top of the version defaults (user wins). This keeps
+    # the version-specific knobs (velocity_net / n_layers / ...) overridable while
+    # also passing through architecture keys not listed in _VERSION_DEFAULTS.
     for k, v in opts.items():
-        if k != "version" and k in resolved:
+        if k != "version":
             resolved[k] = v
     return resolved
 

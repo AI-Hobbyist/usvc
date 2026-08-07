@@ -34,7 +34,12 @@ class SpecExtractor:
 
     @torch.inference_mode()
     def extract(self, wav: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """Returns [T, n_fft//2+1] magnitude spectrogram, T = len//hop+1."""
+        """Returns [T, n_fft//2+1] magnitude spectrogram.
+
+        Uses the nvSTFT ``center=False`` padding convention (same as MelExtractor
+        and the so-vits/RVC internal ``spectrogram_torch``), so the spec grid
+        matches the mel re-extracted inside the GAN models during training.
+        """
         if isinstance(wav, np.ndarray):
             wav = torch.from_numpy(wav).float()
         wav = wav.to(self._device)
@@ -42,10 +47,8 @@ class SpecExtractor:
             self._hann = torch.hann_window(self.win_length).to(self._device)
 
         if not self.center:
-            # Same reflect-pad convention as mel: pad n_fft//2 each side so the
-            # output frame count equals len//hop+1 (matches mel/f0/rms).
-            pad = self.n_fft // 2
-            wav = torch.nn.functional.pad(wav.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+            from .mel import nvstft_pad
+            wav = nvstft_pad(wav, self.win_length, self.hop)
 
         spec = torch.stft(
             wav,
@@ -54,6 +57,7 @@ class SpecExtractor:
             win_length=self.win_length,
             window=self._hann,
             center=self.center,
+            pad_mode="reflect",
             return_complex=True,
         )
         spec = torch.sqrt(spec.real**2 + spec.imag**2 + 1e-6)  # magnitude

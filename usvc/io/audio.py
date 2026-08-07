@@ -67,8 +67,20 @@ def resample_np(
 
 
 def frame_len_for(n_samples: int, hop: int) -> int:
-    """Canonical feature frame count: matches mel center=False convention."""
-    return n_samples // hop + 1
+    """Canonical feature frame count: matches the nvSTFT ``center=False`` grid.
+
+    nvSTFT pads ``(win-hop)//2`` left / ``(win-hop+1)//2`` right and runs
+    ``center=False`` stft, yielding ``(L + (win-hop)) // hop - (win//hop) + 1``
+    frames. For the standard ``win == 4*hop`` config this simplifies to
+    ``(L - hop) // hop + 1``, i.e. ``max(1, L // hop)`` for ``L >= hop`` — which
+    is the exact frame count produced by MelExtractor / SpecExtractor and by
+    the ddsp6/sovits internal mel extractors. Keeping f0/rms/units on this same
+    count is the DSP-001 §3 invariant.
+    """
+    if n_samples <= 0:
+        return 0
+    # (L - hop) // hop + 1 == L // hop for L >= hop; clamp to >= 1.
+    return max(1, (n_samples - hop) // hop + 1)
 
 
 class SharedAudio16kCache:

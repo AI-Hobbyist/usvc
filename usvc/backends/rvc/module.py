@@ -49,11 +49,15 @@ class RVCModule(BaseGANModule):
         else:
             up, k = opts["upsample_rates"], opts["upsample_kernel_sizes"]
 
+        # RVC v1 uses 256-d units (contentvec_proj / TextEncoder256);
+        # v2 uses 768-d (last_hidden_state). Default to the version's native dim
+        # unless the user explicitly overrides n_units.
+        default_n_units = 256 if version == "v1" else 768
         self.generator = RVCModel(
             inter_channels=opts.get("inter_channels", 192),
             hidden_channels=opts.get("hidden_channels", 192),
             filter_channels=opts.get("filter_channels", 768),
-            n_units=opts.get("n_units", 768),
+            n_units=opts.get("n_units", default_n_units),
             spk_embed_dim=opts.get("num_speaker", 1),
             segment_size=opts.get("segment_size", 20),
             sr=sr,

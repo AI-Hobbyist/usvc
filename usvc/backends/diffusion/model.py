@@ -623,13 +623,17 @@ class DiffusionModel(nn.Module):
             spk_id: [B] 1-based (Diffusion-SVC convention)
             gt_spec: [B, T, M] target mel (raw)
             aug_shift: [B] or [B, 1] optional pitch shift
-            frame_len: ignored (DDPM uses all frames)
+            frame_len: [B] true frame counts; used to mask padding frames so the
+                DDPM loss is averaged only over real frames (padding mel=0 is a
+                loud non-silence target that would otherwise pollute gradients).
         """
         x = self._embed_condition(units, f0, volume, spk_id, aug_shift)
         cond = x.transpose(1, 2)  # [B, n_hidden, T]
 
+        from ...train.objective import lens_to_mask
+        mask = lens_to_mask(frame_len, length=gt_spec.shape[1]) if frame_len is not None else None
         loss = self.objective.compute_loss(
-            gt_spec, self._denoise_wrapper, cond, t_max=self.k_step
+            gt_spec, self._denoise_wrapper, cond, t_max=self.k_step, mask=mask,
         )
         return loss, {"eps_loss": loss.item()}
 

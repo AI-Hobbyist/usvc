@@ -11,7 +11,22 @@ import torch
 
 from ..data.feature_config import FeatureConfig
 
-__all__ = ["MelExtractor", "default_mel_config"]
+__all__ = ["MelExtractor", "default_mel_config", "nvstft_pad"]
+
+
+def nvstft_pad(wav: torch.Tensor, win_length: int, hop: int) -> torch.Tensor:
+    """Pad a 1d waveform with the nvSTFT ``center=False`` convention.
+
+    Mirrors ``nsf_hifigan/nvSTFT.py::STFT.get_mel`` so the frame grid
+    (window centered at ``k*hop + (win-hop)//2``, frame count ``(L-hop)//hop+1``)
+    is identical to the openvpi NSF-HiFiGAN / DDSP-SVC internal MelExtractor.
+    Falls back to constant padding when the clip is shorter than one window
+    (reflect would be undefined), which keeps very short clips from crashing.
+    """
+    pad_left = (win_length - hop) // 2
+    pad_right = max((win_length - hop + 1) // 2, win_length - wav.shape[-1] - pad_left)
+    mode = "reflect" if pad_right < wav.shape[-1] else "constant"
+    return torch.nn.functional.pad(wav.unsqueeze(0), (pad_left, pad_right), mode=mode).squeeze(0)
 
 
 def default_mel_config(
@@ -77,11 +92,16 @@ class MelExtractor:
 
     @torch.inference_mode()
     def extract(self, wav: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """wav: 1d float. Returns [T, n_mels] float32, T = len//hop + 1.
+        """wav: 1d float. Returns [T, n_mels] float32.
 
-        ``center=True`` makes stft output exactly ``len//hop + 1`` frames, which
-        matches ``frame_len_for`` (DSP-001 §3 invariant). For ``center=False`` we
-        reflect-pad by ``n_fft//2`` on each side to reach the same frame count.
+        Uses the nvSTFT ``center=False`` padding convention (identical to the
+        openvpi NSF-HiFiGAN / DDSP-SVC internal ``MelExtractor``):
+        ``pad_left = (win-hop)//2``, ``pad_right = (win-hop+1)//2``, so every
+        frame window is centered at ``k*hop + (win-hop)//2`` and the frame count
+        is ``(L-hop)//hop + 1``. This MUST match the mel grid used inside the
+        ddsp6/sovits/rvc models (which re-extract mel from the synthesized wav
+        with the same padding), otherwise ``F.mse_loss(ddsp_mel, gt_spec)`` and
+        the reflow conditioning compare systematically half-hop-shifted mels.
         """
         if isinstance(wav, np.ndarray):
             wav = torch.from_numpy(wav).float()
@@ -89,9 +109,7 @@ class MelExtractor:
         self._ensure_basis(self._device)
 
         if not self.center:
-            # reflect-pad so output length matches (len//hop + 1)
-            pad = self.n_fft // 2
-            wav = torch.nn.functional.pad(wav.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+            wav = nvstft_pad(wav, self.win_length, self.hop)
 
         spec = torch.stft(
             wav,
@@ -100,6 +118,7 @@ class MelExtractor:
             win_length=self.win_length,
             window=self._hann,
             center=self.center,
+            pad_mode="reflect",
             return_complex=True,
         )
         spec = torch.abs(spec)  # magnitude (power=1.0 equivalent)
@@ -122,7 +141,9 @@ class MelExtractor:
             return []
         self._ensure_basis(self._device)
         dev = self._device
-        pad = self.n_fft // 2 if not self.center else 0
+        # nvstft_pad padding length is asymmetric and length-dependent, so the
+        # batch path still pads each clip individually then right-zero-pads to
+        # the batch max for a single fused stft (trailing frames are discarded).
 
         # Normalize inputs to 1d float tensors on device.
         norms = []
@@ -131,18 +152,14 @@ class MelExtractor:
                 w = torch.from_numpy(w).float()
             norms.append(w.to(dev).float())
 
-        # Skip degenerate clips (empty / too short for a single frame).  They
+        # Skip degenerate clips (empty / too short for a single window).  They
         # cannot be reflect-padded and would crash the whole batch.
-        keep = [w for w in norms if w.shape[0] >= 2]
+        keep = [w for w in norms if w.shape[0] >= self.win_length]
         if not keep:
             return [torch.zeros(1, self.n_mels, device=dev) for _ in norms]
 
-        # Per-clip reflect-pad (correct boundary), then right-zero-pad to max.
-        if pad:
-            padded = [
-                torch.nn.functional.pad(w.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
-                for w in keep
-            ]
+        if not self.center:
+            padded = [nvstft_pad(w, self.win_length, self.hop) for w in keep]
         else:
             padded = keep
         lens = [w.shape[0] for w in keep]  # original lengths, for frame counts
@@ -158,6 +175,7 @@ class MelExtractor:
             win_length=self.win_length,
             window=self._hann,
             center=self.center,
+            pad_mode="reflect",
             return_complex=True,
         )
         spec = torch.abs(spec)  # [B, n_fft//2+1, T_pad]
@@ -166,6 +184,7 @@ class MelExtractor:
 
         results = []
         for i, n in enumerate(lens):
-            n_frames = n // self.hop + 1
+            # Match frame_len_for nvSTFT grid: (L-hop)//hop+1.
+            n_frames = max(1, (n - self.hop) // self.hop + 1)
             results.append(mel[i, :, :n_frames].T)  # [T, n_mels]
         return results

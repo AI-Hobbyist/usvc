@@ -119,6 +119,7 @@ class ReflowShallowModel(nn.Module):
         real_mel: torch.Tensor,
         spk_id: torch.Tensor | None = None,
         t_start: float = 0.0,
+        frame_len: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute the reflow loss with mel-independent conditioning.
 
@@ -134,11 +135,14 @@ class ReflowShallowModel(nn.Module):
             (loss, {"reflow_loss": float}).
         """
         cond = self.embed_condition(units, f0, volume, spk_id)  # [B, T, H]
+        from ...train.objective import lens_to_mask
+        mask = lens_to_mask(frame_len, length=real_mel.shape[1]) if frame_len is not None else None
         loss = self.reflow_model(
             condition=cond,
             gt_spec=real_mel,
             infer=False,
             t_start=t_start,
+            mask=mask,
         )
         return loss, {"reflow_loss": float(loss.item())}
 

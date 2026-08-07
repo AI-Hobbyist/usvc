@@ -280,7 +280,7 @@ def test_long_audio_alignment(tmp_path: Path) -> None:
     engine = PreprocessEngine(ds)
     engine.run([FeatureSpec(mel=fc)], device="cpu")
     mel = _load_feature(ds, "mel", "spk_a", "long")
-    expected_T = sr * 60 // 512 + 1
+    expected_T = sr * 60 // 512  # nvSTFT center=False grid: (L-hop)//hop+1 == L//hop
     assert mel.shape[0] == expected_T, f"long audio T={mel.shape[0]} expected {expected_T}"
     print(f"  60s audio -> T={mel.shape[0]} (expected {expected_T}) ✓")
     print("PASS test_long_audio_alignment")

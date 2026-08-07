@@ -146,23 +146,13 @@ class RVCDataset(BaseSVCDataset):
     def _f0_to_coarse(f0: torch.Tensor) -> torch.Tensor:
         """Quantize f0 to RVC pitch token (1-255).
 
-        RVC uses a log-scale mapping: f0=0 (unvoiced) → 255, else 1-254.
+        Delegates to RVCModel.f0_to_coarse (the verbatim RVC mapping from
+        infer/rtrvc.py get_f0_post) so training and inference use the SAME
+        token grid. f0==0 (unvoiced) maps to token 1 (the lowest bin), matching
+        RVC — NOT 255. Previously this used a different formula (f0_mel_min=0,
+        clamp[1,254], unvoiced=255) that was inconsistent with both RVC and the
+        model's own inference path, silently shifting the pitch embedding.
         """
-        # RVC coarse f0: mapping based on log2 scale, 256 bins
-        f0 = f0.float()
-        uv = f0 == 0
-        # log2(f0), clamp to RVC range
-        import numpy as np
+        from .model import RVCModel
 
-        f0_log = torch.where(uv, torch.ones_like(f0) * 1e-5, f0)
-        f0_mel = 1127 * torch.log(1 + f0_log / 700)  # mel scale
-        f0_mel_min = 0
-        f0_mel_max = 1107
-        f0_coarse = (
-            (f0_mel - f0_mel_min)
-            * 254
-            / (f0_mel_max - f0_mel_min)
-        ).round().long()
-        f0_coarse = f0_coarse.clamp(1, 254)
-        f0_coarse[uv] = 255  # unvoiced
-        return f0_coarse
+        return RVCModel.f0_to_coarse(f0)

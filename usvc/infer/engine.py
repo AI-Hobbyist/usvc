@@ -129,8 +129,11 @@ class InferenceEngine:
         self.module = self.module.to(device)
 
         # Feature spec drives inference extraction (same encoder as training).
+        # Keep this filter list in sync with TrainConfig._FEATURE_OVERRIDE_KEYS
+        # so inference uses the same units/f0/mel encoder as the trained ckpt.
         spec = backend_cls.feature_spec({k: v for k, v in opts.items() if k in (
-            "units_kind", "units_ckpt", "f0_extractor", "n_mels", "fmin", "fmax",
+            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+            "n_mels", "fmin", "fmax", "rvc_version", "version",
         )})
         self.features = InferFeatures(
             spec, sr=self.sr, hop=self.hop, device=device,
@@ -227,6 +230,22 @@ class InferenceEngine:
             bad = [k for k in unexpected if k not in tolerable]
             if bad:
                 raise RuntimeError(f"checkpoint keys don't match module: {bad[:8]}")
+        # Guard against silently partial loads: a checkpoint from a different
+        # architecture (e.g. different n_units / n_mels / num_speaker) that
+        # lacks module keys without a shape clash would otherwise load with
+        # UNINITIALIZED weights and produce garbage. Only truly optional keys
+        # (discriminator / optimizer / criterion buffers) may be missing.
+        if missing:
+            _OPTIONAL_PREFIXES = (
+                "discriminator.", "optimizer.", "criterion.", "loss.", "metrics.",
+            )
+            real_missing = [k for k in missing if not k.startswith(_OPTIONAL_PREFIXES)]
+            if real_missing:
+                raise RuntimeError(
+                    f"checkpoint is missing {len(real_missing)} module weight(s); "
+                    f"the architecture likely mismatches (n_units/n_mels/"
+                    f"num_speaker). First few: {real_missing[:8]}"
+                )
 
     # -- feature enhancement (retrieval / cluster) ---------------------------
 
@@ -556,15 +575,26 @@ class InferenceEngine:
             return enh_out.astype(np.float32)
 
         # ---- DiffusionEnhancer (Diffusion-SVC, k-step DDPM denoising)
-        # operates in the backend domain (sovits is already 44.1k); for rvc
-        # at 48k we still feed 44.1k since sovits/diffusion enhancers expect
-        # 44.1k — the DiffusionEnhancer extracts its own mel at enh_sr.
+        # operates in the enhancer domain (44.1k). For rvc at 48k/32k/40k the
+        # synthesized wav AND the frame-domain tensors (units/f0/rms) must all
+        # be realigned to the enhancer frame grid (enh_sr/enh.hop), otherwise T
+        # (backend frames) != mel frames extracted from the 44.1k wav and the
+        # enhancer zero-pads the tail while units/f0 stay on the backend grid —
+        # silently corrupting the shallow-diffusion conditioning.
         wav_in = gen_wav
+        f0_in = f0
+        units_in = units
+        rms_in = rms
         if backend_sr != enh_sr:
             wav_in = _resample_wav(gen_wav.cpu().numpy(), backend_sr, enh_sr)
             wav_in = torch.from_numpy(wav_in).to(gen_wav.dtype).to(self.device)
+            enh_frames = wav_in.shape[-1] // enh.hop
+            f0_in = _resample_f0(f0, enh_frames)
+            units_in = _resample_units(units, enh_frames)
+            if rms_in is not None:
+                rms_in = _resample_f0(rms_in, enh_frames)
         enh_out = self.diffusion_enhancer.enhance(
-            units, f0, rms, spk, wav_in,
+            units_in, f0_in, rms_in, spk, wav_in,
             k_step=k_step,
             infer_speedup=diffusion_speedup,
             method=diffusion_method,

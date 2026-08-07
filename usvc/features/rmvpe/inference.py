@@ -66,7 +66,12 @@ class RMVPE:
         device = device or self.device
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
-        audio = audio.to(device=device, dtype=self.dtype)
+        # Keep the mel/STFT path in float32: MelSpectrogram's hann_window and
+        # mel_basis are fp32 buffers, and torch.stft requires input & window to
+        # share a dtype. Casting audio to fp16/bf16 here either crashes or relies
+        # on undocumented implicit promotion. Low precision is applied only at
+        # mel2hidden (right before the E2E model) — matching RVC/RIFT-SVC.
+        audio = audio.to(device=device).float()
 
         if sample_rate != SAMPLE_RATE:
             # librosa resample (no torchaudio dependency)
@@ -79,7 +84,7 @@ class RMVPE:
                 target_sr=SAMPLE_RATE,
                 res_type="soxr_lq",  # F0 is quality-insensitive; soxr_lq is ~12x faster
             )
-            audio = torch.from_numpy(wav_np).to(device=device, dtype=self.dtype).unsqueeze(0)
+            audio = torch.from_numpy(wav_np).to(device=device).float().unsqueeze(0)
 
         mel = self.mel_extractor(audio, center=True)
         hidden = self.mel2hidden(mel)

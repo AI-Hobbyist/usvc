@@ -33,6 +33,12 @@ class FeatureConfig:
 
     def hash(self) -> str:
         blob = {"kind": self.kind, **self.params}
+        # DSP grid version: mel/spec/rms share the nvSTFT center=False grid
+        # (window centered at k*hop + (win-hop)//2). Bumping this tag invalidates
+        # stale .pt artifacts produced by the old symmetric n_fft//2 padding so
+        # they are recomputed on the corrected grid. units/f0 are unaffected.
+        if self.kind in ("mel", "spec", "rms"):
+            blob["_grid"] = "nvstft_v2"
         return hashlib.sha256(_stable_json(blob).encode()).hexdigest()[:16]
 
     @property

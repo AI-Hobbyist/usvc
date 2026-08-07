@@ -125,10 +125,23 @@ class TrainConfig:
             if override or self.precision == "bf16-mixed":
                 self.precision = opt["precision"]
 
+    # Top-level keys that override feature generation. feature_spec() reads them
+    # from the dict it receives; both preprocessing and training must see the
+    # SAME values, so from_yaml merges any top-level occurrence into backend_opts
+    # (backend_opts wins on conflict to keep existing configs working).
+    _FEATURE_OVERRIDE_KEYS = (
+        "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+        "n_mels", "fmin", "fmax", "rvc_version", "version",
+    )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> TrainConfig:
         with open(path) as f:
             d = yaml.safe_load(f)
+        backend_opts = dict(d.get("backend_opts", {}) or {})
+        for k in cls._FEATURE_OVERRIDE_KEYS:
+            if k in d and k not in backend_opts:
+                backend_opts[k] = d[k]
         return cls(
             backend=d["backend"],
             dataset_dir=d.get("dataset_dir", "data/default"),
@@ -150,5 +163,5 @@ class TrainConfig:
             resume=d.get("resume"),
             pretrained=d.get("pretrained"),
             keep_last_n=d.get("keep_last_n", 5),
-            backend_opts=d.get("backend_opts", {}),
+            backend_opts=backend_opts,
         )

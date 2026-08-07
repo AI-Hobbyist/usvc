@@ -70,11 +70,20 @@ class Bi_RectifiedFlow(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
 
-    def reflow_loss(self, x_1, x_0, t, cond=None, loss_type='l2_lognorm'):
+    def reflow_loss(self, x_1, x_0, t, cond=None, loss_type='l2_lognorm', mask=None):
         x_t = x_0 + t[:, None, None, None] * (x_1 - x_0)
         v_pred = self.velocity_fn(x_t, 1000 * t, cond=cond)
 
-        if loss_type == 'l1':
+        if mask is not None:
+            # Average only over real frames (RIFT-SVC rf.py ``loss[mask]``).
+            # x_1 is [B, 1, M, T] (T last); mask is [B, T] -> [B, 1, 1, T].
+            m = mask.to(x_1.dtype)[:, None, None, :]
+            elem = F.mse_loss(x_1 - x_0, v_pred, reduction='none')
+            if loss_type == 'l2_lognorm':
+                weights = 0.398942 / t / (1 - t) * torch.exp(-0.5 * torch.log(t / (1 - t)) ** 2)
+                elem = weights[:, None, None, None] * elem
+            loss = (elem * m).sum() / (m.sum() * elem.shape[1] * elem.shape[2] + 1e-8)
+        elif loss_type == 'l1':
             loss = (x_1 - x_0 - v_pred).abs().mean()
         elif loss_type == 'l2':
             loss = F.mse_loss(x_1 - x_0, v_pred)
@@ -137,7 +146,8 @@ class Bi_RectifiedFlow(nn.Module):
                 t_end=1.0,
                 infer_step=10,
                 method='euler',
-                use_tqdm=True):
+                use_tqdm=True,
+                mask=None):
         if cond is not None:
             cond = cond.transpose(1, 2)  # [B, H, T]
         if not infer:
@@ -145,7 +155,7 @@ class Bi_RectifiedFlow(nn.Module):
             x_1 = self.norm_spec(x_end).transpose(1, 2).unsqueeze(1)  # [B, 1, M, T]
             t = torch.rand(x_0.shape[0], device=x_0.device)
             t = torch.clip(t, 1e-7, 1 - 1e-7)
-            return self.reflow_loss(x_1, x_0, t, cond=cond)
+            return self.reflow_loss(x_1, x_0, t, cond=cond, mask=mask)
         else:
             # initial condition and step size of the ODE
             if t_start < 0.0:

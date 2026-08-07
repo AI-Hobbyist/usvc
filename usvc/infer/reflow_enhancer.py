@@ -232,11 +232,38 @@ class ReflowEnhancer:
             sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
         # drop shape-mismatched keys (e.g. DDSP6 conditioner_projection 128→256)
         model_sd = self.shallow_model.state_dict()
+        dropped_shape = [k for k, v in sd.items()
+                         if k in model_sd and v.shape != model_sd[k].shape]
+        if dropped_shape:
+            print(
+                f"[reflow_shallow] dropped {len(dropped_shape)} shape-mismatched "
+                f"key(s) (expected when finetuning from a DDSP6 base with a "
+                f"different dim_cond): {dropped_shape[:5]}"
+            )
         sd = {k: v for k, v in sd.items()
               if k in model_sd and v.shape == model_sd[k].shape}
+        dropped_shape_set = set(dropped_shape)
         missing, unexpected = self.shallow_model.load_state_dict(sd, strict=False)
         if missing:
-            print(f"[reflow_shallow] missing keys: {len(missing)} (e.g. {missing[:3]})")
+            # Tolerable missing keys when finetuning from a DDSP6 base:
+            #  - optional submodules: ddsp_model / mel_extractor / vocoder / cfg
+            #  - reflow_shallow-only embedding layers (unit_embed / f0_embed /
+            #    volume_embed / spk_embed) which a DDSP6 ckpt never contains —
+            #    they are condition embeddings added by the v2 shallow model and
+            #    are intentionally random-initialized on migration.
+            _OPTIONAL = (
+                "ddsp_model.", "mel_extractor.", "vocoder", "_", "cfg",
+                "unit_embed.", "f0_embed.", "volume_embed.", "spk_embed.",
+                "aug_shift_embed.",
+            )
+            real_missing = [k for k in missing
+                            if not k.startswith(_OPTIONAL) and k not in dropped_shape_set]
+            if real_missing:
+                raise RuntimeError(
+                    f"[reflow_shallow] ckpt missing {len(real_missing)} required "
+                    f"weight(s); architecture mismatch? e.g. {real_missing[:5]}"
+                )
+            print(f"[reflow_shallow] missing optional/new-layer keys: {len(missing)} (e.g. {missing[:3]})")
         # unexpected: tolerate lightning metadata / optimizer keys
         bad = [k for k in unexpected
                if not k.startswith(("ddsp_model.", "mel_extractor.", "_", "vocoder", "cfg"))]
@@ -245,12 +272,16 @@ class ReflowEnhancer:
 
     def _load_reflow_weights(self, ckpt_path: str | Path) -> None:
         sd = _load_ckpt_state(ckpt_path)
+        # Strip the lightning "model." prefix if present (usvc training ckpts save
+        # DDSP6Model under 'model.ddsp_model.*' / 'model.reflow_model.*').
+        if any(k.startswith("model.") for k in sd):
+            sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
         missing, unexpected = self.ddsp_model.load_state_dict(sd, strict=False)
         # DDSP6 mel_extractor weights are not in the reflow ckpt (they are
         # deterministic STFT buffers); tolerate them as missing.
         tolerable_missing = [
             k for k in missing
-            if k.startswith("mel_extractor.")
+            if k.startswith(("mel_extractor.",))
         ]
         bad_missing = [k for k in missing if k not in tolerable_missing]
         if bad_missing:

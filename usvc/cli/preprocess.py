@@ -150,7 +150,20 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
 
         with open(args.train_cfg) as f:
-            args.train_cfg = yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        # Mirror TrainConfig.from_yaml: merge top-level feature override keys into
+        # backend_opts so preprocessing and training see the SAME feature config
+        # (otherwise units_kind / f0_extractor / version set at the top level only
+        # affect preprocessing, while training reads only backend_opts).
+        backend_opts = dict(raw.get("backend_opts", {}) or {})
+        _OVERRIDE = (
+            "units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+            "n_mels", "fmin", "fmax", "rvc_version", "version",
+        )
+        for k in _OVERRIDE:
+            if k in raw and k not in backend_opts:
+                backend_opts[k] = raw[k]
+        args.train_cfg = backend_opts
     else:
         args.train_cfg = {}
     args.func(args)

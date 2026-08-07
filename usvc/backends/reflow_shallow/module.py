@@ -47,6 +47,7 @@ class ReflowShallowModule(BaseSVCModule):
         spk = batch.spk_id  # [B] or None
         loss, sub = self.model.forward_loss(
             units, f0, rms, mel, spk_id=spk, t_start=self.t_start,
+            frame_len=batch.frame_len,
         )
         return loss, sub
 

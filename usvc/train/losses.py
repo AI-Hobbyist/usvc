@@ -82,14 +82,19 @@ def kl_loss(
     and normalizes by mask sum instead of mean).
 
     Args:
-        z_p: [B, T, C] flow-transformed posterior sample.
-        logs_q: [B, T, C] posterior log-std.
-        m_p: [B, T, C] prior mean.
-        logs_p: [B, T, C] prior log-std.
-        z_mask: [B, 1, T] optional mask.
+        z_p: [B, C, T] flow-transformed posterior sample.
+        logs_q: [B, C, T] posterior log-std.
+        m_p: [B, C, T] prior mean.
+        logs_p: [B, C, T] prior log-std.
+        z_mask: [B, 1, T] optional mask (broadcast over C).
     """
     kl = logs_p - logs_q - 0.5 + 0.5 * (z_p - m_p) ** 2 * torch.exp(-2 * logs_p)
     if z_mask is not None:
         kl = kl * z_mask
-        return kl.sum() / (z_mask.sum() * kl.shape[-1] + 1e-8)
+        # so-vits-svc / RVC convention: sum over (B, C, T), normalize by the
+        # number of active frames (z_mask.sum()). The [B,1,T] mask broadcasts
+        # over the channel dim C in the numerator, so this is the per-frame
+        # channel-summed KL — NOT a per-element mean (which would be ~1/C of
+        # this and break the c_kl balance of the original projects).
+        return kl.sum() / (z_mask.sum() + 1e-8)
     return kl.mean()

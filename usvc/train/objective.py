@@ -20,7 +20,21 @@ import torch.nn.functional as F
 from ..nn.normalization import MelNormalizer
 from ..nn.schedule import linear_beta_schedule, compute_alphas
 
-__all__ = ["FlowMatchingObjective", "DDPMObjective", "sample_time_lognorm"]
+__all__ = ["FlowMatchingObjective", "DDPMObjective", "sample_time_lognorm", "lens_to_mask"]
+
+
+def lens_to_mask(t: torch.Tensor, length: int | None = None) -> torch.Tensor:
+    """[b] lengths -> [b, n] boolean mask (True = valid frame).
+
+    Shared by all backends that mask padding frames in the loss (RIFT-SVC
+    rf.py convention ``loss[mask]``). Kept here so flow / DDPM / reflow
+    objectives can all consume the same mask without each backend rolling
+    its own.
+    """
+    if length is None:
+        length = int(t.amax().item()) if t.numel() else 0
+    seq = torch.arange(length, device=t.device)
+    return seq < t[..., None]
 
 
 def sample_time_lognorm(size: int, device: torch.device) -> torch.Tensor:
@@ -114,19 +128,23 @@ class FlowMatchingObjective:
             loss = F.mse_loss(pred, target, reduction="none")
         else:
             # l2_lognorm: weight = 0.398942 / t / (1-t) * exp(-0.5 * log(t/(1-t))^2)
-            # t is the original [B] before broadcasting
-            t_1d = self.sample_time(batch, x1.device) if batch > 1 else t.flatten()
-            # Recompute t_1d for weights (independent sample is fine for expectation)
+            # The weight MUST use the SAME t used to build xt and feed the
+            # velocity net, otherwise E_{t'~p}[w(t')]·E_t[L(t)] = E_t[L(t)]
+            # (since ∫₀¹ w dt = 1 for the logit-normal density) and the lognorm
+            # time emphasis collapses to plain L2. This matches ReFlow-VAE-SVC /
+            # DDSP-SVC-6.3 / the usvc ddsp6 RectifiedFlow.reflow_loss verbatim port.
+            t_1d = t.flatten()
             w = (
                 0.398942
                 / t_1d
                 / (1 - t_1d)
                 * torch.exp(-0.5 * torch.log(t_1d / (1 - t_1d)) ** 2)
             )
-            # Broadcast w to match loss shape
-            while w.ndim < loss.ndim if isinstance(loss, torch.Tensor) else w.ndim < pred.ndim:
+            # Broadcast w to match the elementwise MSE shape, then weight it.
+            mse = F.mse_loss(pred, target, reduction="none")
+            while w.ndim < mse.ndim:
                 w = w.unsqueeze(-1)
-            loss = w * F.mse_loss(pred, target, reduction="none")
+            loss = w * mse
 
         if mask is not None and loss.ndim >= 2 and mask.shape[1] == loss.shape[1]:
             # Apply per-frame mask (rift_dit [B,T,M] layout)
@@ -194,6 +212,7 @@ class DDPMObjective:
         denoise_fn: Callable,
         cond: dict | torch.Tensor | None = None,
         t_max: int | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute epsilon-prediction MSE loss.
 
@@ -204,6 +223,11 @@ class DDPMObjective:
             t_max: upper bound (exclusive) for the random timestep. None →
                 self.timesteps. so-vits shallow diffusion trains with
                 t = randint(0, k_step_max) where k_step_max < 1000.
+            mask: optional [B, T] boolean/float frame mask (1 = real frame,
+                0 = padding). When given, the loss is averaged only over real
+                frames (padding has mel=0 → norm(+0.714), a loud non-silence
+                target that pollutes the denoiser gradient). Matches RIFT-SVC
+                rf.py ``loss[mask]``.
 
         Returns:
             scalar loss tensor.
@@ -227,6 +251,10 @@ class DDPMObjective:
         xt = sqrt_acp * x0 + sqrt_omacp * noise
         eps_pred = denoise_fn(xt, t, cond)
 
+        if mask is not None and mask.shape[1] == x0.shape[1]:
+            elem = F.mse_loss(eps_pred, noise, reduction="none")
+            elem = elem * mask.unsqueeze(-1)
+            return elem.sum() / (mask.sum() * elem.shape[-1] + 1e-8)
         if self.loss_type == "l1":
             return F.l1_loss(eps_pred, noise)
         return F.mse_loss(eps_pred, noise)
