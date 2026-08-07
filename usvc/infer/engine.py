@@ -77,6 +77,65 @@ def _change_rms(data1: np.ndarray, sr1: int, data2: np.ndarray, sr2: int, rate: 
     out = data2 * (env1 ** (1 - rate)) * (env2 ** (rate - 1))
     return np.asarray(out, dtype=np.float32)
 
+
+# -- LUFS loudness normalization (RIFT-SVC style) -----------------------------
+
+_LUFS_METERS: dict[int, object] = {}
+# Integrated loudness below this (basically silence / pure noise floor) is not
+# normalized — amplifying it by tens of dB just boosts the noise floor.
+_MIN_LUFS = -70.0
+
+
+def _lufs_meter(sr: int):
+    """Cached pyloudnorm Meter (RIFT-SVC uses block_size=0.1)."""
+    from pyloudnorm import Meter
+
+    m = _LUFS_METERS.get(sr)
+    if m is None:
+        m = Meter(sr, block_size=0.1)
+        _LUFS_METERS[sr] = m
+    return m
+
+
+def _normalize_loudness(
+    wav: np.ndarray, sr: int, target_lufs: float
+) -> tuple[np.ndarray, float]:
+    """Normalize wav to target integrated loudness (LUFS).
+
+    Mirrors RIFT-SVC extract_features: measure original loudness, normalize to
+    target, then scale back to 0.99 peak if the gain would clip. Returns
+    (normalized_wav, original_lufs); silence / noise-floor audio is returned
+    untouched with original_lufs = -inf so callers skip the restore step.
+    """
+    from pyloudnorm import normalize as pyln_normalize
+
+    loudness = _lufs_meter(sr).integrated_loudness(wav)
+    if not np.isfinite(loudness) or loudness < _MIN_LUFS:
+        return wav, loudness
+    out = pyln_normalize.loudness(wav, loudness, target_lufs)
+    max_amp = float(np.max(np.abs(out))) if out.size else 0.0
+    if max_amp > 1.0:
+        out = out * (0.99 / max_amp)
+    return np.asarray(out, dtype=np.float32), loudness
+
+
+def _restore_loudness(wav: np.ndarray, sr: int, original_lufs: float) -> np.ndarray:
+    """Restore output loudness to the input's original integrated loudness.
+
+    Mirrors RIFT-SVC generate_audio: measure the output loudness and normalize
+    it back to the original input loudness, with 0.99 peak protection.
+    """
+    from pyloudnorm import normalize as pyln_normalize
+
+    loudness = _lufs_meter(sr).integrated_loudness(wav)
+    if not np.isfinite(loudness) or loudness < _MIN_LUFS:
+        return wav
+    out = pyln_normalize.loudness(wav, loudness, original_lufs)
+    max_amp = float(np.max(np.abs(out))) if out.size else 0.0
+    if max_amp > 1.0:
+        out = out * (0.99 / max_amp)
+    return np.asarray(out, dtype=np.float32)
+
 # mel-domain backends use the shared NSF-HiFiGAN vocoder
 MEL_DOMAIN = ("rift_dit", "ddsp6", "diffusion", "reflow_vae")
 # wav-domain backends decode waveform directly from the generator
@@ -355,6 +414,15 @@ class InferenceEngine:
         t_start: float | None = None,
         rms_mix_rate: float = 1.0,
         protect: float = 0.5,
+        f0_method: str | None = None,
+        noice_scale: float = 0.4,
+        predict_f0: bool = False,
+        formant_shift: float = 0.0,
+        ds_cfg_strength: float | None = None,
+        spk_cfg_strength: float | None = None,
+        skip_cfg_strength: float | None = None,
+        target_loudness: float | None = None,
+        restore_loudness: bool = True,
     ) -> np.ndarray:
         """Convert a wav file; returns float32 wav at the backend sample rate.
 
@@ -375,6 +443,15 @@ class InferenceEngine:
             disabled; 0.33 typical). Uses rms > threshold as the speech-frame
             criterion (rvc f0 is interpolated so it is never 0 except digital
             silence). Only meaningful with index/cluster enhancement.
+        f0_method: optional runtime f0 extractor override ("rmvpe" | "fcpe");
+            None uses the config default.
+        target_loudness: LUFS value to normalize the input to before feature
+            extraction (RIFT-SVC style; None = disabled). Features are
+            extracted from the normalized audio, so this also matches the
+            RIFT training distribution for the rift_dit backend.
+        restore_loudness: after conversion, restore the output loudness to the
+            input's original integrated loudness (only when target_loudness
+            is set and the input loudness was measurable).
         """
         if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError(
@@ -382,7 +459,19 @@ class InferenceEngine:
                 "or reflow_ckpt+reflow_config at engine construction (sovits/rvc)"
             )
         _t_start = self.t_start if t_start is None else float(t_start)
-        feats = self.features.extract(input_wav)
+        original_loudness: float | None = None
+        if target_loudness is not None:
+            # Normalize the input first so features are extracted from the
+            # loudness-matched audio (matches RIFT training distribution).
+            from ..io.audio import load_audio
+
+            wav_in = load_audio(input_wav, sr=self.sr)
+            wav_in, original_loudness = _normalize_loudness(
+                wav_in, self.sr, float(target_loudness)
+            )
+            feats = self.features.extract(wav=wav_in, f0_method=f0_method)
+        else:
+            feats = self.features.extract(input_wav, f0_method=f0_method)
         units = feats["units"].to(self.device)  # [T, dim]
         f0 = feats["f0"].to(self.device)  # [T]
         rms = feats["rms"].to(self.device) if feats["rms"] is not None else None
@@ -424,6 +513,12 @@ class InferenceEngine:
                 diffusion_speedup=diffusion_speedup,
                 t_start=_t_start,
                 steps=steps,
+                noice_scale=noice_scale,
+                predict_f0=predict_f0,
+                formant_shift=formant_shift,
+                ds_cfg_strength=ds_cfg_strength,
+                spk_cfg_strength=spk_cfg_strength,
+                skip_cfg_strength=skip_cfg_strength,
             ).astype(np.float32)
         else:
             # Silence-aware segmentation: split at silence boundaries.
@@ -444,11 +539,21 @@ class InferenceEngine:
                     diffusion_speedup=diffusion_speedup,
                     t_start=_t_start,
                     steps=steps,
+                    noice_scale=noice_scale,
+                    predict_f0=predict_f0,
+                    formant_shift=formant_shift,
+                    ds_cfg_strength=ds_cfg_strength,
+                    spk_cfg_strength=spk_cfg_strength,
+                    skip_cfg_strength=skip_cfg_strength,
                 )
                 chunk_outputs.append(wav_chunk)
 
             out = self._stitch_chunks(boundaries, chunk_outputs)
 
+        # Restore the input's original loudness (before RMS envelope match so
+        # rms_mix_rate stays the final envelope step).
+        if original_loudness is not None and restore_loudness:
+            out = _restore_loudness(out, self.sr, original_loudness)
         # RVC pipeline: optional output RMS envelope match to the input wav.
         if rms_mix_rate != 1.0:
             out = _change_rms(feats["wav"], feats["sr"], out, self.sr, rms_mix_rate)
@@ -569,6 +674,12 @@ class InferenceEngine:
         diffusion_speedup: int = 10,
         t_start: float = 0.5,
         steps: int | None = None,
+        noice_scale: float = 0.4,
+        predict_f0: bool = False,
+        formant_shift: float = 0.0,
+        ds_cfg_strength: float | None = None,
+        spk_cfg_strength: float | None = None,
+        skip_cfg_strength: float | None = None,
     ) -> np.ndarray:
         """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
@@ -582,7 +693,10 @@ class InferenceEngine:
             rms=rms.unsqueeze(0) if rms is not None else None,
             spk_id=spk_id,
             uv=uv.unsqueeze(0),
-            aug_shift=None,
+            aug_shift=(
+                torch.tensor([[formant_shift]], device=self.device, dtype=units.dtype)
+                if formant_shift != 0.0 else None
+            ),
             pitch_token=None,
             frame_len=frame_len,
             key=None,
@@ -591,16 +705,20 @@ class InferenceEngine:
         if self.backend_name == "rift_dit":
             src_mel = torch.zeros(1, T, self.n_mels, device=self.device, dtype=units.dtype)
             batch.mel = src_mel
+            # CLI overrides take precedence over config values (None = use config).
+            _ds = self.cfg_ds_strength if ds_cfg_strength is None else ds_cfg_strength
+            _spk = self.cfg_spk_strength if spk_cfg_strength is None else spk_cfg_strength
+            _skip = self.cfg_skip_strength if skip_cfg_strength is None else skip_cfg_strength
             # RIFT-SVC bad_cvec: cvec downsampled 2x then interpolated back to
             # full length (infer.py:124-128) — the "degraded" condition for ds CFG.
             bad_cvec = None
-            if self.cfg_ds_strength > 1e-5:
+            if _ds > 1e-5:
                 bad_cvec = _resample_units(batch.units[0, ::2, :], T).unsqueeze(0)
             mel = self.module.sample(
                 batch,
-                ds_cfg_strength=self.cfg_ds_strength,
-                spk_cfg_strength=self.cfg_spk_strength,
-                skip_cfg_strength=self.cfg_skip_strength,
+                ds_cfg_strength=_ds,
+                spk_cfg_strength=_spk,
+                skip_cfg_strength=_skip,
                 cfg_rescale=self.cfg_rescale,
                 bad_cvec=bad_cvec,
                 steps=steps,
@@ -623,6 +741,8 @@ class InferenceEngine:
                 batch.uv,
                 batch.spk_id.unsqueeze(-1),
                 vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)
+                noice_scale=noice_scale,
+                predict_f0=predict_f0,
             )
             if shallow_diffusion:
                 return self._enhance_wav(
@@ -760,7 +880,21 @@ class InferenceEngine:
                     out = np.concatenate([out, cur[overlap:]])
         return out.astype(np.float32)
 
-    def convert_file(self, input_wav: str | Path, output_wav: str | Path, **kwargs) -> None:
-        """Convert and write the result to a wav file."""
+    def convert_file(
+        self,
+        input_wav: str | Path,
+        output_wav: str | Path,
+        resample_sr: int | None = None,
+        **kwargs,
+    ) -> None:
+        """Convert and write the result to a wav file.
+
+        resample_sr: optional output sample rate; None (default) keeps the
+            backend sample rate. The wav is resampled with soxr before saving.
+        """
         wav = self.convert(input_wav, **kwargs)
-        save_audio(str(output_wav), wav, sr=self.sr)
+        sr = self.sr
+        if resample_sr is not None and resample_sr != self.sr:
+            wav = _resample_wav(wav, self.sr, resample_sr)
+            sr = resample_sr
+        save_audio(str(output_wav), wav, sr=sr)

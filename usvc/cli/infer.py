@@ -29,6 +29,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--spk", type=int, default=0, help="speaker id")
     p.add_argument("--trans", type=int, default=0, help="pitch shift in semitones")
     p.add_argument("--steps", type=int, default=None, help="sampling steps (flow/diff backends)")
+    p.add_argument("--resample-sr", type=int, default=None,
+                   help="output sample rate (default: backend sr; soxr resample)")
+    p.add_argument("--noice-scale", type=float, default=0.4,
+                   help="so-vits prior noise scale (sovits only; default 0.4)")
+    p.add_argument("--auto-predict-f0", action="store_true",
+                   help="so-vits: use the f0 decoder head instead of ground f0 (sovits only)")
+    p.add_argument("--formant-shift", type=float, default=0.0,
+                   help="formant shift in semitones (ddsp6/diffusion/reflow_vae with "
+                        "use_pitch_aug; 0=off)")
+    p.add_argument("--f0-method", default=None, choices=["rmvpe", "fcpe"],
+                   help="f0 extractor for inference: rmvpe | fcpe "
+                        "(default: config's f0_extractor)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--half", action="store_true", help="use fp16 inference")
     p.add_argument("--index-path", default=None, help="retrieval index .pt (RVC style)")
@@ -61,6 +73,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--t-start", type=float, default=0.5,
                    help="reflow ODE start time [0,1): 0=full gen, ->1=keep gt "
                         "(default 0.5; only used with --reflow-ckpt)")
+    # rift_dit CFG overrides (default None = use config values)
+    p.add_argument("--ds-cfg", dest="ds_cfg_strength", type=float, default=None,
+                   help="rift content(units) CFG strength (overrides config; default=config)")
+    p.add_argument("--spk-cfg", dest="spk_cfg_strength", type=float, default=None,
+                   help="rift speaker CFG strength (overrides config; default=config)")
+    p.add_argument("--skip-cfg", dest="skip_cfg_strength", type=float, default=None,
+                   help="rift skip-layer CFG strength (overrides config; default=config)")
+    # LUFS loudness normalization (RIFT-SVC style)
+    p.add_argument("--target-loudness", type=float, default=None,
+                   help="normalize input to this integrated loudness in LUFS before "
+                        "conversion (RIFT-SVC default -18.0; default: disabled)")
+    p.add_argument("--no-restore-loudness", action="store_true", default=False,
+                   help="do not restore output loudness to the input's original "
+                        "loudness after conversion (only with --target-loudness)")
     args = p.parse_args(argv)
 
     from ..infer.engine import InferenceEngine
@@ -97,6 +123,16 @@ def main(argv: list[str] | None = None) -> int:
         t_start=args.t_start,
         rms_mix_rate=args.rms_mix_rate,
         protect=args.protect,
+        f0_method=args.f0_method,
+        resample_sr=args.resample_sr,
+        noice_scale=args.noice_scale,
+        predict_f0=args.auto_predict_f0,
+        formant_shift=args.formant_shift,
+        ds_cfg_strength=args.ds_cfg_strength,
+        spk_cfg_strength=args.spk_cfg_strength,
+        skip_cfg_strength=args.skip_cfg_strength,
+        target_loudness=args.target_loudness,
+        restore_loudness=not args.no_restore_loudness,
     )
     print(f"[usvc-infer] {args.input} -> {output} "
           f"(backend={engine.backend_name}, sr={engine.sr}, half={args.half})")

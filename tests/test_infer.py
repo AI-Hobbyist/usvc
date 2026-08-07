@@ -394,3 +394,106 @@ class TestEngine:
         torch.save({"model": bare2}, tmp_path / "orig_rvc_full.pth")
         engine2 = InferenceEngine(cfg_path, tmp_path / "orig_rvc_full.pth", device="cuda")
         assert engine2.module.generator is not None
+
+
+class TestLoudnessNorm:
+    """LUFS loudness normalization (RIFT-SVC style)."""
+
+    def test_helpers_normalize_restore(self):
+        import numpy as np
+        from usvc.infer.engine import (
+            _lufs_meter, _normalize_loudness, _restore_loudness,
+        )
+
+        sr = 44100
+        t = np.arange(sr) / sr
+        wav = (0.05 * np.sin(2 * np.pi * 440 * t)
+               + 0.02 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
+        meter = _lufs_meter(sr)
+        l0 = meter.integrated_loudness(wav)
+
+        # normalize to -18 LUFS, capture original
+        wav_n, orig = _normalize_loudness(wav, sr, -18.0)
+        assert wav_n.dtype == np.float32
+        assert abs(orig - l0) < 1e-3
+        assert abs(meter.integrated_loudness(wav_n) - (-18.0)) < 0.3
+        assert float(np.max(np.abs(wav_n))) <= 1.0  # peak protection
+
+        # restore back to original loudness
+        wav_r = _restore_loudness(wav_n, sr, orig)
+        assert abs(meter.integrated_loudness(wav_r) - l0) < 0.5
+        assert float(np.max(np.abs(wav_r))) <= 1.0
+
+    def test_helpers_silence_and_noise_floor(self):
+        import numpy as np
+        from usvc.infer.engine import _normalize_loudness
+
+        sr = 44100
+        # digital silence: -inf loudness must not blow up
+        sil = np.zeros(sr, dtype=np.float32)
+        sil_n, orig_sil = _normalize_loudness(sil, sr, -18.0)
+        assert not np.isfinite(orig_sil)
+        assert not sil_n.any()
+        # near-silence noise floor: skipped (returned unchanged)
+        noise = (1e-6 * np.random.randn(sr)).astype(np.float32)
+        noise_n, _ = _normalize_loudness(noise, sr, -18.0)
+        assert np.allclose(noise_n, noise)
+
+    def test_cli_args_present(self):
+        import contextlib
+        import io
+        from usvc.cli import infer as infer_cli
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                infer_cli.main(["--help"])
+            except SystemExit as e:
+                assert e.code == 0
+        help_text = buf.getvalue()
+        assert "--target-loudness" in help_text
+        assert "--no-restore-loudness" in help_text
+
+    def test_engine_convert_accepts_target_loudness(self, tmp_path):
+        """convert() accepts target_loudness/restore_loudness and output stays
+        finite; when the restore peak-protection is not triggered, the output
+        loudness is restored to the input's original loudness."""
+        import numpy as np
+        from usvc.infer.engine import InferenceEngine, _lufs_meter
+        from usvc.infer.features import synth_test_wav
+        from usvc.io.audio import load_audio
+
+        backend, sr = "rvc", 48000
+        opts = {"n_units": 768, "num_speaker": 1, "sr": 48000, "segment_size": 20,
+                "inter_channels": 64, "hidden_channels": 64, "filter_channels": 128}
+        ckpt = tmp_path / "rvc.ckpt"
+        cfg = tmp_path / "rvc.yaml"
+        _make_module_ckpt(backend, opts, ckpt)
+        _write_cfg(backend, opts, cfg)
+        wav_in = tmp_path / "in.wav"
+        synth_test_wav(wav_in, sr=sr, duration=1.0, f0_base=220.0)
+
+        engine = InferenceEngine(cfg, ckpt, device="cuda")
+        # baseline without normalization
+        out_base = engine.convert(str(wav_in), spk=0, trans=0)
+        # with loudness normalization (restore on by default)
+        out_norm = engine.convert(str(wav_in), spk=0, trans=0, target_loudness=-18.0)
+        # with restore disabled
+        out_norestore = engine.convert(
+            str(wav_in), spk=0, trans=0, target_loudness=-18.0, restore_loudness=False
+        )
+        for o in (out_base, out_norm, out_norestore):
+            assert o.dtype == np.float32 and o.ndim == 1
+            assert not np.isnan(o).any()
+            assert 0.7 < o.shape[0] / sr < 1.4
+        # restore on -> output loudness matches the input's original loudness
+        # (unless the 0.99-peak protection fired, which only happens with
+        # un-trained random weights whose output peaks far exceed 1.0)
+        meter = _lufs_meter(sr)
+        l_in = meter.integrated_loudness(load_audio(str(wav_in), sr=sr))
+        l_norm = meter.integrated_loudness(out_norm)
+        if float(np.abs(out_norm).max()) <= 1.0:
+            assert abs(l_norm - l_in) < 1.5, f"restore target {l_in:.2f}, got {l_norm:.2f}"
+        else:
+            # peak protection fired: loudness is lower than the target
+            assert l_norm < l_in + 0.5
