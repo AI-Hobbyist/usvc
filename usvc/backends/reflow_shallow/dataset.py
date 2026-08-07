@@ -1,11 +1,7 @@
-"""reflow_shallow dataset (v2): reads mel + units + f0 + rms.
+"""reflow_shallow dataset: reads mel + units + f0 + rms.
 
-v2 uses units/f0/vol embeddings as the reflow condition (mel-independent),
-so units are now required (contentvec 768-d, same as sovits/ddsp6).
-
-Feature reuse: mel/f0/rms/units hashes come from the backend feature_spec,
-which matches the sovits/ddsp6 config family (44.1k/512, contentvec768) so
-preprocessed features are shared where configs coincide.
+mel/units/f0/rms use the 44.1k/512 contentvec768 config family, shared
+with sovits/ddsp6 so preprocessed features are reused.
 """
 from __future__ import annotations
 

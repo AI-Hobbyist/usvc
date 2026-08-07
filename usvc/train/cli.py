@@ -285,6 +285,9 @@ def run_training(cfg: TrainConfig, resume: str | None = None, device: str | None
         precision=cfg.precision,
         gradient_clip_val=use_grad_clip,
         callbacks=[checkpoint_cb, prune_cb, lr_monitor, ScheduleFreeModeCallback()],
+        # Explicit logger so metrics/checkpoints land under exp_dir predictably
+        # (Lightning's default TensorBoardLogger sometimes defers dir creation).
+        logger=pl.loggers.TensorBoardLogger(save_dir=str(cfg.exp_dir), name="lightning_logs"),
         # val_check_interval: >1 = step count (if <= batches/epoch),
         # <=1 = epoch fraction. Clamp to per-epoch (1.0) when the requested
         # step interval exceeds the batches-per-epoch, to avoid

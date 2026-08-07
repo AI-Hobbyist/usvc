@@ -1,45 +1,13 @@
-"""Reflow shallow-diffusion enhancer (DDSP6 RectifiedFlow backend).
+"""Reflow shallow-diffusion enhancer for sovits/rvc.
 
-Reuses the ``RectifiedFlow`` + ``ddsp_model.unit2ctrl`` from the DDSP6 backend
-to perform t_start shallow diffusion on the mel produced by a wav-domain
-generator (sovits / rvc). The final wav is resynthesised by the shared
-PC NSF-HiFiGAN vocoder.
+Two modes:
+  - "shallow" (ReflowShallowModel): condition = sovits/rvc mel + units/f0/vol
+    embeddings; the velocity network applies a targeted "dirty → clean"
+    correction.
+  - "ddsp6" (DDSP6Model): DDSP-synthesised mel as condition + reflow.
 
-Data flow::
-
-    rvc/sovits wav ──MelExtractor──▶ gt_spec (log-dB mel)
-    units/f0/rms/spk ──ddsp_model.unit2ctrl──▶ hidden (condition)
-    gt_spec + hidden ──RectifiedFlow(t_start)──▶ 去噪 mel
-    去噪 mel + f0 ──NSF-HiFiGAN (PC)──▶ 最终 wav
-
-Key design:
-  - The DDSP6 ``RectifiedFlow`` velocity network takes the *mel* as its
-    condition (``dim_cond == out_dims == 128``).  The condition mel comes
-    from DDSP synthesis: ``units+f0+volume+spk -> ddsp_model -> ddsp_wav ->
-    extract mel``.  ``Unit2Wav.forward``'s infer branch is unsuitable here
-    because it ignores the caller's ``gt_spec`` whenever a mel extractor is
-    present (it reuses the DDSP mel as both condition *and* target).
-  - For shallow diffusion we therefore build the condition mel via DDSP
-    synthesis ourselves, then feed the *external* (sovits/rvc) mel as the
-    reflow ``gt_spec`` (refinement target):
-      1. ddsp_wav = ddsp_model(units, f0, volume, spk)
-      2. ddsp_mel = mel_extractor.extract(ddsp_wav)   # condition
-      3. mel = reflow_model(condition=ddsp_mel, gt_spec=<external mel>,
-                            t_start)                   # shallow diffusion
-    This makes the sovits/rvc output genuinely drive the refinement.
-
-RectifiedFlow shallow-diffusion math (``model.py:RectifiedFlow.forward``)::
-
-    if gt_spec is None:                 # 纯生成
-        x = randn(shape);  t = 0;       dt = 1/infer_step
-    else:                               # 浅扩散
-        x = t_start * norm(gt_spec) + (1-t_start) * randn(shape)
-        t = t_start;        dt = (1 - t_start) / infer_step
-    for i in range(infer_step):
-        x, t = sample_euler(x, t, dt, cond)   # euler / rk4
-
-This is mathematically equivalent to diffusion k_step shallow diffusion, but
-rectified flow converges in ~10 steps (vs 25-100 for DDPM).
+Data flow: rvc/sovits wav → mel → reflow(t_start) → refined mel →
+NSF-HiFiGAN vocoder → final wav.
 """
 from __future__ import annotations
 
@@ -161,11 +129,7 @@ class ReflowEnhancer:
             self.shallow_model = None
         # reflow sampling stays fp32 (ODE iterations are numerically sensitive)
 
-        # ---- mel extractor (must match DDSP6 training mel params) ----
-        # ---- mel extractor (must EXACTLY match DDSP6's internal mel_extractor) ----
-        # DDSP6's MelExtractor uses fmin=40 / fmax=16000 defaults (44.1k/512/2048).
-        # The gt_spec we extract here is the reflow *target*; it must live in
-        # the same mel domain as the DDSP-synthesised condition mel.
+        # mel extractor: must match the reflow model's mel domain
         self.mel_extractor = MelExtractor(
             FeatureConfig(
                 "mel",
@@ -182,12 +146,8 @@ class ReflowEnhancer:
             hop=int(mel_cfg.get("hop", block_size)),
         ).to(device)
 
-        # ---- contentvec units extractor (if enhancer units differ from
-        # the main generator's units, re-extract from the enhancer-domain wav)
-        # ----
-        # DDSP6 expects contentvec (768-d).  sovits/rvc already use contentvec
-        # 768-d, so in most cases re-extraction is unnecessary.  We keep the
-        # hook for safety (matching DiffusionEnhancer's design).
+        # Optional re-extraction of contentvec units from the enhancer-domain
+        # wav (usually unnecessary since sovits/rvc already use contentvec 768-d).
         self.units_kind = str(cfg.get("units_kind", "contentvec"))
         self.units_extractor = None
         if self.units_kind != "contentvec":
@@ -230,6 +190,12 @@ class ReflowEnhancer:
         # Strip the lightning "model." prefix if present.
         if any(k.startswith("model.") for k in sd):
             sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+        # Remap stored key name to ReflowShallowModel structure.
+        sd = {
+            (k.replace("reflow_velocity_fn.", "reflow_model.velocity_fn.")
+             if k.startswith("reflow_velocity_fn.") else k): v
+            for k, v in sd.items()
+        }
         # drop shape-mismatched keys (e.g. DDSP6 conditioner_projection 128→256)
         model_sd = self.shallow_model.state_dict()
         dropped_shape = [k for k, v in sd.items()
@@ -245,12 +211,8 @@ class ReflowEnhancer:
         dropped_shape_set = set(dropped_shape)
         missing, unexpected = self.shallow_model.load_state_dict(sd, strict=False)
         if missing:
-            # Tolerable missing keys when finetuning from a DDSP6 base:
-            #  - optional submodules: ddsp_model / mel_extractor / vocoder / cfg
-            #  - reflow_shallow-only embedding layers (unit_embed / f0_embed /
-            #    volume_embed / spk_embed) which a DDSP6 ckpt never contains —
-            #    they are condition embeddings added by the v2 shallow model and
-            #    are intentionally random-initialized on migration.
+            # Tolerable missing keys: optional submodules + reflow_shallow-
+            # only embedding layers (random-initialised when migrating from DDSP6).
             _OPTIONAL = (
                 "ddsp_model.", "mel_extractor.", "vocoder", "_", "cfg",
                 "unit_embed.", "f0_embed.", "volume_embed.", "spk_embed.",
@@ -412,21 +374,14 @@ class ReflowEnhancer:
         # 3-4) shallow diffusion
         with torch.no_grad():
             if self._mode == "shallow":
-                # ReflowShallowModel v2: condition = units/f0/vol embeddings
-                # (mel-independent), gt_spec = sovits/rvc mel.  The reflow
-                # ODE starts from (t_start*sovits_mel + noise) and integrates
-                # toward the clean-mel manifold guided by the mel-free
-                # condition — a true shallow diffusion (DDPM-equivalent).
+                # shallow mode: condition = sovits/rvc mel + embeddings
                 denoised = self.shallow_model.sample(
                     units_b, f0_b.squeeze(-1), vol_b.squeeze(-1), mel,
                     t_start=t_start, infer_step=infer_step, method=method,
                     spk_id=spk_b,
                 )  # [1, T, M] denormalized (dB domain)
             else:
-                # DDSP6 mode: DDSP synthesis (condition) + reflow toward the
-                # external mel.  _shallow_sample bypasses Unit2Wav.forward
-                # (whose infer branch ignores gt_spec when a mel extractor is
-                # present) and feeds the sovits/rvc mel directly.
+                # ddsp6 mode: DDSP-synthesised mel as condition + reflow
                 denoised = self._shallow_sample(
                     units_b, f0_b, vol_b, spk_b, mel,
                     t_start=t_start, infer_step=infer_step, method=method,

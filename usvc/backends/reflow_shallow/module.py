@@ -1,11 +1,7 @@
-"""ReflowShallowModule — LightningModule for the reflow_shallow backend (v2).
+"""ReflowShallowModule — LightningModule for the reflow_shallow backend (v3).
 
-Training: condition = units/f0/vol embeddings (mel-independent), target =
-real_mel, reflow_loss.  This is the DDPM-equivalent shallow-diffusion
-formulation: the condition does NOT carry mel information, so at inference
-the sovits_mel (gt_spec) genuinely participates in the ODE trajectory.
-
-Inference (sample): shallow-diffuse the input mel via t_start ODE.
+Mel-conditioned reflow: training condition = degrade(clean_mel) +
+units/f0/vol embeddings; inference condition = sovits/rvc mel.
 """
 from __future__ import annotations
 

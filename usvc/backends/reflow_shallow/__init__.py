@@ -42,7 +42,7 @@ class ReflowShallowBackend(Backend):
     def feature_spec(train_cfg: dict) -> FeatureSpec:
         base = ReflowShallowBackend.DEFAULT_FEATURES
         f0 = resolve_f0_config(train_cfg)
-        return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms)
+        return FeatureSpec(mel=base.mel, f0=f0, rms=base.rms, units=base.units)
 
     def build_dataset(
         self, dataset_dir: str, split: str, feature_hashes: dict[str, str]

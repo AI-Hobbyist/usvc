@@ -74,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        import traceback as _tb
+        _tb.print_exc()
         print(f"error: training failed: {exc}", file=sys.stderr)
         return 1
     return 0

@@ -44,7 +44,7 @@ class SoVITSModule(BaseGANModule):
             n_sdp_layers0=opts.get("n_sdp_layers0", 6),
             n_sdp_layers=opts.get("n_sdp_layers", 6),
             n_speakers=opts.get("num_speaker", 1),
-            segment_size=opts.get("segment_size", 10240),
+            segment_size=opts.get("segment_size", 20),  # FRAMES per segment (10240 samples // 512 hop)
             gin_channels=opts.get("gin_channels", 768),
             use_automatic_f0_prediction=opts.get("use_automatic_f0_prediction", True),
             vol_embedding=opts.get("vol_embedding", False),

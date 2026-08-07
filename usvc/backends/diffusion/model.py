@@ -632,6 +632,8 @@ class DiffusionModel(nn.Module):
 
         from ...train.objective import lens_to_mask
         mask = lens_to_mask(frame_len, length=gt_spec.shape[1]) if frame_len is not None else None
+        if mask is not None:
+            mask = mask.to(gt_spec.device)  # frame_len may be on CPU
         loss = self.objective.compute_loss(
             gt_spec, self._denoise_wrapper, cond, t_max=self.k_step, mask=mask,
         )

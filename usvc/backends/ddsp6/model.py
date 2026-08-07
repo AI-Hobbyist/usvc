@@ -856,6 +856,9 @@ class RectifiedFlow(nn.Module):
 
             x = x.squeeze(1).transpose(1, 2)  # [B, T, M]
 
+            # Clamp ODE output to [-1,1] before denormalization to avoid
+            # vocoder overshoot/clipping from integration error.
+            x = torch.clamp(x, -1.0, 1.0)
             return self.denorm_spec(x)
 
     def norm_spec(self, x):
@@ -1034,6 +1037,8 @@ class Unit2Wav(nn.Module):
                 # not trained on pad frames (mel=0 dB target). gt_spec is [B, T, M].
                 from ...train.objective import lens_to_mask
                 _mask = lens_to_mask(frame_len, length=gt_spec.shape[1]) if frame_len is not None else None
+                if _mask is not None:
+                    _mask = _mask.to(gt_spec.device)  # frame_len may be on CPU
                 reflow_loss = self.reflow_model(ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False, mask=_mask)
             else:
                 reflow_loss = torch.tensor(0)
