@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
                         "(default: config's f0_extractor)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--half", action="store_true", help="use fp16 inference")
+    p.add_argument("--compile-graph", action="store_true",
+                   help="torch.compile the generator/model (reduce-overhead CUDA graph; launch-bound inference)")
     p.add_argument("--index-path", default=None, help="retrieval index .pt (RVC style)")
     p.add_argument("--index-ratio", type=float, default=0.0, help="retrieval blend ratio (0-1)")
     p.add_argument("--cluster-path", default=None, help="cluster model .pt (so-vits style)")
@@ -104,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         reflow_ckpt=args.reflow_ckpt,
         reflow_config=args.reflow_config,
         t_start=args.t_start,
+        compile_graph=args.compile_graph,
     )
 
     output = args.output
