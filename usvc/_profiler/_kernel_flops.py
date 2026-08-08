@@ -26,20 +26,25 @@ CATEGORIES = [CUDNN_CUBLAS, TRITON_FUSED, ELEMENTWISE_REDUCE, MEMCPY_TRANSFER, S
 
 # kernel 名匹配规则（按优先级，先命中先用）
 _KERNEL_PATTERNS = [
-    # cuBLAS / cutlass GEMM
-    (CUDNN_CUBLAS, re.compile(r"cutlass|cublas|gemm|sgemm|gemv|getrf|getri|trsm", re.I)),
+    # cuBLAS / cutlass GEMM (含 aten::mm/bmm/addmm/linear —— 它们最终走 cublas)
+    (CUDNN_CUBLAS, re.compile(r"cutlass|cublas|gemm|sgemm|gemv|getrf|getri|trsm|"
+                              r"aten::mm|aten::bmm|aten::addmm|aten::linear|aten::matmul", re.I)),
     # cuDNN conv / winograd
     (CUDNN_CUBLAS, re.compile(r"cudnn|winograd|convolv|spatial", re.I)),
-    # Triton fused kernel（我们自己写的 + torch._inductor）
-    (TRITON_FUSED, re.compile(r"triton_|_kernel$|inductor|_fused|program_id", re.I)),
+    # cuFFT / FFT (STFT 主导算子，已优化不可压)
+    (CUDNN_CUBLAS, re.compile(r"fft|_fft|vector_fft", re.I)),
+    # Triton fused kernel（我们自己写的 + torch._inductor）。严格匹配 triton 命名，
+    # 避免 _kernel$ 误吃 at::native::elementwise_kernel（后者由 elementwise 规则处理）。
+    (TRITON_FUSED, re.compile(r"triton_+_?\d|inductor|program_id|_triton_|triton::", re.I)),
     # elementwise / reduce（胶水）
     (ELEMENTWISE_REDUCE, re.compile(
-        r"elementwise|reduce|unary|binary|tensor_iterator|"
-        r"add|sub|mul|div|relu|clamp|sigmoid|tanh|exp|log|sqrt|"
-        r"_sum|_max|_min|_mean|argmax|argmin|softmax|norm", re.I)),
+        r"elementwise|reduce|unary|binary|tensor_iterator|_kernel_vectorized|"
+        r"aten::add|aten::sub|aten::mul|aten::div|aten::abs|aten::neg|aten::exp|aten::log|aten::sqrt|aten::clamp|aten::relu|aten::gelu|"
+        r"aten::_softmax|softmax|add|sub|mul|div|relu|clamp|sigmoid|tanh|exp|log|sqrt|gelu|"
+        r"_sum|_max|_min|_mean|argmax|argmin|norm", re.I)),
     # memcpy / transfer
     (MEMCPY_TRANSFER, re.compile(r"memcpy|cudaMemcpy|copy_kernel|tensor_copy|set_|fill_|zero_|"
-                                 r"cudaMemset|to_copy|_to_copy", re.I)),
+                                 r"cudaMemset|to_copy|_to_copy|aten::copy_|aten::to", re.I)),
     # sync / idle（这些通常 self_device_time=0，是 CPU 侧）
     (SYNC_IDLE, re.compile(r"cudaDeviceSynchronize|cudaStreamSynchronize|cudaEvent|"
                            r"StreamSync|EventSync|cudaStreamWait", re.I)),

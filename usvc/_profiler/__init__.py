@@ -42,7 +42,7 @@ class USVCProfiler:
     def __init__(self, name: str, out_dir: Path, *,
                  warmup: int = 3, iters: int = 10,
                  peak: Optional[PeakData] = None,
-                 sample_interval_s: float = 0.005,
+                 sample_interval_s: float = 0.002,
                  allow_tf32: bool = True):
         """allow_tf32: profile 期间是否开 TF32（默认 True，与 docs/bench_peak.py 记录峰值时一致）。
         peak json 的 gemm_FP32_tflops 实测值是在 TF32=on 下测得的，故 fp32 的 roofline

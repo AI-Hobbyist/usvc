@@ -58,19 +58,31 @@ def build_breakdown(kernel_events: Iterable, *, cpu_sync_us: float = 0.0) -> Bre
     for cat in CATEGORIES:
         rep.category_us[cat] = 0.0
 
+    # 设备类型常量（避免硬依赖 torch import）
+    try:
+        from torch.profiler import DeviceType
+        CUDA_DEV = DeviceType.CUDA
+    except Exception:
+        CUDA_DEV = 2  # DeviceType.CUDA == 2
+
     for ev in kernel_events:
         key = ev.key
-        # 只看 CUDA device 事件（device_time_total > 0 的是 GPU kernel）
+        dev_type = getattr(ev, "device_type", None)
+        # 只统计 CUDA 设备侧事件（避免 aten:: CPU 包装事件重复计入 device 时间）。
+        # aten::_softmax(CPU) 与 softmax_warp(CUDA) 都报 self_device_time，会重复。
+        if dev_type is not None and dev_type != CUDA_DEV:
+            # CPU 侧 aten 事件：只累计它的 CPU 时间（用于 §0.c 的 sync/idle 判据参考）
+            cpu_us = getattr(ev, "self_cpu_time_total", 0) or 0
+            rep.total_cpu_us += cpu_us / 1e3
+            continue
         dev_us = getattr(ev, "self_device_time_total", 0) or 0
-        dev_us = dev_us / 1e3  # ns -> μs
-        cpu_us = getattr(ev, "self_cpu_time_total", 0) or 0
-        if dev_us <= 0 and cpu_us <= 0:
+        dev_us = dev_us  # torch.profiler self_device_time_total 已是 μs，不要再除
+        if dev_us <= 0:
             continue
 
         category = classify_kernel(key)
         rep.category_us[category] = rep.category_us.get(category, 0.0) + dev_us
         rep.total_gpu_us += dev_us
-        rep.total_cpu_us += cpu_us
         rep.kernels.append(KernelStat(
             name=key, category=category, total_us=dev_us, count=ev.count
         ))

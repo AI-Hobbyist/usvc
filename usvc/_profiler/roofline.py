@@ -69,7 +69,7 @@ def collect_roofline_points(op_events, kernels_for_timing=None) -> list:
             pass
         flops = estimate_op_flops(key, shapes)
         bytes_ = estimate_op_bytes(key, shapes, dtypes)
-        dur_us = (getattr(ev, "self_device_time_total", 0) or 0) / 1e3  # ns->μs
+        dur_us = (getattr(ev, "self_device_time_total", 0) or 0)  # torch.profiler 已是 μs
         if flops is None or bytes_ is None or dur_us <= 0:
             continue
         pts.append(RooflinePoint(
