@@ -92,6 +92,31 @@ usvc-train --config configs/sovits.yaml \
     --exp-dir experiments/sovits
 ```
 
+## Performance (A10G)
+
+usvc is aggressively optimized for A10G with Triton kernels, `torch.compile`, and
+CUDA-graph inference. Timings (pure 1000 steps / real audio):
+
+| Stage | Baseline | Optimized | Speedup |
+|-------|----------|-----------|---------|
+| **Preprocess** contentvec (units) | 1077 ms | 323 ms | **3.33×** |
+| **Train** ddsp6 (conv) | ~3.8 min/1k | 1.25 min/1k | 1.10× |
+| **Train** diffusion (conv) | ~4.2 min/1k | 1.15 min/1k | 1.38× |
+| **Train** reflow_shallow (conv) | ~3.1 min/1k | 0.42 min/1k | 1.27× |
+| **Train** sovits / rvc (GAN) | — | compute-bound | at roofline |
+| **Infer** rvc (10s clip) | — | 134 ms | RTF 0.013 (75× rt) |
+
+Key optimizations (opt-in, semantics-preserving, bit-exact equivalence guarded):
+
+- **contentvec flash-attention** (Triton): 3.1× on the dominant preprocessing step.
+- **`torch.compile`** on conv velocity/denoise networks (`compile_velocity` /
+  `compile_denoise` backend opts): 1.10–1.38× on conv backends.
+- **`--compile-graph`** inference flag (CUDA-graph via `reduce-overhead`): 1.16× on rvc.
+
+GAN backends (sovits/rvc) are compute-bound at ~95% SM occupancy (NSF-HiFiGAN conv
+dominates) — `torch.compile` is ineffective there due to random-slice conflicts, so
+they ship at the measured roofline.
+
 ## Backend comparison
 
 | Backend | Domain | Sample rate | Hop | Units encoder | F0 default | Shallow diffusion |

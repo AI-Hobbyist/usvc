@@ -89,6 +89,30 @@ usvc-train --config configs/sovits.yaml \
     --exp-dir experiments/sovits
 ```
 
+## 性能 (A10G)
+
+usvc 针对 A10G 做了极致优化：Triton kernel + `torch.compile` + CUDA-graph 推理。
+纯 1000 步 / 真实音频计时：
+
+| 阶段 | 基线 | 优化后 | 加速 |
+|------|------|--------|------|
+| **预处理** contentvec (units) | 1077 ms | 323 ms | **3.33×** |
+| **训练** ddsp6 (conv) | ~3.8 min/1k | 1.25 min/1k | 1.10× |
+| **训练** diffusion (conv) | ~4.2 min/1k | 1.15 min/1k | 1.38× |
+| **训练** reflow_shallow (conv) | ~3.1 min/1k | 0.42 min/1k | 1.27× |
+| **训练** sovits / rvc (GAN) | — | 计算到顶 | 在 roofline |
+| **推理** rvc (10s 片段) | — | 134 ms | RTF 0.013 (75×实时) |
+
+关键优化（可选项，不改训练语义，bit 级等价守卫）：
+
+- **contentvec flash-attention**（Triton）：预处理主项 3.1× 加速。
+- **`torch.compile`** 编译 conv velocity/denoise 网络（`compile_velocity` /
+  `compile_denoise` backend_opts）：conv 后端 1.10–1.38×。
+- **`--compile-graph`** 推理开关（`reduce-overhead` 走 CUDA graph）：rvc 1.16×。
+
+GAN 后端（sovits/rvc）计算到顶（SM ~95%，NSF-HiFiGAN conv 主导）——
+`torch.compile` 因随机切片冲突无效，已在实测 roofline。
+
 ## 后端对比
 
 | 后端 | 域 | 采样率 | Hop | 内容编码器 | 默认 F0 | 浅扩散 |
