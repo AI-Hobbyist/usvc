@@ -423,6 +423,7 @@ class InferenceEngine:
         skip_cfg_strength: float | None = None,
         target_loudness: float | None = None,
         restore_loudness: bool = True,
+        vocal_register_shift: float = 0.0,
     ) -> np.ndarray:
         """Convert a wav file; returns float32 wav at the backend sample rate.
 
@@ -452,6 +453,10 @@ class InferenceEngine:
         restore_loudness: after conversion, restore the output loudness to the
             input's original integrated loudness (only when target_loudness
             is set and the input loudness was measurable).
+        vocal_register_shift: pc vocal register shift in semitones (mel-domain
+            backends only: ddsp6/diffusion/reflow_vae/rift_dit with a pc-aug
+            vocoder). The model sees f0/(2^(shift/12)) while the vocoder sees
+            the original f0: pitch stays, register shifts. 0.0 = off.
         """
         if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError(
@@ -519,6 +524,7 @@ class InferenceEngine:
                 ds_cfg_strength=ds_cfg_strength,
                 spk_cfg_strength=spk_cfg_strength,
                 skip_cfg_strength=skip_cfg_strength,
+                vocal_register_shift=vocal_register_shift,
             ).astype(np.float32)
         else:
             # Silence-aware segmentation: split at silence boundaries.
@@ -545,6 +551,7 @@ class InferenceEngine:
                     ds_cfg_strength=ds_cfg_strength,
                     spk_cfg_strength=spk_cfg_strength,
                     skip_cfg_strength=skip_cfg_strength,
+                    vocal_register_shift=vocal_register_shift,
                 )
                 chunk_outputs.append(wav_chunk)
 
@@ -680,14 +687,27 @@ class InferenceEngine:
         ds_cfg_strength: float | None = None,
         spk_cfg_strength: float | None = None,
         skip_cfg_strength: float | None = None,
+        vocal_register_shift: float = 0.0,
     ) -> np.ndarray:
         """Run the backend model on one contiguous feature segment."""
         T = units.shape[0]
         spk_id = torch.zeros(1, dtype=torch.long, device=self.device) + spk
         frame_len = torch.tensor([T], device=self.device, dtype=torch.long)
+
+        # pc vocal register shift: the model sees a shifted f0 (so it renders
+        # a different register) while the vocoder sees the original f0 (so the
+        # pitch stays the same). Only meaningful for mel-domain backends whose
+        # mel is decoded by the (pc-aug) NSF-HiFiGAN vocoder; rvc/sovits are
+        # wav-domain (no separate vocoder step) and ignore this.
+        f0_for_model = f0
+        if vocal_register_shift != 0.0 and self.backend_name in (
+            "ddsp6", "diffusion", "reflow_vae", "rift_dit"
+        ):
+            f0_for_model = f0 / (2.0 ** (vocal_register_shift / 12.0))
+
         batch = SVCBatch(
             units=units.unsqueeze(0),          # [1, T, D]
-            f0=f0.unsqueeze(0),                # [1, T]
+            f0=f0_for_model.unsqueeze(0),      # [1, T] (shifted for register shift)
             mel=torch.zeros(1, T, self.n_mels, device=self.device, dtype=units.dtype),
             wav=torch.zeros(1, 1, T * self.hop, device=self.device, dtype=units.dtype),
             rms=rms.unsqueeze(0) if rms is not None else None,

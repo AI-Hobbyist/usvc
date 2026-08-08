@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--formant-shift", type=float, default=0.0,
                    help="formant shift in semitones (ddsp6/diffusion/reflow_vae with "
                         "use_pitch_aug; 0=off)")
+    p.add_argument("--vocal-register-shift", type=float, default=0.0,
+                   help="pc vocal register shift in semitones (mel-domain backends only: "
+                        "ddsp6/diffusion/reflow_vae/rift_dit + pc-aug vocoder). Model sees "
+                        "shifted f0, vocoder sees original: pitch stays, register shifts. "
+                        "Positive = higher register. 0=off")
     p.add_argument("--f0-method", default=None, choices=["rmvpe", "fcpe"],
                    help="f0 extractor for inference: rmvpe | fcpe "
                         "(default: config's f0_extractor)")
@@ -133,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_cfg_strength=args.skip_cfg_strength,
         target_loudness=args.target_loudness,
         restore_loudness=not args.no_restore_loudness,
+        vocal_register_shift=args.vocal_register_shift,
     )
     print(f"[usvc-infer] {args.input} -> {output} "
           f"(backend={engine.backend_name}, sr={engine.sr}, half={args.half})")
