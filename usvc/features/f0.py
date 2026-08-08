@@ -43,13 +43,26 @@ def _get_rmvpe(ckpt: str, device: str, dtype: torch.dtype = torch.float32) -> RM
     return m
 
 
-def _get_fcpe(device: str, dtype: torch.dtype = torch.float32):
-    # FCPE uses the bundled weight shipped under usvc/features/fcpe/assets/.
-    key = ("bundled", device, str(dtype))
+def _get_fcpe(
+    device: str,
+    dtype: torch.dtype = torch.float32,
+    ckpt: str | None = None,
+):
+    # FCPE weight: explicit ckpt path, else bundled default.
+    key = (ckpt or "bundled", device, str(dtype))
     if key not in _FCPE_CACHE:
-        from .fcpe.models_infer import spawn_bundled_infer_model
+        if ckpt:
+            from .fcpe.models_infer import spawn_infer_model_from_pt
 
-        _FCPE_CACHE[key] = spawn_bundled_infer_model(device=device, dtype=dtype)
+            _FCPE_CACHE[key] = spawn_infer_model_from_pt(
+                ckpt, device=device, dtype=dtype
+            )
+        else:
+            from .fcpe.models_infer import spawn_bundled_infer_model
+
+            _FCPE_CACHE[key] = spawn_bundled_infer_model(
+                device=device, dtype=dtype
+            )
     m = _FCPE_CACHE[key]
     # Move cached model to requested device.
     try:
@@ -86,9 +99,14 @@ class F0Extractor:
 
         if self.extractor == "rmvpe":
             ckpt = fc.params.get("model_ckpt", "pretrained/rmvpe/model.pt")
+            from ..hub import ensure_pretrained
+            ckpt = ensure_pretrained(ckpt)
             self.rmvpe = _get_rmvpe(ckpt, device, self.dtype)
         else:  # fcpe — keep FP32 (its mel sanity-check rejects fp16 inputs)
-            self.fcpe = _get_fcpe(device, torch.float32)
+            ckpt = fc.params.get("model_ckpt", "pretrained/fcpe/fcpe.pt")
+            from ..hub import ensure_pretrained
+            ckpt = ensure_pretrained(ckpt)
+            self.fcpe = _get_fcpe(device, torch.float32, ckpt=ckpt)
 
     @torch.inference_mode()
     def extract(self, wav: np.ndarray | torch.Tensor) -> torch.Tensor:

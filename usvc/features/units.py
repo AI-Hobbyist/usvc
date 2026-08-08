@@ -39,6 +39,9 @@ class UnitsExtractor:
         self.hop_native: int = int(p.get("hop_native", 320))
         self.align_mode: str = p.get("align_mode", "gather")
         self.ckpt: str = p["model_ckpt"]
+        # Auto-download if missing
+        from ..hub import ensure_pretrained
+        self.ckpt = ensure_pretrained(self.ckpt)
         self.model = self._load_model()
 
     def _load_model(self) -> torch.nn.Module:

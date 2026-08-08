@@ -187,6 +187,12 @@ def run_training(cfg: TrainConfig, resume: str | None = None, device: str | None
         # generator file we also try to load the sibling discriminator file.
         pretrained_paths = [Path(cfg.pretrained)]
         p = Path(cfg.pretrained)
+        # Auto-download base model if missing
+        if not p.exists():
+            from ..hub import ensure_pretrained
+            downloaded = ensure_pretrained(cfg.pretrained)
+            p = Path(downloaded)
+            pretrained_paths = [p]
         if p.name == "G_0.pth":
             d0 = p.with_name("D_0.pth")
             if d0.exists():

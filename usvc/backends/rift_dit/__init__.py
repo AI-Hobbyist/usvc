@@ -31,7 +31,6 @@ def _default_spec() -> FeatureSpec:
             {
                 "extractor": "fcpe",
                 "uv_policy": "raw",
-                "model_ckpt": "pretrained/rmvpe/model.pt",
             },
         ),
         rms=FeatureConfig("rms", {"win_length": 2048}),

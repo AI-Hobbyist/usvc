@@ -246,7 +246,8 @@ class InferenceEngine:
         self.vocoder = None
         if self.backend_name in MEL_DOMAIN:
             if vocoder_dir is None:
-                vocoder_dir = Path(__file__).resolve().parents[2] / "pretrained" / "nsf_hifigan"
+                from ..hub import ensure_dir
+                vocoder_dir = ensure_dir("nsf_hifigan")
             vocoder_dir = Path(vocoder_dir)
             self.vocoder = NSFHiFiGAN(
                 vocoder_dir / "config.json",

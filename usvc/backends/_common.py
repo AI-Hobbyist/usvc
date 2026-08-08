@@ -24,6 +24,11 @@ def resolve_f0_config(
         "uv_policy": train_cfg.get("uv_policy", default_uv_policy),
     }
     if extractor == "rmvpe":
-        # RMVPE needs an external weight; FCPE ships its weight bundled.
-        params["model_ckpt"] = train_cfg.get("rmvpe_ckpt", "pretrained/rmvpe/model.pt")
+        params["model_ckpt"] = train_cfg.get(
+            "rmvpe_ckpt", "pretrained/rmvpe/model.pt"
+        )
+    else:  # fcpe
+        params["model_ckpt"] = train_cfg.get(
+            "fcpe_ckpt", "pretrained/fcpe/fcpe.pt"
+        )
     return FeatureConfig("f0", params)
