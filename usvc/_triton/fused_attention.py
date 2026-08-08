@@ -116,8 +116,8 @@ def fused_attention(q, k, v, scale):
     B, H, T, D = q.shape
     out = torch.empty_like(q)
 
-    # block sizes
-    BLOCK_M = 128 if T >= 128 else 64
+    # block sizes (criterion d 实测最优：M=256 N=64 比 M=128 快 ~10%%，改参无效)
+    BLOCK_M = 256 if T >= 256 else 64
     BLOCK_N = 64
     BLOCK_D = triton.next_power_of_2(D)
     is_even_m = (T % BLOCK_M) == 0

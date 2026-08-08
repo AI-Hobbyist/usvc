@@ -29,3 +29,7 @@ def test_fused_attention_matches_pytorch(T):
     # 主要约束绝对误差：atol=1e-3（实测 max abs diff < 3e-3 在 T=11184 时）。
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=1e-3)
     assert (out - ref).abs().max() < 5e-3, f"max abs diff {(out-ref).abs().max()}"
+
+
+# 注：fused_norm（residual+layernorm fusion）实测无收益（LN 仅 3.4ms，融合后精度噪声增加），
+# 已回退不启用。保留 fused_norm.py 供未来需要时参考。
