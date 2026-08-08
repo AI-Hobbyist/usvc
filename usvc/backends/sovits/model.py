@@ -427,6 +427,13 @@ class ResidualCouplingBlock(nn.Module):
             )
             self.flows.append(Flip())
 
+    def remove_weight_norm(self):
+        for flow in self.flows:
+            if hasattr(flow, "remove_weight_norm"):
+                flow.remove_weight_norm()
+        if self.wn is not None:
+            self.wn.remove_weight_norm()
+
     def forward(self, x, x_mask, g=None, reverse=False):
         if not reverse:
             for flow in self.flows:

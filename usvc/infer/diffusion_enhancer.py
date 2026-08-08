@@ -230,6 +230,7 @@ class DiffusionEnhancer:
             method=method,
         )  # [1, T, M] denormalized dB
 
-        # 4) 去噪 mel + f0 → 声码器合成
-        wav = self.vocoder.infer(denoised.float(), f0_b)
+        # 4) 去噪 mel + f0 → 声码器合成 (autocast fp16: conv 跑 tensor core)
+        with torch.autocast("cuda", dtype=torch.float16):
+            wav = self.vocoder.infer(denoised.float(), f0_b)
         return wav[0, 0].float().cpu().numpy()

@@ -67,7 +67,7 @@ class UnitsExtractor:
         _HUBERT_CACHE[key] = m
         return m.to(device=self.device, dtype=self.dtype)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def extract(self, wav16k: torch.Tensor) -> torch.Tensor:
         """wav16k: 1d float tensor at 16kHz. Returns [T_out, dim].
 
@@ -86,7 +86,18 @@ class UnitsExtractor:
             units = self.model.units(wav16k)  # [1, T_native, 256]
         else:
             # ContentVec family: pure-torch impl takes [B,1,T], handles padding internally.
-            hidden = self.model.encode(wav16k, layer=self.layer if self.layer else None)  # [1, T, 768]
+            if self.tta_2x:
+                # TTA 2x (RIFT-style): batch the original + 160-sample-shifted
+                # clip into a single encode() call (saves one forward launch).
+                shifted = torch.roll(wav16k, shifts=-160, dims=-1)
+                shifted[:, -160:] = 0
+                batch_in = torch.cat([wav16k, shifted], dim=0)  # [2, 1, T]
+                hidden_both = self.model.encode(
+                    batch_in, layer=self.layer if self.layer else None)
+                hidden, hidden2 = hidden_both[0:1], hidden_both[1:2]
+            else:
+                hidden = self.model.encode(
+                    wav16k, layer=self.layer if self.layer else None)
             if self.use_proj:
                 # RVC's 3_feature256/768: ContentVec final_proj (768 -> 256).
                 units = self.model.final_proj(hidden)  # [1, T, 256]
@@ -94,12 +105,9 @@ class UnitsExtractor:
                 units = hidden  # [1, T_native, 768]
 
             if self.tta_2x:
-                # TTA 2x (RIFT-style): shift by 160 samples (half native hop), zeroing
-                # the wrapped tail so length is preserved -> both forwards match.
-                shifted = torch.roll(wav16k, shifts=-160, dims=-1)
-                shifted[:, -160:] = 0
-                hidden2 = self.model.encode(shifted, layer=self.layer if self.layer else None)
                 n, d = units.shape[1], units.shape[2]
+                if self.use_proj:
+                    hidden2 = self.model.final_proj(hidden2)
                 units = torch.stack([units, hidden2], dim=2).view(1, n * 2, d)
 
         units = units.squeeze(0)  # [T_native, dim]

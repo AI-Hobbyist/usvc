@@ -387,8 +387,9 @@ class ReflowEnhancer:
                     t_start=t_start, infer_step=infer_step, method=method,
                 )  # [1, T, M] denormalized (dB domain)
 
-            # 5) PC vocoder resynthesis
+            # 5) PC vocoder resynthesis (autocast fp16: conv 跑 tensor core)
             f0_for_voc = f0_b.squeeze(-1)  # [1, T]
-            wav = self.vocoder.infer(denoised.float(), f0_for_voc)
+            with torch.autocast("cuda", dtype=torch.float16):
+                wav = self.vocoder.infer(denoised.float(), f0_for_voc)
 
         return wav[0, 0].float().cpu().numpy()
