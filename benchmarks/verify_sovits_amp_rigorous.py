@@ -4,14 +4,16 @@ The earlier 19% divergence was dominated by posterior sampling noise (z is rando
 This script fixes the noise via torch.manual_seed to isolate the true bf16 error,
 then compares multi-step training loss trajectories with matched noise.
 """
+import sys
+from pathlib import Path
+
 import torch
 import warnings
 warnings.filterwarnings("ignore")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import sys
-sys.path.insert(0, "/root/usvc")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from usvc.backends.sovits.model import SoVITSModel
 from usvc.backends.rvc.model import RVCModel
 from usvc.train.losses import kl_loss

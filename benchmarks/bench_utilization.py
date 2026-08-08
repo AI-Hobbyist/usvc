@@ -8,9 +8,11 @@ config is compute-bound or IO/bottleneck-bound).
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
@@ -18,11 +20,20 @@ from pathlib import Path
 import numpy as np
 import psutil
 
-REPO = Path("/root/usvc")
-WAVTEST = Path("/root/wavtest")
-BENCH = Path("/tmp/usvc_util")
+REPO = Path(__file__).resolve().parents[1]
+WAVTEST = Path(os.environ.get("USVC_WAVTEST_DIR") or (REPO / "data" / "wavtest"))
+BENCH = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_util"))
 N = 60  # files per config (enough to sample for ~10-30s)
 SAMPLE_HZ = 20  # sampling rate (every 50ms)
+
+sys.path.insert(0, str(REPO))
+from usvc.hub import pretrained_dir  # noqa: E402
+
+PRETRAINED = {
+    "rmvpe": str(pretrained_dir() / "rmvpe" / "model.pt"),
+    "hsoft": str(pretrained_dir() / "hubert" / "hubert-soft-0d54a1f4.pt"),
+    "cvec": str(pretrained_dir() / "contentvec" / "pytorch_model.bin"),
+}
 
 
 def _gpu_util() -> tuple[float, float]:
@@ -153,11 +164,11 @@ CONFIGS = {
     "mel": ("mel", {"n_fft": 2048, "win_length": 2048, "n_mels": 128, "fmin": 40.0, "fmax": 16000.0, "center": False}),
     "rms": ("rms", {"win_length": 2048}),
     "spec": ("spec", {"n_fft": 2048, "win_length": 2048, "center": False}),
-    "f0_rmvpe": ("f0", {"extractor": "rmvpe", "uv_policy": "raw", "model_ckpt": "pretrained/rmvpe/model.pt"}),
+    "f0_rmvpe": ("f0", {"extractor": "rmvpe", "uv_policy": "raw", "model_ckpt": PRETRAINED["rmvpe"]}),
     "f0_fcpe": ("f0", {"extractor": "fcpe", "uv_policy": "raw"}),
-    "units_hsoft": ("units", {"kind": "hubertsoft", "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": "pretrained/hubert/hubert-soft-0d54a1f4.pt"}),
-    "units_cvec": ("units", {"kind": "contentvec", "layer": 12, "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": "pretrained/contentvec/pytorch_model.bin"}),
-    "units_cvec_tta2x": ("units", {"kind": "contentvec_tta2x", "layer": 12, "tta_2x": True, "sr_in": 16000, "hop_native": 160, "align_mode": "gather", "model_ckpt": "pretrained/contentvec/pytorch_model.bin"}),
+    "units_hsoft": ("units", {"kind": "hubertsoft", "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": PRETRAINED["hsoft"]}),
+    "units_cvec": ("units", {"kind": "contentvec", "layer": 12, "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": PRETRAINED["cvec"]}),
+    "units_cvec_tta2x": ("units", {"kind": "contentvec_tta2x", "layer": 12, "tta_2x": True, "sr_in": 16000, "hop_native": 160, "align_mode": "gather", "model_ckpt": PRETRAINED["cvec"]}),
 }
 
 

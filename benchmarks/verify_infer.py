@@ -7,7 +7,9 @@ wav-domain (no external vocoder); mel-domain use the shared NSF-HiFiGAN.
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+OUT_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_infer"))
 
 from usvc.infer.engine import InferenceEngine  # noqa: E402
 from usvc.infer.features import synth_test_wav  # noqa: E402
@@ -76,7 +80,8 @@ def make_ckpt(backend: str, opts: dict, gan: bool, path: Path):
 
 
 def main():
-    wav_in = Path("/tmp/usvc_infer_test.wav")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    wav_in = OUT_DIR / "test.wav"
     synth_test_wav(wav_in, sr=44100, duration=2.0, f0_base=200.0)
     print(f"test wav: {wav_in} ({wav_in.stat().st_size} bytes)")
 
@@ -84,14 +89,14 @@ def main():
     for backend, spec in CONFIGS.items():
         print(f"\n=== {backend} ===")
         try:
-            ckpt = Path(f"/tmp/usvc_infer_{backend}.ckpt")
+            ckpt = OUT_DIR / f"{backend}.ckpt"
             make_ckpt(backend, spec["backend_opts"], spec["gan"], ckpt)
-            cfg_path = Path(f"/tmp/usvc_infer_{backend}.yaml")
+            cfg_path = OUT_DIR / f"{backend}.yaml"
             opts_lines = "\n".join(
                 f"  {k}: {v}" for k, v in spec["backend_opts"].items()
             )
             cfg_path.write_text(
-                f"backend: {backend}\ndataset_dir: /tmp\nexp_dir: /tmp/exp\n"
+                f"backend: {backend}\ndataset_dir: {OUT_DIR}\nexp_dir: {OUT_DIR}\n"
                 f"backend_opts:\n{opts_lines}\n"
             )
             sr = 48000 if backend == "rvc" else 44100
@@ -105,7 +110,7 @@ def main():
             dur_out = out.shape[0] / sr
             ratio = dur_out / dur_in
             ok_len = 0.6 < ratio < 1.6
-            out_path = Path(f"/tmp/usvc_infer_out_{backend}.wav")
+            out_path = OUT_DIR / f"out_{backend}.wav"
             engine.convert_file(str(wav_in), str(out_path), spk=0, trans=0)
             print(f"  ✓ {backend}: {out.shape[0]} samples ({dur_out:.2f}s), "
                   f"len_ratio={ratio:.2f}, max={np.abs(out).max():.3f}")

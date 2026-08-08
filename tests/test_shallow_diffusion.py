@@ -218,7 +218,7 @@ def _sovits_module_ckpt(path: Path) -> None:
 
 def _sovits_cfg(path: Path) -> None:
     lines = [
-        "backend: sovits", "dataset_dir: /tmp", "exp_dir: /tmp/exp",
+        "backend: sovits", f"dataset_dir: {path.parent}", f"exp_dir: {path.parent}",
         "backend_opts:",
         "  n_units: 768", "  spec_channels: 1025", "  num_speaker: 1",
         "  gin_channels: 64", "  segment_size: 8", "  inter_channels: 32",
@@ -263,7 +263,8 @@ class TestEngineShallowDiffusion:
         torch.save({"state_dict": module.state_dict()}, ckpt)
         cfgp = tmp_path / "diffusion.yaml"
         cfgp.write_text(
-            "backend: diffusion\ndataset_dir: /tmp\nexp_dir: /tmp/exp\nbackend_opts:\n"
+            "backend: diffusion\n"
+            f"dataset_dir: {cfgp.parent}\nexp_dir: {cfgp.parent}\nbackend_opts:\n"
             "  n_units: 64\n  num_speakers: 1\n  out_dims: 128\n"
             "  cn_layers: 2\n  cn_chans: 32\n  n_hidden: 32\n"
         )

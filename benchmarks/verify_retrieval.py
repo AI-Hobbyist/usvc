@@ -9,12 +9,16 @@ has zero dependency on them.
 """
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/root/usvc")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+SOVITS_DIR = os.environ.get("USVC_SOVITS_DIR")
 
 
 def verify_retrieval_vs_faiss():
@@ -56,8 +60,19 @@ def verify_cluster_vs_sklearn():
     import importlib.util
     import sys as _sys
 
-    _sys.path.insert(0, "/root/so-vits-svc/cluster")
-    spec = importlib.util.spec_from_file_location("orig_kmeans", "/root/so-vits-svc/cluster/kmeans.py")
+    if not SOVITS_DIR:
+        print(
+            "[verify_retrieval] USVC_SOVITS_DIR not set (original so-vits-svc "
+            "source needed for the KMeansGPU parity check). "
+            "Export it, e.g. USVC_SOVITS_DIR=/path/to/so-vits-svc"
+        )
+        sys.exit(1)
+    sovits_kmeans = Path(SOVITS_DIR) / "cluster" / "kmeans.py"
+    if not sovits_kmeans.exists():
+        print(f"[verify_retrieval] {sovits_kmeans} not found (USVC_SOVITS_DIR={SOVITS_DIR})")
+        sys.exit(1)
+    _sys.path.insert(0, str(Path(SOVITS_DIR) / "cluster"))
+    spec = importlib.util.spec_from_file_location("orig_kmeans", str(sovits_kmeans))
     orig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(orig)
 

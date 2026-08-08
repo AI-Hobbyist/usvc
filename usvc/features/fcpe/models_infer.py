@@ -295,35 +295,6 @@ def spawn_bundled_infer_model(
     return model
 
 
-def spawn_infer_model_from_onnx(
-    onnx_path: str, device: str = None
-) -> InferCFNaiveMelPEONNX:
-    """
-    Spawn infer model from onnx file
-    Args:
-        onnx_path (str): Path to onnx file.
-        device (str): Device. Default: None.
-    """
-    device = get_device(device, "torchfcpe.tools.spawn_infer_cf_naive_mel_pe_from_onnx")
-    config_path = get_config_json_in_same_path(onnx_path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_dict = json.load(f)
-        args = DotDict(config_dict)
-    if (args.is_onnx is None) or (args.is_onnx is False):
-        raise ValueError(
-            "  [ERROR] spawn_infer_model_from_onnx: this model is not onnx model."
-        )
-
-    if args.model.type == "CFNaiveMelPEONNX":
-        infer_model = InferCFNaiveMelPEONNX(args, onnx_path, device)
-    else:
-        raise ValueError(
-            f"  [ERROR] args.model.type is {args.model.type}, but only support CFNaiveMelPEONNX"
-        )
-
-    return infer_model
-
-
 def spawn_infer_model_from_pt(
     pt_path: str, device: str = None, bundled_model: bool = False, dtype: torch.dtype = None
 ) -> InferCFNaiveMelPE:
@@ -437,29 +408,3 @@ def spawn_model(args: DotDict) -> CFNaiveMelPE:
             f"  [ERROR] args.model.type is {args.model.type}, but only support CFNaiveMelPE"
         )
     return pe_model
-
-
-def bundled_infer_model_unit_test(wav_path):
-    """Unit test for bundled infer model"""
-    # wav_path is your wav file path
-    try:
-        import librosa
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print(
-            "  [UNIT_TEST] torchfcpe.tools.spawn_infer_model_from_pt: matplotlib or librosa not found, skip test"
-        )
-        exit(1)
-
-    infer_model = spawn_bundled_infer_model(device="cpu")
-    wav, sr = librosa.load(wav_path, sr=16000)
-    f0 = infer_model.infer(torch.tensor(wav).unsqueeze(0), sr, interp_uv=False)
-    f0_interp = infer_model.infer(torch.tensor(wav).unsqueeze(0), sr, interp_uv=True)
-    plt.plot(f0.squeeze(-1).squeeze(0).numpy(), color="r", linestyle="-")
-    plt.plot(f0_interp.squeeze(-1).squeeze(0).numpy(), color="g", linestyle="-")
-    # 添加图例
-    plt.legend(["f0", "f0_interp"])
-    plt.xlabel("frame")
-    plt.ylabel("f0")
-    plt.title("f0")
-    plt.show()

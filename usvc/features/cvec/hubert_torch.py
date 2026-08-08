@@ -205,18 +205,3 @@ def _compute_mask(
     mask = mask.scatter(1, mask_idxs, True)
 
     return mask
-
-
-def hubert_soft(
-        path: str,
-) -> HubertSoft:
-    r"""HuBERT-Soft from `"A Comparison of Discrete and Soft Speech Units for Improved Voice Conversion"`.
-    Args:
-        path (str): path of a pretrained model
-    """
-    hubert = HubertSoft()
-    checkpoint = torch.load(path)
-    consume_prefix_in_state_dict_if_present(checkpoint, "module.")
-    hubert.load_state_dict(checkpoint)
-    hubert.eval()
-    return hubert

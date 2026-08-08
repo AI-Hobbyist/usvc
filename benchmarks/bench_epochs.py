@@ -1,7 +1,7 @@
 """Per-backend training throughput benchmark with real 10-epoch runs.
 
 For rift_dit / ddsp6 / diffusion: runs full 10 epochs on real preprocessed
-features from /tmp/u_opt (155.6 min audio, 1540 clips).
+features from the staged feature dir (default: <repo>/data/u_opt).
 For sovits / rvc: synthetic data, fixed step count (no real spec features).
 
 Reports: ms/step, min/epoch, std (stability), GPU power/utilization.
@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 import torch
 
-FEAT_DIR = Path("/tmp/u_opt")
+REPO = Path(__file__).resolve().parents[1]
+FEAT_DIR = Path(os.environ.get("USVC_FEAT_DIR") or (REPO / "data" / "u_opt"))
+OUT_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_validate"))
 
 # Per-backend epoch counts
 EPOCHS = {"rift_dit": 10, "ddsp6": 10, "diffusion": 10, "sovits": 2, "rvc": 2, "reflow_vae": 10}
@@ -36,7 +40,7 @@ def gpu_power():
 
 
 def load_real_dataset(n_max=200):
-    """Load real mel/units/f0/rms from /tmp/u_opt. Returns list of dicts."""
+    """Load real mel/units/f0/rms from FEAT_DIR. Returns list of dicts."""
     import json as _json
     meta = _json.load(open(FEAT_DIR / "meta.json"))
     mel_hash = list((FEAT_DIR / "mel").iterdir())[0].name
@@ -343,7 +347,7 @@ def main():
     ap.add_argument("--amp", action="store_true", default=None)
     ap.add_argument("--tf32", action="store_true", default=True)
     ap.add_argument("--batch", type=int, default=None)
-    ap.add_argument("--out", default="/tmp/usvc_validate/throughput_epochs.json")
+    ap.add_argument("--out", default=str(OUT_DIR / "throughput_epochs.json"))
     args = ap.parse_args()
 
     if args.tf32:

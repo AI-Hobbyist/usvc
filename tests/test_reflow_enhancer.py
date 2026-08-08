@@ -6,23 +6,26 @@ Covers:
   - t_start semantics (0 ≈ full generation, →1 ≈ keep gt)
   - sample-rate bridge via the InferenceEngine helper functions
 
-These tests use the DDSP6 base models under ``/home/waas/pretrained`` if
-available; otherwise they are skipped (environment-dependent).
+These tests use the DDSP6 base models under the pretrained dir (USVC_PRETRAINED_DIR
+or <repo>/pretrained) if available; otherwise they are skipped (environment-dependent).
 """
 from __future__ import annotations
 
-import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-DDSP6_CKPT = "/home/waas/pretrained/base_models/ddsp6/6.3_6x512_6x768/model.pt"
-DDSP6_CFG = "/home/waas/pretrained/base_models/ddsp6/6.3_6x512_6x768/config.yaml"
-VOCODER_DIR = os.path.join(os.path.dirname(__file__), "..", "pretrained", "nsf_hifigan")
-VOCODER_DIR = os.path.abspath(VOCODER_DIR)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from usvc.hub import pretrained_dir  # noqa: E402
 
-_SKIP = not (os.path.isfile(DDSP6_CKPT) and os.path.isfile(os.path.join(VOCODER_DIR, "model.ckpt")))
+DDSP6_CKPT = pretrained_dir() / "base_models" / "ddsp6" / "6.3_6x512_6x768" / "model.pt"
+DDSP6_CFG = pretrained_dir() / "base_models" / "ddsp6" / "6.3_6x512_6x768" / "config.yaml"
+VOCODER_DIR = pretrained_dir() / "nsf_hifigan"
+
+_SKIP = not (DDSP6_CKPT.is_file() and (VOCODER_DIR / "model.ckpt").is_file())
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 env = pytest.mark.skipif(_SKIP, reason="DDSP6 base model / vocoder not present")

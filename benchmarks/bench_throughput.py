@@ -7,12 +7,16 @@ for a representative dataset (e.g. 1540 clips, ~6s each).
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 
 import torch
 
 torch.backends.cudnn.benchmark = True
+
+OUT_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_validate"))
 
 # Representative dataset: 1540 clips, avg 6.07s each (from preprocessing run)
 N_CLIPS = 1540
@@ -223,7 +227,8 @@ def main():
                 "min_per_epoch": round(epoch_min, 1),
             })
 
-    out = Path("/tmp/usvc_validate/throughput.json")
+    out = OUT_DIR / "throughput.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved to {out}")

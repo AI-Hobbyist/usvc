@@ -6,7 +6,9 @@ GAN: usvc-optimal(large batch) vs usvc-baseline(small batch) — batch change
      shouldn't alter per-sample loss, just throughput.
 """
 import json
+import os
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -14,9 +16,11 @@ import numpy as np
 import torch
 
 warnings.filterwarnings("ignore")
-sys.path.insert(0, "/root/usvc")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+OUT_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_validate"))
 
 
 def make_data(n=80, T=256, seed=777):
@@ -104,7 +108,8 @@ def main():
     fp = train_diff(False); amp = train_diff(True)
     results["diffusion_amp_vs_fp32"] = compare("diffusion", amp, fp, "AMP", "fp32")
 
-    out = Path("/tmp/usvc_validate/optimal_lossless_check.json")
+    out = OUT_DIR / "optimal_lossless_check.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved to {out}")

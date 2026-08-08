@@ -1,6 +1,7 @@
-"""Preprocessing speed benchmark on /root/wavtest (real game voice corpus).
+"""Preprocessing speed benchmark on a wavtest corpus (real game voice corpus).
 
-1540 files, 48kHz, ~2.6h total. Measures:
+The corpus dir defaults to <repo>/data/wavtest (set USVC_WAVTEST_DIR to
+override; a typical corpus is 1540 files, 48kHz, ~2.6h total). Measures:
 - per-feature latency (CPU vs GPU) on a representative clip
 - full engine throughput (files/s, realtime factor) on a 100-file subset
 - breakdown by feature kind
@@ -8,9 +9,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -29,9 +32,9 @@ from usvc.features.spec import SpecExtractor
 from usvc.features.units import UnitsExtractor
 from usvc.io.audio import frame_len_for, load_audio
 
-REPO = Path("/root/usvc")
-WAVTEST = Path("/root/wavtest")
-BENCH_DIR = Path("/tmp/usvc_bench")
+REPO = Path(__file__).resolve().parents[1]
+WAVTEST = Path(os.environ.get("USVC_WAVTEST_DIR") or (REPO / "data" / "wavtest"))
+BENCH_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_bench"))
 N_SUBSET = 100  # subset size for throughput test
 WARMUP = 3
 

@@ -12,13 +12,18 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import torch
 
-PROXY = "/etc/waas-script/proxy.sh"
-BASE = Path("/root/usvc/pretrained/base_models")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from usvc.hub import pretrained_dir  # noqa: E402
+
+PROXY = os.environ.get("USVC_PROXY_SCRIPT") or "/etc/waas-script/proxy.sh"
+BASE = pretrained_dir() / "base_models"
+OUT_DIR = Path(os.environ.get("USVC_BENCH_DIR") or (Path(tempfile.gettempdir()) / "usvc_validate"))
 
 # (output_subdir, filename, expected_mb)
 SVCFUSION_MODELS = [
@@ -187,8 +192,8 @@ def main():
     print(f"ok: {len(ok)}, skip: {len(results) - len(ok) - len(failed)}, failed: {len(failed)}")
     for r in failed:
         print(f"  FAILED: {r[0]} ({r[1]})")
-    print(f"\nresults saved to /tmp/download_results.json")
-    json.dump(results, open("/tmp/download_results.json", "w"), indent=1)
+    print(f"\nresults saved to {OUT_DIR / 'download_results.json'}")
+    json.dump(results, open(OUT_DIR / "download_results.json", "w"), indent=1)
 
 
 if __name__ == "__main__":

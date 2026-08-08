@@ -1,7 +1,9 @@
 """Inference tests: shared vocoder, sovits/rvc infer, engine end-to-end."""
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +18,10 @@ VOCODER_DIR = ROOT / "pretrained" / "nsf_hifigan"
 HAVE_VOCODER = (VOCODER_DIR / "config.json").exists() and (VOCODER_DIR / "model.ckpt").exists()
 
 # openvpi PC-NSF-HiFiGAN 2025.02 (mini_nsf=True) ckpt, optional in CI.
-PC_VOCODER_CKPT = Path("/tmp/vocoder_dl/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.ckpt")
+PC_VOCODER_CKPT = Path(
+    os.environ.get("USVC_PC_VOCODER_CKPT")
+    or (Path(tempfile.gettempdir()) / "vocoder_dl" / "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.ckpt")
+)
 HAVE_PC_VOCODER = PC_VOCODER_CKPT.exists()
 
 _PC_VOCODER_CONFIG = {
@@ -41,8 +46,8 @@ def _make_module_ckpt(backend: str, opts: dict, path: Path):
 
 
 def _write_cfg(backend: str, opts: dict, path: Path):
-    lines = [f"backend: {backend}", "dataset_dir: /tmp", "exp_dir: /tmp/exp",
-             "backend_opts:"]
+    lines = [f"backend: {backend}", f"dataset_dir: {path.parent}",
+             f"exp_dir: {path.parent}", "backend_opts:"]
     for k, v in opts.items():
         lines.append(f"  {k}: {v}")
     path.write_text("\n".join(lines) + "\n")
@@ -81,7 +86,10 @@ class TestVocoder:
             pytest.skip("legacy choihkk-format ckpt not present (PC ckpt deployed)")
         import sys as _sys
 
-        _sys.path.insert(0, "/root/DDSP-SVC-6.3")
+        ddsp_dir = os.environ.get("USVC_DDSP_DIR")
+        if not ddsp_dir:
+            pytest.skip("USVC_DDSP_DIR not set (DDSP-SVC-6.3 source)")
+        _sys.path.insert(0, ddsp_dir)
         from nsf_hifigan.models import load_model as ddsp_load
 
         from usvc.nn.vocoder import NSFHiFiGAN
@@ -139,7 +147,7 @@ class TestVocoder:
         """usvc Generator (mini_nsf) == openvpi SingingVocoders original."""
         import sys as _sys
 
-        _sys.path.insert(0, "/tmp")
+        _sys.path.insert(0, str(PC_VOCODER_CKPT.parent.parent))
         import pc_models
 
         from usvc.nn.vocoder import nsf_hifigan as uh
@@ -190,7 +198,10 @@ class TestSovitsRVCInfer:
         """usvc SoVITSModel.infer == so-vits NetGSvc.infer (bitwise)."""
         import sys as _sys
 
-        _sys.path.insert(0, "/root/so-vits-svc")
+        sovits_dir = os.environ.get("USVC_SOVITS_DIR")
+        if not sovits_dir:
+            pytest.skip("USVC_SOVITS_DIR not set (original so-vits-svc source)")
+        _sys.path.insert(0, sovits_dir)
         import models as so_models
 
         from usvc.backends.sovits.model import SoVITSModel
@@ -230,11 +241,14 @@ class TestSovitsRVCInfer:
 
     def test_rvc_infer_runs_and_matches(self):
         import os
-        if not os.path.isdir("/tmp/rvc_src"):
-            pytest.skip("/tmp/rvc_src (original RVC source) not present")
+        rvc_src = os.environ.get("USVC_RVC_SRC_DIR")
+        if not rvc_src:
+            pytest.skip("USVC_RVC_SRC_DIR not set (original RVC source)")
+        if not os.path.isdir(rvc_src):
+            pytest.skip(f"{rvc_src} (original RVC source) not present")
         import sys as _sys
 
-        _sys.path.insert(0, "/tmp/rvc_src")
+        _sys.path.insert(0, rvc_src)
         from infer.module.models import SynthesizerTrnMs768NSFsid as OrigRVC
 
         from usvc.backends.rvc.model import RVCModel

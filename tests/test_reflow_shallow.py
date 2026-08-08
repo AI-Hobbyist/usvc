@@ -5,9 +5,15 @@ v2: condition = units/f0/vol embeddings (mel-independent), so gt_spec
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from usvc.hub import pretrained_dir  # noqa: E402
 
 
 def test_model_forward_loss_has_gradient():
@@ -66,12 +72,9 @@ def test_condition_is_mel_independent():
     assert torch.isfinite(out).all()
 
 
-ddsp6 = "/home/waas/pretrained/base_models/ddsp6/6.3_6x512_6x768/model.pt"
-vocoder_dir = "pretrained/nsf_hifigan"
-_skip_env = not (
-    __import__("os").path.isfile(ddsp6)
-    and __import__("os").path.isfile(__import__("os").path.join(vocoder_dir, "model.ckpt"))
-)
+ddsp6 = pretrained_dir() / "base_models" / "ddsp6" / "6.3_6x512_6x768" / "model.pt"
+vocoder_dir = pretrained_dir() / "nsf_hifigan"
+_skip_env = not (ddsp6.is_file() and (vocoder_dir / "model.ckpt").is_file())
 
 
 @pytest.mark.skipif(_skip_env, reason="DDSP6 base / vocoder not present")
