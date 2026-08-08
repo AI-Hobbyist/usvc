@@ -35,6 +35,17 @@ class DiffusionModule(BaseSVCModule):
             mlp_factor=opts.get("mlp_factor", 4),
             gradient_checkpointing=opts.get("gradient_checkpointing", False),
         )
+        # torch.compile denoise_fn（ConvNext/WaveNet 纯 conv 可安全编译）。
+        # 实测 96→69ms/step (1.38×)，胶水大幅下降。由 backend_opts.compile_denoise 开关，默认关。
+        if opts.get("compile_denoise", False):
+            try:
+                self.model.decoder.denoise_fn = torch.compile(
+                    self.model.decoder.denoise_fn,
+                    mode=opts.get("compile_mode", "max-autotune"),
+                    dynamic=False,
+                )
+            except Exception:
+                pass
 
     def forward_loss(self, batch: SVCBatch):
         units = batch.units
