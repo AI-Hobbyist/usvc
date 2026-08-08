@@ -29,8 +29,8 @@ _KERNEL_PATTERNS = [
     # cuBLAS / cutlass GEMM (含 aten::mm/bmm/addmm/linear —— 它们最终走 cublas)
     (CUDNN_CUBLAS, re.compile(r"cutlass|cublas|gemm|sgemm|gemv|getrf|getri|trsm|"
                               r"aten::mm|aten::bmm|aten::addmm|aten::linear|aten::matmul", re.I)),
-    # cuDNN conv / winograd
-    (CUDNN_CUBLAS, re.compile(r"cudnn|winograd|convolv|spatial", re.I)),
+    # cuDNN conv / winograd / depthwise
+    (CUDNN_CUBLAS, re.compile(r"cudnn|winograd|convolv|spatial|conv_depthwise|conv_.*kernel", re.I)),
     # cuFFT / FFT (STFT 主导算子，已优化不可压)
     (CUDNN_CUBLAS, re.compile(r"fft|_fft|vector_fft", re.I)),
     # Triton fused kernel（我们自己写的 + torch._inductor）。严格匹配 triton 命名，
