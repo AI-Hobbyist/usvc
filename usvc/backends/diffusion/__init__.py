@@ -21,7 +21,7 @@ def _default_spec() -> FeatureSpec:
         ),
         f0=FeatureConfig(
             "f0",
-            {"extractor": "rmvpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
+            {"extractor": "fcpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
         ),
         rms=FeatureConfig("rms", {"win_length": 2048}),
         units=FeatureConfig(

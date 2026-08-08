@@ -415,7 +415,8 @@ class GeneratorNSF(torch.nn.Module):
                 x = F.leaky_relu(x, self.lrelu_slope)
                 x = ups(x)
                 x_source = noise_convs(har_source)
-                x = x + x_source
+                minl = min(x.size(2), x_source.size(2))
+                x = x[:, :, :minl] + x_source[:, :, :minl]
                 xs = None
                 l = [i * self.num_kernels + j for j in range(self.num_kernels)]
                 for j, resblock in enumerate(self.resblocks):
@@ -744,16 +745,20 @@ class RVCModel(nn.Module):
 
         f0: [B, T] Hz -> [B, T] long tokens in [1, 255].
         """
-        f0_mel_min = 1127 * torch.log(torch.tensor(1 + f0_min / 700, dtype=f0.dtype))
-        f0_mel_max = 1127 * torch.log(torch.tensor(1 + f0_max / 700, dtype=f0.dtype))
-        f0_mel = 1127 * torch.log(1 + f0 / 700)
-        f0_mel = torch.where(
-            f0_mel > 0,
-            (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
-            f0_mel,
-        )
-        f0_mel = f0_mel.clamp(min=1, max=255)
-        f0_coarse = torch.round(f0_mel).long()
+        # Always run in fp32: autocast fp16 log/clamp can produce out-of-range
+        # indices that overflow the 256-entry f0 embedding table.
+        with torch.autocast("cuda", enabled=False):
+            f0 = f0.float()
+            f0_mel_min = 1127 * torch.log(torch.tensor(1 + f0_min / 700))
+            f0_mel_max = 1127 * torch.log(torch.tensor(1 + f0_max / 700))
+            f0_mel = 1127 * torch.log(1 + f0 / 700)
+            f0_mel = torch.where(
+                f0_mel > 0,
+                (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
+                f0_mel,
+            )
+            f0_mel = f0_mel.clamp(min=1, max=255)
+            f0_coarse = torch.round(f0_mel).long()
         return f0_coarse
 
 

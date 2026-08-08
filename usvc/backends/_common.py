@@ -7,11 +7,11 @@ __all__ = ["resolve_f0_config"]
 
 
 def resolve_f0_config(
-    train_cfg: dict, *, default_extractor: str = "rmvpe", default_uv_policy: str = "raw"
+    train_cfg: dict, *, default_extractor: str = "fcpe", default_uv_policy: str = "raw"
 ) -> FeatureConfig:
     """Build an f0 FeatureConfig, allowing train_cfg to override the extractor.
 
-    Supported extractors: ``rmvpe`` (default) and ``fcpe``.
+    Supported extractors: ``fcpe`` (default, fast) and ``rmvpe``.
     uv_policy: "raw" (default) keeps f0==0 at unvoiced frames; "interp" fills
     them with linear interpolation (RVC/DDSP/Diffusion-SVC style). Backends
     pass their own default via ``default_uv_policy``; train_cfg can always

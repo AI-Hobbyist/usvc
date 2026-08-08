@@ -22,7 +22,7 @@ def _default_spec() -> FeatureSpec:
         spec=FeatureConfig("spec", {"n_fft": 2048, "win_length": 2048, "center": False}),
         f0=FeatureConfig(
             "f0",
-            {"extractor": "rmvpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
+            {"extractor": "fcpe", "uv_policy": "interp", "model_ckpt": "pretrained/rmvpe/model.pt"},
         ),
         rms=FeatureConfig("rms", {"win_length": 2048}),
         units=FeatureConfig(

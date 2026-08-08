@@ -324,10 +324,12 @@ class Generator(torch.nn.Module):
             x = self.ups[i](x)
             if not self.mini_nsf:
                 x_source = self.noise_convs[i](har_source)
-                x = x + x_source
+                minl = min(x.size(2), x_source.size(2))
+                x = x[:, :, :minl] + x_source[:, :, :minl]
             elif i == 1:
                 x_source = self.source_conv(har_source)
-                x = x + x_source
+                minl = min(x.size(2), x_source.size(2))
+                x = x[:, :, :minl] + x_source[:, :, :minl]
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:

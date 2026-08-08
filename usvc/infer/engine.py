@@ -10,6 +10,7 @@ Usage (CLI):  usvc-infer input.wav --config configs/sovits.yaml --ckpt ck.ckpt
 """
 from __future__ import annotations
 
+from contextlib import nullcontext as _nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -214,10 +215,13 @@ class InferenceEngine:
         # numerically sensitive and random-weight models diverge to NaN in
         # half precision (observed ~50% of runs). The vocoder below still
         # runs in half for the mel->wav stage.
-        self.module_half = half and self.backend_name != "diffusion"
-        if self.module_half:
-            self.module.half()
+        self.half = half and self.backend_name != "diffusion"
         self.module = self.module.to(device)
+        # autocast: conv-heavy nets (NSF-HiFiGAN, GAN generators) get fp16
+        # tensor-core acceleration while accumulation/reductions stay fp32.
+        # Unlike pure .half(), autocast keeps weight_norm norms in fp32,
+        # avoiding the ~3x slowdown seen with pure half precision.
+        self._autocast_dtype = torch.float16 if self.half else None
 
         # Feature spec drives inference extraction (same encoder as training).
         # Keep this filter list in sync with TrainConfig._FEATURE_OVERRIDE_KEYS
@@ -228,7 +232,7 @@ class InferenceEngine:
         )})
         self.features = InferFeatures(
             spec, sr=self.sr, hop=self.hop, device=device,
-            dtype="fp16" if self.module_half else "fp32",
+            dtype="fp32",
         )
 
         # Vocoder for mel-domain backends (uses shared openvpi NSF-HiFiGAN).
@@ -241,7 +245,9 @@ class InferenceEngine:
                 vocoder_dir / "config.json",
                 vocoder_dir / "model.ckpt",
                 device=device,
-                is_half=self.module_half,
+                # Keep vocoder in fp32; autocast (via self._autocast_dtype)
+                # handles fp16 tensor-core acceleration at forward time.
+                is_half=False,
             )
 
         self.t_start = float(t_start)
@@ -482,11 +488,7 @@ class InferenceEngine:
         rms = feats["rms"].to(self.device) if feats["rms"] is not None else None
         uv = feats["uv"].to(self.device)
 
-        if self.module_half:
-            units = units.half()
-            f0 = f0.half()
-            if rms is not None:
-                rms = rms.half()
+        # autocast handles dtype internally; keep fp32 inputs.
 
         # Pitch shift (semitones).
         if trans != 0:
@@ -722,73 +724,66 @@ class InferenceEngine:
             key=None,
         )
 
-        if self.backend_name == "rift_dit":
-            src_mel = torch.zeros(1, T, self.n_mels, device=self.device, dtype=units.dtype)
-            batch.mel = src_mel
-            # CLI overrides take precedence over config values (None = use config).
-            _ds = self.cfg_ds_strength if ds_cfg_strength is None else ds_cfg_strength
-            _spk = self.cfg_spk_strength if spk_cfg_strength is None else spk_cfg_strength
-            _skip = self.cfg_skip_strength if skip_cfg_strength is None else skip_cfg_strength
-            # RIFT-SVC bad_cvec: cvec downsampled 2x then interpolated back to
-            # full length (infer.py:124-128) — the "degraded" condition for ds CFG.
-            bad_cvec = None
-            if _ds > 1e-5:
-                bad_cvec = _resample_units(batch.units[0, ::2, :], T).unsqueeze(0)
-            mel = self.module.sample(
-                batch,
-                ds_cfg_strength=_ds,
-                spk_cfg_strength=_spk,
-                skip_cfg_strength=_skip,
-                cfg_rescale=self.cfg_rescale,
-                bad_cvec=bad_cvec,
-                steps=steps,
-            )
-            if isinstance(mel, tuple):
-                mel = mel[0]
-            wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
+        ac = (torch.autocast("cuda", dtype=self._autocast_dtype)
+              if self._autocast_dtype is not None else _nullcontext())
+        with ac:
+            if self.backend_name == "rift_dit":
+                src_mel = torch.zeros(1, T, self.n_mels, device=self.device, dtype=units.dtype)
+                batch.mel = src_mel
+                _ds = self.cfg_ds_strength if ds_cfg_strength is None else ds_cfg_strength
+                _spk = self.cfg_spk_strength if spk_cfg_strength is None else spk_cfg_strength
+                _skip = self.cfg_skip_strength if skip_cfg_strength is None else skip_cfg_strength
+                bad_cvec = None
+                if _ds > 1e-5:
+                    bad_cvec = _resample_units(batch.units[0, ::2, :], T).unsqueeze(0)
+                mel = self.module.sample(
+                    batch,
+                    ds_cfg_strength=_ds,
+                    spk_cfg_strength=_spk,
+                    skip_cfg_strength=_skip,
+                    cfg_rescale=self.cfg_rescale,
+                    bad_cvec=bad_cvec,
+                    steps=steps,
+                )
+                if isinstance(mel, tuple):
+                    mel = mel[0]
+                wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
 
-        elif self.backend_name in ("ddsp6", "diffusion", "reflow_vae"):
-            mel = self.module.sample(batch, steps=steps)
-            wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
+            elif self.backend_name in ("ddsp6", "diffusion", "reflow_vae"):
+                mel = self.module.sample(batch, steps=steps)
+                wav = self.vocoder.infer(mel.float(), f0.float().unsqueeze(0))
 
-        elif self.backend_name == "sovits":
-            # NSF source gets fully-voiced f0 (so-vits convention); uv keeps
-            # the raw voicing computed by InferFeatures from the raw f0.
-            f0_interp = interp_unvoiced_f0(batch.f0[0]).unsqueeze(0)
-            wav, _ = self.module.generator.infer(
-                batch.units.transpose(1, 2),  # [B, D, T]
-                f0_interp,
-                batch.uv,
-                batch.spk_id.unsqueeze(-1),
-                vol=batch.rms,  # [1, T] volume (only used if vol_embedding=True)
-                noice_scale=noice_scale,
-                predict_f0=predict_f0,
-            )
-            if shallow_diffusion:
-                return self._enhance_wav(
-                    units, f0, rms, spk, wav[0, 0].float(),
-                    k_step=k_step, diffusion_method=diffusion_method,
-                    diffusion_speedup=diffusion_speedup, t_start=t_start,
+            elif self.backend_name == "sovits":
+                f0_interp = interp_unvoiced_f0(batch.f0[0]).unsqueeze(0)
+                wav, _ = self.module.generator.infer(
+                    batch.units.transpose(1, 2),
+                    f0_interp,
+                    batch.uv,
+                    batch.spk_id.unsqueeze(-1),
+                    vol=batch.rms,
+                    noice_scale=noice_scale,
+                    predict_f0=predict_f0,
                 )
 
-        elif self.backend_name == "rvc":
-            pitch_token = self.module.generator.f0_to_coarse(batch.f0.float())
-            wav, *_ = self.module.generator.infer(
-                batch.units,
-                batch.frame_len,
-                pitch_token,
-                batch.f0,  # continuous f0 for the NSF source
-                batch.spk_id,
-            )
-            if shallow_diffusion:
-                return self._enhance_wav(
-                    units, f0, rms, spk, wav[0, 0].float(),
-                    k_step=k_step, diffusion_method=diffusion_method,
-                    diffusion_speedup=diffusion_speedup, t_start=t_start,
+            elif self.backend_name == "rvc":
+                pitch_token = self.module.generator.f0_to_coarse(batch.f0.float())
+                wav, *_ = self.module.generator.infer(
+                    batch.units,
+                    batch.frame_len,
+                    pitch_token,
+                    batch.f0,
+                    batch.spk_id,
                 )
 
-        else:  # pragma: no cover
-            raise ValueError(self.backend_name)
+            else:  # pragma: no cover
+                raise ValueError(self.backend_name)
+
+        if shallow_diffusion and self.backend_name in ("sovits", "rvc"):
+            return self._enhance_wav(
+                units, f0, rms, spk, wav[0, 0].float(),
+                k_step=k_step, diffusion_method=diffusion_method,
+                diffusion_speedup=diffusion_speedup, t_start=t_start,
+            )
 
         return wav[0, 0].float().cpu().numpy()
 

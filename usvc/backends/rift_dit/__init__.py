@@ -29,7 +29,7 @@ def _default_spec() -> FeatureSpec:
         f0=FeatureConfig(
             "f0",
             {
-                "extractor": "rmvpe",
+                "extractor": "fcpe",
                 "uv_policy": "raw",
                 "model_ckpt": "pretrained/rmvpe/model.pt",
             },
