@@ -125,13 +125,19 @@ class _Attention(nn.Module):
         q = self.q_proj(x).view(B, T, self.h, D // self.h).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.h, D // self.h).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.h, D // self.h).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if attn_mask is not None:
-            # attn_mask: [B, T] (True = valid, False = pad) -> [B,1,1,T]
-            m = attn_mask[:, None, None, :]
-            attn = attn.masked_fill(~m, float("-inf"))
-        attn = attn.softmax(dim=-1)
-        out = attn @ v  # [B, h, T, D/h]
+        # Fused flash-attention (Triton)：不 materialize [B,h,T,T] attention 矩阵（6GB/layer），
+        # 数值等价于 (q@k.T*scale).softmax()@v，无 mask 时启用。有 mask 回退原生。
+        from ..._triton import fused_attention as _fa_mod
+        try:
+            out = _fa_mod.attention(q, k, v, self.scale, attn_mask=attn_mask)
+        except Exception:
+            # 任何 triton 失败（shape/平台）回退 PyTorch 原生，保证永远不崩
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_mask is not None:
+                m = attn_mask[:, None, None, :]
+                attn = attn.masked_fill(~m, float("-inf"))
+            attn = attn.softmax(dim=-1)
+            out = attn @ v
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.out_proj(out)
 

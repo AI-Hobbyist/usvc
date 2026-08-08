@@ -35,7 +35,7 @@ _KERNEL_PATTERNS = [
     (CUDNN_CUBLAS, re.compile(r"fft|_fft|vector_fft", re.I)),
     # Triton fused kernel（我们自己写的 + torch._inductor）。严格匹配 triton 命名，
     # 避免 _kernel$ 误吃 at::native::elementwise_kernel（后者由 elementwise 规则处理）。
-    (TRITON_FUSED, re.compile(r"triton_+_?\d|inductor|program_id|_triton_|triton::", re.I)),
+    (TRITON_FUSED, re.compile(r"triton_+_?\d|inductor|program_id|_triton_|triton::|_fwd_kernel|_bwd_kernel", re.I)),
     # elementwise / reduce（胶水）
     (ELEMENTWISE_REDUCE, re.compile(
         r"elementwise|reduce|unary|binary|tensor_iterator|_kernel_vectorized|"
