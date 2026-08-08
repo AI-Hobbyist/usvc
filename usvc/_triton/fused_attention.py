@@ -65,14 +65,21 @@ def _fwd_kernel(
 
     end_n = T
     for start_n in range(0, end_n, BLOCK_N):
+        abs_n = start_n + offs_n   # 绝对 N 索引（offs_n 是块内 0..BLOCK_N-1）
         # load K, V blocks
         if IS_EVEN_N:
             k = tl.load(k_ptrs)
         else:
-            k = tl.load(k_ptrs, mask=offs_n[:, None] < T, other=0.0)
+            k = tl.load(k_ptrs, mask=abs_n[:, None] < T, other=0.0)
         # compute QK
         qk = tl.dot(q, tl.trans(k))   # [BLOCK_M, BLOCK_N]
         qk = qk * qk_scale
+        # mask out-of-range N columns with -inf（用绝对索引 abs_n 判定）
+        if not IS_EVEN_N:
+            qk = tl.where(abs_n[None, :] < T, qk, float("-inf"))
+        # mask out-of-range M rows：用 -1e4 避免 NaN（这些行不被 store）
+        if not IS_EVEN_M:
+            qk = tl.where(offs_m[:, None] < T, qk, -1e4)
 
         # online softmax
         m_ij = tl.max(qk, axis=1)
@@ -87,7 +94,7 @@ def _fwd_kernel(
         if IS_EVEN_N:
             v = tl.load(v_ptrs)
         else:
-            v = tl.load(v_ptrs, mask=offs_n[:, None] < T, other=0.0)
+            v = tl.load(v_ptrs, mask=abs_n[:, None] < T, other=0.0)
         acc = acc + tl.dot(p.to(v.dtype), v)
 
         m_i = m_new
@@ -116,8 +123,13 @@ def fused_attention(q, k, v, scale):
     B, H, T, D = q.shape
     out = torch.empty_like(q)
 
-    # block sizes (criterion d 实测最优：M=256 N=64 比 M=128 快 ~10%%，改参无效)
-    BLOCK_M = 256 if T >= 256 else 64
+    # block sizes (criterion d 实测最优：M=256 N=64 比 M=128 快 ~10%%)
+    if T >= 256:
+        BLOCK_M = 256
+    elif T >= 128:
+        BLOCK_M = 128
+    else:
+        BLOCK_M = 64
     BLOCK_N = 64
     BLOCK_D = triton.next_power_of_2(D)
     is_even_m = (T % BLOCK_M) == 0
