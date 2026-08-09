@@ -11,7 +11,6 @@ nearest neighbors + (1/score)^2 weights) is in ``usvc.retrieval.predict``.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import torch

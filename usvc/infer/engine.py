@@ -208,8 +208,6 @@ class InferenceEngine:
             if _cap[0] < 8:
                 dec_cl = False
                 vocoder_cl = False
-        self._dec_cl_req = dec_cl
-        self._vocoder_cl_req = vocoder_cl
 
         # Sample rate / hop for inference features (from config or defaults).
         opts = self.cfg.backend_opts
@@ -241,11 +239,11 @@ class InferenceEngine:
         # rvc/sovits dec channels_last 推理（conv1d→conv2d(1,k) 等价变换，消除逐层
         # nchw<->nhwc 转换 ~12ms）。仅 GAN 后端生效。
         if dec_cl and self.backend_name in ("rvc", "sovits"):
-            from ..backends.rvc.model import GeneratorNSF as _GNSF, _WN_CACHE as _RWN
-            from ..backends.sovits.model import Generator as _SGen, _WN_CACHE as _SWN
+            from ..backends.rvc.model import GeneratorNSF as _GNSF
+            from ..backends.sovits.model import Generator as _SGen
+            from ..nn.cl_helper import clear_wn_cache
 
-            _RWN.clear()  # 新引擎从干净缓存开始（权重已冻结）
-            _SWN.clear()
+            clear_wn_cache()  # 新引擎从干净缓存开始（权重已冻结）
             for _mod in self.module.generator.modules():
                 if isinstance(_mod, (_GNSF, _SGen)):
                     _mod._use_cl = True
@@ -304,9 +302,9 @@ class InferenceEngine:
                 is_half=False,
             )
             if vocoder_cl:
-                from ..nn.vocoder.nsf_hifigan import _WN_CACHE as _VWN_CACHE
+                from ..nn.cl_helper import clear_wn_cache
 
-                _VWN_CACHE.clear()  # 新引擎从干净缓存开始（权重已冻结）
+                clear_wn_cache()  # 新引擎从干净缓存开始（权重已冻结）
                 self.vocoder.generator._use_cl = True
 
         self.t_start = float(t_start)
@@ -349,8 +347,7 @@ class InferenceEngine:
                 from .reflow_enhancer import ReflowEnhancer
                 self.reflow_enhancer = ReflowEnhancer(
                     reflow_ckpt, reflow_config, vocoder_dir,
-                    device=device, half=half, sr=self.sr, hop=self.hop,
-                    compile_sample=compile_graph,
+                    device=device, sr=self.sr, hop=self.hop,
                 )
 
     @property
@@ -939,9 +936,8 @@ class InferenceEngine:
 
         Adjacent boundaries either abut (silence cut: prev_end == next_start,
         concatenate directly) or overlap (force cut: prev_end > next_start by
-        crossfade_frames, apply linear crossfade on the wav-domain overlap).
+        overlap_frames, apply linear crossfade on the wav-domain overlap).
         """
-        crossfade_samples = (2 * self.sr // self.hop) * self.hop
         out = chunks[0].copy()
         for i in range(1, len(chunks)):
             cur = chunks[i]

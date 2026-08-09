@@ -17,8 +17,7 @@ def __getattr__(name: str):
     # 按需加载子模块，避免无 triton 环境下 import 整个包失败，也避免顶层 import 的递归。
     _LAZY = {
         "fused_attention": "usvc._triton.fused_attention",
-        "fused_mel": "usvc._triton.fused_mel",
-        "fused_rms": "usvc._triton.fused_rms",
+        "fused_norm": "usvc._triton.fused_norm",
     }
     if name in _LAZY:
         mod = importlib.import_module(_LAZY[name])

@@ -6,7 +6,10 @@ from ._resample import Resample
 
 import os
 
-os.environ["LRU_CACHE_CAPACITY"] = "3"
+# Cap torch's LRU audio cache to avoid unbounded memory growth during batch
+# mel extraction (fcpe re-reads wav windows heavily). Module-level on purpose:
+# must be set before the first DataLoader iteration picks it up.
+os.environ.setdefault("LRU_CACHE_CAPACITY", "3")
 
 
 # Use librosa directly (core dep). The original try/except fallback to

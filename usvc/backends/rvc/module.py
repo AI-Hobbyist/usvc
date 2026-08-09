@@ -250,7 +250,6 @@ class RVCModule(BaseGANModule):
             with torch.no_grad():
                 out = self.forward_generator(batch)
         wave_gen = out["wave_gen"].detach()
-        spec = batch.mel
         wave = batch.wav
         ids_slice = out["ids_slice"]
         segment = wave_gen.shape[-1]

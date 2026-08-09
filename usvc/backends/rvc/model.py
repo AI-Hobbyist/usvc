@@ -29,51 +29,8 @@ from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-# ---------------------------------------------------------------------------
-# channels_last 推理辅助（rvc dec: conv1d -> conv2d(1,k)，消除 cuDNN NHWC 的
-# nchw<->nhwc 逐层转换；权重形状不变，weight_norm 手动归一化）。
-# ---------------------------------------------------------------------------
-_WN_CACHE: dict[tuple[object, int, int], torch.Tensor] = {}
-
-
-def _wn_weight(conv):
-    """weight_norm 包装 conv 的归一化权重（否则返回原始权重）。
-
-    必须用 torch._weight_norm（与模块 forward 的 compute_weight 完全一致）；
-    手写 v*(g/||v||) 在 fp32 下偏差达 0.16（torch 内部实现不同）。
-    推理时权重冻结，按 (conv 对象, _version) 缓存避免每次 conv 重复归一化；
-    不用 id() 作 key——对象销毁后 id 复用会把缓存错配给新 conv。
-    """
-    if hasattr(conv, "weight_g") and hasattr(conv, "weight_v"):
-        key = (conv, conv.weight_v._version, conv.weight_g._version)
-        w = _WN_CACHE.get(key)
-        if w is None:
-            w = torch._weight_norm(conv.weight_v, conv.weight_g, 0)
-            _WN_CACHE[key] = w
-        return w
-    return conv.weight
-
-
-def _conv2d_cl(x4, conv):
-    """Conv1d -> Conv2d(1,k) on channels_last [B,C,1,T] (weight_norm-safe)."""
-    w = _wn_weight(conv)[:, :, None, :]
-    return F.conv2d(
-        x4, w, conv.bias,
-        stride=(1, conv.stride[0]),
-        padding=(0, conv.padding[0]),
-        dilation=(1, conv.dilation[0]),
-    )
-
-
-def _convT2d_cl(x4, conv):
-    """ConvTranspose1d -> ConvTranspose2d(1,k) on channels_last [B,C,1,T]."""
-    w = _wn_weight(conv)[:, :, None, :]
-    return F.conv_transpose2d(
-        x4, w, conv.bias,
-        stride=(1, conv.stride[0]),
-        padding=(0, conv.padding[0]),
-        output_padding=(0, conv.output_padding[0]),
-    )
+# channels_last 推理辅助统一在 usvc/nn/cl_helper.py（rvc/sovits/vocoder/wavenet 共享）
+from ...nn.cl_helper import conv2d_cl, convT2d_cl
 
 # ---------------------------------------------------------------------------
 # Reused from sovits model (numerically identical components)
@@ -321,11 +278,11 @@ class ResBlock1(torch.nn.Module):
             xt = F.leaky_relu(x, self.lrelu_slope)
             if x_mask is not None:
                 xt = xt * x_mask
-            xt = _conv2d_cl(xt, c1)
+            xt = conv2d_cl(xt, c1)
             xt = F.leaky_relu(xt, self.lrelu_slope)
             if x_mask is not None:
                 xt = xt * x_mask
-            xt = _conv2d_cl(xt, c2)
+            xt = conv2d_cl(xt, c2)
             x = xt + x
         if x_mask is not None:
             x = x * x_mask
@@ -374,7 +331,7 @@ class ResBlock2(torch.nn.Module):
             xt = F.leaky_relu(x, self.lrelu_slope)
             if x_mask is not None:
                 xt = xt * x_mask
-            xt = _conv2d_cl(xt, c)
+            xt = conv2d_cl(xt, c)
             x = xt + x
         if x_mask is not None:
             x = x * x_mask
@@ -485,17 +442,17 @@ class GeneratorNSF(torch.nn.Module):
             if n != x.shape[-1]:
                 x = F.interpolate(x, size=n, mode="linear")
         x4 = x[:, :, None, :].to(memory_format=torch.channels_last)  # [B,C,1,T] CL
-        x = _conv2d_cl(x4, self.conv_pre)
+        x = conv2d_cl(x4, self.conv_pre)
         if g is not None:
-            x = x + _conv2d_cl(
+            x = x + conv2d_cl(
                 g[:, :, None, :].to(memory_format=torch.channels_last), self.cond)
         # NSF source as [B,1,1,L] CL
         hs4 = har_source[:, :, None, :].to(memory_format=torch.channels_last)
         for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
             if i < self.num_upsamples:
                 x = F.leaky_relu(x, self.lrelu_slope)
-                x = _convT2d_cl(x, ups)
-                x_source = _conv2d_cl(hs4, noise_convs)
+                x = convT2d_cl(x, ups)
+                x_source = conv2d_cl(hs4, noise_convs)
                 minl = min(x.size(3), x_source.size(3))
                 x = x[:, :, :, :minl] + x_source[:, :, :, :minl]
                 xs = None
@@ -509,7 +466,7 @@ class GeneratorNSF(torch.nn.Module):
                 assert isinstance(xs, torch.Tensor)
                 x = xs / self.num_kernels
         x = F.leaky_relu(x)
-        x = _conv2d_cl(x, self.conv_post)
+        x = conv2d_cl(x, self.conv_post)
         x = torch.tanh(x)
         return x[:, :, 0, :]  # [B,1,T]（view，无拷贝）
 

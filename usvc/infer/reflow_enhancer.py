@@ -25,18 +25,6 @@ from ..nn.vocoder import NSFHiFiGAN
 __all__ = ["ReflowEnhancer"]
 
 
-def _load_ckpt_state(ckpt_path: str | Path) -> dict:
-    """Load state dict from a torch ckpt (lightning or bare)."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict):
-        sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
-    else:
-        sd = ckpt
-    if not isinstance(sd, dict):
-        raise RuntimeError(f"cannot interpret checkpoint: {ckpt_path}")
-    return sd
-
-
 class ReflowEnhancer:
     """Reflow shallow-diffusion enhancer (DDSP6 backend).
 
@@ -52,16 +40,13 @@ class ReflowEnhancer:
         reflow_config: str | Path,
         vocoder_dir: str | Path,
         device: str = "cuda",
-        half: bool = False,
         sr: int = 44100,
         hop: int = 512,
-        compile_sample: bool = False,
     ) -> None:
         self.device = device
-        # The enhancer always operates in the DDSP6 mel domain (44.1k/512).
-        # The engine handles the sample-rate bridge for rvc (48k) separately,
-        # so self.sr/self.hop reflect the enhancer's own domain, not the
-        # backend's.  These are overridden below from the model config.
+        # The enhancer always operates in the reflow mel domain (44.1k/512).
+        # self.sr/self.hop are seeded from constructor args then overridden by
+        # the model config below; they are used by enhance() for resampling.
         self.sr = sr
         self.hop = hop
 
@@ -191,7 +176,8 @@ class ReflowEnhancer:
         Accepts lightning ckpts (keys under ``state_dict`` with a ``model.``
         prefix from ``self.model = ReflowShallowModel``) and bare model ckpts.
         """
-        sd = _load_ckpt_state(ckpt_path)
+        from ..io.ckpt import load_ckpt_state
+        sd = load_ckpt_state(ckpt_path)
         # Strip the lightning "model." prefix if present.
         if any(k.startswith("model.") for k in sd):
             sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
@@ -238,7 +224,8 @@ class ReflowEnhancer:
             print(f"[reflow_shallow] unexpected keys: {bad[:5]}")
 
     def _load_reflow_weights(self, ckpt_path: str | Path) -> None:
-        sd = _load_ckpt_state(ckpt_path)
+        from ..io.ckpt import load_ckpt_state
+        sd = load_ckpt_state(ckpt_path)
         # Strip the lightning "model." prefix if present (usvc training ckpts save
         # DDSP6Model under 'model.ddsp_model.*' / 'model.reflow_model.*').
         if any(k.startswith("model.") for k in sd):

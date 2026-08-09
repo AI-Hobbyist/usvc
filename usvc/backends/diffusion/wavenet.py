@@ -15,6 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Mish
 
+# channels_last 推理辅助统一在 usvc/nn/cl_helper.py（rvc/sovits/vocoder/wavenet 共享）
+from ...nn.cl_helper import conv2d_cl
+
 
 class Conv1d(torch.nn.Conv1d):
     def __init__(self, *args, **kwargs):
@@ -52,19 +55,19 @@ class ResidualBlock(nn.Module):
         self.conditioner_projection = nn.Conv1d(encoder_hidden, 2 * residual_channels, 1)
         self.output_projection = nn.Conv1d(residual_channels, 2 * residual_channels, 1)
 
-    def forward_cl(self, x, conditioner, diffusion_step, conv2d_cl):
+    def forward_cl(self, x, conditioner, diffusion_step, conv2d_fn):
         """channels_last 版（x/conditioner 为 [B,C,1,T] CL）。"""
         diffusion_step = self.diffusion_projection(diffusion_step).unsqueeze(-1)
-        conditioner = conv2d_cl(conditioner, self.conditioner_projection)
+        conditioner = conv2d_fn(conditioner, self.conditioner_projection)
         y = x + diffusion_step[:, :, :, None]
 
-        y = conv2d_cl(y, self.dilated_conv) + conditioner
+        y = conv2d_fn(y, self.dilated_conv) + conditioner
 
         # split dim=1 (channel) — same as NCHW
         gate, filter = torch.split(y, [self.residual_channels, self.residual_channels], dim=1)
         y = torch.sigmoid(gate) * torch.tanh(filter)
 
-        y = conv2d_cl(y, self.output_projection)
+        y = conv2d_fn(y, self.output_projection)
 
         residual, skip = torch.split(y, [self.residual_channels, self.residual_channels], dim=1)
         return (x + residual) / math.sqrt(2.0), skip
@@ -109,25 +112,11 @@ class WaveNet(nn.Module):
         self.output_projection = Conv1d(n_chans, in_dims, 1)
         nn.init.zeros_(self.output_projection.weight)
 
-    def _conv2d_cl(self, x4, conv):
-        """Conv1d as Conv2d(1,k) on a channels_last [B,C,1,T] tensor.
-
-        Keeps 1D weight shape (state_dict 兼容); cuDNN picks the NHWC
-        tensorop path with zero nchw<->nhwc conversions inside the network.
-        """
-        w = conv.weight[:, :, None, :]  # [out, in, 1, k]
-        return F.conv2d(
-            x4, w, conv.bias,
-            stride=1,
-            padding=(0, conv.padding[0]),
-            dilation=(1, conv.dilation[0]),
-        )
-
     def forward_cl(self, spec, diffusion_step, cond):
         """channels_last 版 forward：网络内零布局转换（等价于 forward）。"""
         # spec [B,1,M,T] -> [B,M,1,T]（mel 作通道）-> channels_last
         x = spec.transpose(1, 2).to(memory_format=torch.channels_last)
-        x = self._conv2d_cl(x, self.input_projection)   # [B,C,1,T] CL
+        x = conv2d_cl(x, self.input_projection)   # [B,C,1,T] CL
 
         x = F.relu(x)
         diffusion_step = self.diffusion_embedding(diffusion_step)
@@ -136,13 +125,13 @@ class WaveNet(nn.Module):
         skip = []
         for layer in self.residual_layers:
             x, skip_connection = layer.forward_cl(
-                x, cond4, diffusion_step, self._conv2d_cl)
+                x, cond4, diffusion_step, conv2d_cl)
             skip.append(skip_connection)
 
         x = torch.sum(torch.stack(skip), dim=0) / sqrt(len(self.residual_layers))
-        x = self._conv2d_cl(x, self.skip_projection)
+        x = conv2d_cl(x, self.skip_projection)
         x = F.relu(x)
-        x = self._conv2d_cl(x, self.output_projection)  # [B,128,1,T]
+        x = conv2d_cl(x, self.output_projection)  # [B,128,1,T]
         return x.transpose(1, 2)  # [B,1,128,T]
 
     def forward(self, spec, diffusion_step, cond):

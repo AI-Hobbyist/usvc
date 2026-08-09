@@ -217,7 +217,7 @@ class SelfAttention(nn.Module):
         # print (torch.sum(self.name_embedding))
 
     def forward(self, x, context=None, mask=None, context_mask=None, name=None, inference=False, **kwargs):
-        b, n, _, h, gh = *x.shape, self.heads, self.global_heads
+        _, _, _, h, gh = *x.shape, self.heads, self.global_heads
 
         cross_attend = exists(context)
 

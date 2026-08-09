@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 
@@ -42,20 +43,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot interpret checkpoint: {ckpt_path}")
         return 1
 
-    orig_size = sum(v.numel() * v.element_size() for v in sd.values())
-
-    # Strip inference-irrelevant keys:
-    #   - discriminator.*  (GAN backends: rvc/sovits)
-    #   - any key containing 'discriminator' / 'mpd' / 'msd'
-    infer_sd = {}
-    dropped = 0
-    for k, v in sd.items():
-        kl = k.lower()
-        if "discriminator" in kl or kl.startswith("disc") or ".mpd." in kl or ".msd." in kl:
-            dropped += 1
-            continue
-        infer_sd[k] = v
-
     # Optionally convert to half precision
     if args.half:
         infer_sd = {k: (v.half() if v.is_floating_point() else v) for k, v in infer_sd.items()}
@@ -64,8 +51,6 @@ def main(argv: list[str] | None = None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(infer_sd, str(out_path))
 
-    out_size = sum(v.numel() * v.element_size() for v in infer_sd.values())
-    import os
     ckpt_file_mb = os.path.getsize(ckpt_path) / 1024 / 1024
     out_file_mb = os.path.getsize(out_path) / 1024 / 1024
     dtype = "fp16" if args.half else "fp32"

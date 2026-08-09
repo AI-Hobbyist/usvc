@@ -27,19 +27,6 @@ from ..nn.vocoder import NSFHiFiGAN
 __all__ = ["DiffusionEnhancer"]
 
 
-def _load_ckpt_state(ckpt_path: str) -> dict:
-    """Load state dict from a torch ckpt (lightning or bare)."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict):
-        # lightning: {"state_dict": {...}, ...}; so-vits diffusion: {"model": {...}}
-        sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
-    else:
-        sd = ckpt
-    if not isinstance(sd, dict):
-        raise RuntimeError(f"cannot interpret checkpoint: {ckpt_path}")
-    return sd
-
-
 class DiffusionEnhancer:
     """Shallow diffusion enhancer for sovits.
 
@@ -161,7 +148,8 @@ class DiffusionEnhancer:
 
     def _load_diffusion_weights(self, ckpt_path: str | Path) -> None:
         """Load diffusion state dict, stripping ``model.``/``module.`` prefixes."""
-        sd = _load_ckpt_state(str(ckpt_path))
+        from ..io.ckpt import load_ckpt_state
+        sd = load_ckpt_state(str(ckpt_path))
         if all(k.startswith("model.") for k in sd):
             sd = {k[len("model."):]: v for k, v in sd.items()}
         elif all(k.startswith("module.") for k in sd):
@@ -210,8 +198,6 @@ class DiffusionEnhancer:
         # 0) 如果扩散模型用不同编码器 (如 contentvec 768维), 从 sovits 输出 wav
         # 重新提取 units (sovits 用 hubertsoft 256维, 维度不匹配会崩)。
         if self.units_extractor is not None:
-            import soundfile as sf_resample  # noqa: F401 (not used directly)
-            from ..io.audio import load_audio
             wav_np = sovits_wav if isinstance(sovits_wav, np.ndarray) else sovits_wav.cpu().numpy()
             # UnitsExtractor 需要 16k wav, 从目标 sr 重采样
             import librosa

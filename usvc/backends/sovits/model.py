@@ -29,47 +29,8 @@ from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 LRELU_SLOPE = 0.1
 
-# ---------------------------------------------------------------------------
-# channels_last 推理辅助（与 usvc/backends/rvc/model.py 同款：Conv1d ->
-# Conv2d(1,k) 在 [B,C,1,T] channels_last 上执行，消除逐层 nchw<->nhwc 转换）。
-# ---------------------------------------------------------------------------
-_WN_CACHE: dict[tuple[object, int, int], torch.Tensor] = {}
-
-
-def _wn_weight(conv):
-    """weight_norm 包装 conv 的归一化权重（否则返回原始权重）。"""
-    if hasattr(conv, "weight_g") and hasattr(conv, "weight_v"):
-        key = (conv, conv.weight_v._version, conv.weight_g._version)
-        w = _WN_CACHE.get(key)
-        if w is None:
-            # 必须用 torch._weight_norm（与模块 forward 完全一致）；
-            # 手写 v*(g/||v||) fp32 下偏差达 0.16。
-            w = torch._weight_norm(conv.weight_v, conv.weight_g, 0)
-            _WN_CACHE[key] = w
-        return w
-    return conv.weight
-
-
-def _conv2d_cl(x4, conv):
-    """Conv1d -> Conv2d(1,k) on channels_last [B,C,1,T] (weight_norm-safe)."""
-    w = _wn_weight(conv)[:, :, None, :]
-    return F.conv2d(
-        x4, w, conv.bias,
-        stride=(1, conv.stride[0]),
-        padding=(0, conv.padding[0]),
-        dilation=(1, conv.dilation[0]),
-    )
-
-
-def _convT2d_cl(x4, conv):
-    """ConvTranspose1d -> ConvTranspose2d(1,k) on channels_last."""
-    w = _wn_weight(conv)[:, :, None, :]
-    return F.conv_transpose2d(
-        x4, w, conv.bias,
-        stride=(1, conv.stride[0]),
-        padding=(0, conv.padding[0]),
-        output_padding=(0, conv.output_padding[0]),
-    )
+# channels_last 推理辅助统一在 usvc/nn/cl_helper.py（rvc/sovits/vocoder/wavenet 共享）
+from ...nn.cl_helper import conv2d_cl, convT2d_cl
 
 # ---------------------------------------------------------------------------
 # mel_spectrogram / spec_to_mel (from so-vits-svc/modules/mel_processing.py)
@@ -139,7 +100,7 @@ def spec_to_mel(
     Bit-matches so-vits (clip_val=1e-5) or RVC (clip_val=2e-6) mel_processing.
     """
     dtype_device = str(spec.dtype) + "_" + str(spec.device)
-    key = f"{fmax}_{dtype_device}"
+    key = f"{n_fft}_{num_mels}_{sampling_rate}_{fmin}_{fmax}_{dtype_device}"
     if key not in _mel_basis_cache:
         import librosa
 
@@ -938,9 +899,9 @@ class ResBlock1(torch.nn.Module):
         """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, LRELU_SLOPE)
-            xt = _conv2d_cl(xt, c1)
+            xt = conv2d_cl(xt, c1)
             xt = F.leaky_relu(xt, LRELU_SLOPE)
-            xt = _conv2d_cl(xt, c2)
+            xt = conv2d_cl(xt, c2)
             x = xt + x
         return x
 
@@ -974,7 +935,7 @@ class ResBlock2(torch.nn.Module):
         """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
         for c in self.convs:
             xt = F.leaky_relu(x, LRELU_SLOPE)
-            xt = _conv2d_cl(xt, c)
+            xt = conv2d_cl(xt, c)
             x = xt + x
         return x
 
@@ -1263,13 +1224,13 @@ class Generator(torch.nn.Module):
             har_source = har_source.transpose(1, 2)
         hs4 = har_source[:, :, None, :].to(memory_format=torch.channels_last)
         x4 = x[:, :, None, :].to(memory_format=torch.channels_last)
-        x = _conv2d_cl(x4, self.conv_pre)
+        x = conv2d_cl(x4, self.conv_pre)
         g4 = g[:, :, None, :].to(memory_format=torch.channels_last)
-        x = x + _conv2d_cl(g4, self.cond)
+        x = x + conv2d_cl(g4, self.cond)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
-            x = _convT2d_cl(x, self.ups[i])
-            x_source = _conv2d_cl(hs4, self.noise_convs[i])
+            x = convT2d_cl(x, self.ups[i])
+            x_source = conv2d_cl(hs4, self.noise_convs[i])
             minl = min(x.size(3), x_source.size(3))
             x = x[:, :, :, :minl] + x_source[:, :, :, :minl]
             xs = None
@@ -1281,7 +1242,7 @@ class Generator(torch.nn.Module):
                     xs = xs + rb.forward_cl(x)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
-        x = _conv2d_cl(x, self.conv_post)
+        x = conv2d_cl(x, self.conv_post)
         x = torch.tanh(x)
         return x[:, :, 0, :]  # [B,1,T]（view，无拷贝，与 forward 同形状）
 
