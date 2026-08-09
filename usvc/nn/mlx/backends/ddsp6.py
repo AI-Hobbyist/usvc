@@ -861,11 +861,14 @@ class DDSP6Model(nn.Module):
         in_proj = shape("reflow_model.velocity_fn.input_projection.weight")
         if in_proj is None:
             raise ValueError("cannot infer ddsp6 config: missing velocity_fn.input_projection.weight")
-        if in_proj.ndim == 2:  # LYNXNet2 Linear (n_chans, in_dims)
+        # input_projection:Linear torch (n_chans, in_dims) 或
+        # Conv1d mlx (n_chans, K, in_dims)。in_dims 在最后(Linear)或
+        # Conv1d 的第 3 维。
+        if len(in_proj) == 2:  # LYNXNet2 Linear (n_chans, in_dims)
             n_chans, out_dims = in_proj[0], in_proj[1]
             velocity_net = "LYNXNet2"
-        else:  # LYNXNet Conv1d (n_chans, in_dims, 1)
-            n_chans, out_dims = in_proj[0], in_proj[1]
+        else:  # LYNXNet Conv1d mlx (n_chans, K, in_dims)
+            n_chans, out_dims = in_proj[0], in_proj[2]
             velocity_net = "LYNXNet"
         n_layers = sum(
             1 for k in sd if k.startswith("reflow_model.velocity_fn.residual_layers.")

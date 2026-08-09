@@ -467,12 +467,15 @@ class Unit2Wav_VAE(nn.Module):
 
     def _fit_dims(self, f0, volume, spk_id):
         """usvc SVCBatch 形状 → 模型约定([B,T,1] / [B,1],0-based spk)。"""
-        if f0 is not None and f0.ndim == 2:
+        if f0 is not None and getattr(f0, "ndim", 0) == 2:
             f0 = f0[:, :, None]
-        if volume is not None and volume.ndim == 2:
+        if volume is not None and getattr(volume, "ndim", 0) == 2:
             volume = volume[:, :, None]
-        if spk_id is not None and spk_id.ndim == 1:
-            spk_id = spk_id[:, None]
+        if spk_id is not None:
+            if not hasattr(spk_id, "ndim"):
+                spk_id = mx.array([int(spk_id)])
+            if spk_id.ndim == 1:
+                spk_id = spk_id[:, None]
         return f0, volume, spk_id
 
     def __call__(self, units, f0, volume, spk_id=None, aug_shift=None,

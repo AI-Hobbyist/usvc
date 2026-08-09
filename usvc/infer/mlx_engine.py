@@ -134,17 +134,19 @@ class MlxInferenceEngine:
         self.model.eval()
 
     def _build_sovits(self):
-        """sovits wav-domain pipeline:Generator + flow + TextEncoder。"""
-        from ..nn.mlx.backends.sovits import Generator
-        # sovits 完整 SynthesizerTrn 集成待补;先持有 Generator
-        # TODO: 完整 sovits model(enc_p + flow + dec)
-        raise NotImplementedError(
-            "sovits full mlx pipeline pending (Generator ready, flow/enc_p wiring TODO). "
-            "Use impl='torch'."
-        )
+        """sovits wav-domain pipeline:SoVITSModel(enc_p + flow + dec)。"""
+        from ..nn.mlx.backends.sovits import SoVITSModel
+        try:
+            self.model = SoVITSModel.from_ckpt(self.ckpt_path)
+        except Exception:
+            from ..nn.mlx.backends.sovits import Generator  # noqa: F401
+            raise NotImplementedError(
+                "sovits mlx from_ckpt failed. Check ckpt format. Use impl='torch'."
+            )
+        self.model.eval()
 
     def _build_mel_domain(self):
-        """mel-domain backends:需 NSF-HiFiGAN vocoder + backend sample()。"""
+        """mel-domain backends:backend.sample(units,f0,vol) -> mel -> vocoder -> wav。"""
         if self.vocoder_dir is None:
             from ..hub import ensure_dir
             self.vocoder_dir = ensure_dir("nsf_hifigan")
@@ -154,11 +156,23 @@ class MlxInferenceEngine:
         self.vocoder = NSFHiFiGAN(
             vdir / "config.json", vdir / "model.ckpt", device="gpu"
         )
-        # backend model.sample 集成待补
-        raise NotImplementedError(
-            f"{self.backend_name} mlx sample() pipeline pending (vocoder ready). "
-            f"Use impl='torch'."
-        )
+        self.vocoder.generator.eval()
+        # backend model.sample -> mel
+        opts = self.cfg.backend_opts
+        if self.backend_name == "diffusion":
+            from ..nn.mlx.backends.diffusion import DiffusionModel
+            self.model = DiffusionModel.from_ckpt(self.ckpt_path)
+        elif self.backend_name == "ddsp6":
+            from ..nn.mlx.backends.ddsp6 import DDSP6Model
+            self.model = DDSP6Model.from_ckpt(self.ckpt_path)
+        elif self.backend_name == "reflow_vae":
+            from ..nn.mlx.backends.reflow_vae import ReflowVAEModel
+            self.model = ReflowVAEModel.from_ckpt(self.ckpt_path)
+        else:
+            raise NotImplementedError(
+                f"{self.backend_name} mlx pipeline pending. Use impl='torch'."
+            )
+        self.model.eval()
 
     # ------------------------------------------------------------------
     # 特征提取(mlx)
@@ -181,11 +195,85 @@ class MlxInferenceEngine:
         混合策略:特征提取(units/f0/rms/uv)复用 torch 版 feats 管线
         (backend 无关,返回 numpy),model forward 用 mlx。
         """
-        if self.backend_name != "rvc":
-            raise NotImplementedError(
-                f"{self.backend_name} mlx convert pending. Use impl='torch'."
+        if self.backend_name == "rvc":
+            return self._convert_rvc(input_wav, spk, trans, **kwargs)
+        if self.backend_name == "sovits":
+            return self._convert_sovits(input_wav, spk, trans, **kwargs)
+        if self.backend_name in ("diffusion", "ddsp6", "reflow_vae"):
+            return self._convert_mel_domain(input_wav, spk, trans, **kwargs)
+        raise NotImplementedError(
+            f"{self.backend_name} mlx convert pending. Use impl='torch'."
+        )
+
+    def _extract_feats_numpy(self, input_wav, f0_method="rmvpe"):
+        """复用 torch engine 的特征提取(返回 numpy units/f0/rms/uv)。"""
+        if not hasattr(self, "_torch_eng_for_feats"):
+            from .engine import InferenceEngine
+            self._torch_eng_for_feats = InferenceEngine(
+                config_path=self._config_path,
+                ckpt_path=self.ckpt_path,
+                device="cpu", impl="torch",
             )
-        return self._convert_rvc(input_wav, spk, trans, **kwargs)
+        feats = self._torch_eng_for_feats.features.extract(
+            input_wav, f0_method=f0_method
+        )
+        units = feats["units"].cpu().numpy()  # [T, D]
+        f0 = feats["f0"].cpu().numpy()        # [T]
+        rms = feats["rms"].cpu().numpy() if feats["rms"] is not None else None
+        return units, f0, rms
+
+    def _convert_sovits(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
+        """sovits wav-domain:feats -> SoVITSModel.infer(c, f0, uv, g) -> wav。"""
+        import mlx.core as mx
+        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
+        units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
+        if trans != 0:
+            f0_np = f0_np * (2.0 ** (trans / 12.0))
+        # uv:浊音标志(1=浊音)。f0>0 视为浊音。
+        uv_np = (f0_np > 0).astype(np.float32)
+        c = mx.array(units_np)[None]   # [1, T, D]
+        f0 = mx.array(f0_np)[None]    # [1, T]
+        uv = mx.array(uv_np)[None]     # [1, T]
+        g = mx.array([spk])
+        ret = self.model.infer(c, f0, uv, g)
+        o = ret[0] if isinstance(ret, (tuple, list)) else ret
+        wav = np.array(o).reshape(-1).astype(np.float32)
+        return wav
+
+    def _convert_mel_domain(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
+        """mel-domain pipeline:feats -> backend.sample -> mel -> vocoder -> wav。"""
+        import mlx.core as mx
+        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
+        units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
+        # pitch shift
+        if trans != 0:
+            f0_np = f0_np * (2.0 ** (trans / 12.0))
+        # volume:用 rms(若无填 1.0)
+        vol_np = rms_np if rms_np is not None else np.ones_like(f0_np) * 0.5
+        units = mx.array(units_np)[None]   # [1, T, D]
+        f0 = mx.array(f0_np)[None]        # [1, T]
+        vol = mx.array(vol_np)[None]      # [1, T]
+        # backend.sample -> mel [1, T, M]
+        be = self.backend_name
+        if be == "diffusion":
+            speedup = int(kwargs.get("diffusion_speedup", 10))
+            method = kwargs.get("diffusion_method", "ddim")
+            k_step = int(kwargs.get("k_step", 1000))
+            mel = self.model.sample(units, f0, vol, spk_id=mx.array([spk]),
+                                    infer_speedup=speedup, method=method,
+                                    k_step=k_step)
+        elif be == "ddsp6":
+            mel = self.model.sample(units, f0, vol, spk_id=spk,
+                                    infer_step=int(kwargs.get("steps", 10)),
+                                    method=kwargs.get("method", "euler"))
+        else:  # reflow_vae
+            mel = self.model.sample(units, f0, vol, spk_id=spk,
+                                    infer_step=int(kwargs.get("steps", 10)))
+        # vocoder: mel -> wav
+        mel = mel if mel.shape[0] == 1 else mel[0:1]
+        f0_voc = f0  # [1, T]
+        wav_mlx = np.array(self.vocoder.infer(mel, f0_voc))  # [1, L, 1]
+        return wav_mlx.reshape(-1).astype(np.float32)
 
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
         """RVC 端到端:feats(torch engine) -> RVCModel.infer(mlx) -> wav。
@@ -195,20 +283,10 @@ class MlxInferenceEngine:
         torch engine 仅用于特征提取(model forward 由 mlx 接管)。
         """
         import mlx.core as mx
-        # 1. 特征提取(复用 torch engine 的 features)
-        from .engine import InferenceEngine
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
-        # 构造一个 torch engine 仅用于特征(同一 config/ckpt)
-        if not hasattr(self, "_torch_eng_for_feats"):
-            self._torch_eng_for_feats = InferenceEngine(
-                config_path=self._config_path,
-                ckpt_path=self.ckpt_path,
-                device="cpu", impl="torch",
-            )
-        te = self._torch_eng_for_feats
-        feats = te.features.extract(input_wav, f0_method=f0_method)
-        units = feats["units"].cpu().numpy()  # [T, 768]
-        f0 = feats["f0"].cpu().numpy()        # [T]
+        units_np, f0_np, _ = self._extract_feats_numpy(input_wav, f0_method)
+        units = units_np
+        f0 = f0_np
 
         # 2. Pitch shift
         if trans != 0:
