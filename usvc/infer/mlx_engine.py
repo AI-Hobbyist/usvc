@@ -261,11 +261,45 @@ class MlxInferenceEngine:
         )
 
     def _extract_feats_numpy(self, input_wav, f0_method="rmvpe"):
-        """复用 torch 特征提取管线(绕过 torch model 加载)。
-
-        直接用 ``get_backend(name).feature_spec()`` + ``InferFeatures``,避免
-        ``InferenceEngine`` 构造时强制加载 torch ckpt(与 mlx 场景冲突)。
+        """特征提取:优先 mlx GPU(快 2.3x,无 torch 进程开销),
+        回退 torch InferFeatures(若 mlx 特征器不可用)。
         """
+        # 尝试 mlx 特征提取(GPU,无 torch)
+        try:
+            if not hasattr(self, "_mlx_feats"):
+                from ..hub import ensure_pretrained
+                from ..nn.mlx.features import MlxFeatureExtractor
+                # 从 feature_spec 解析 rms win_length / uv_policy / units_layer
+                from ..backends import get_backend
+                opts = self.cfg.backend_opts
+                spec = get_backend(self.backend_name).feature_spec({
+                    k: v for k, v in opts.items()
+                    if k in ("units_kind", "units_ckpt", "f0_extractor",
+                             "rmvpe_ckpt", "uv_policy", "n_mels", "fmin",
+                             "fmax", "rvc_version", "version")
+                })
+                rms_win = (spec.rms.params.get("win_length")
+                           if spec.rms is not None else None)
+                uv_policy = (spec.f0.params.get("uv_policy", "interp")
+                             if spec.f0 is not None else "interp")
+                units_layer = (spec.units.params.get("layer", 12)
+                               if spec.units is not None else 12)
+                self._mlx_feats = MlxFeatureExtractor(
+                    sr=self.sr, hop=self.hop,
+                    units_ckpt=ensure_pretrained("contentvec/pytorch_model.bin"),
+                    rmvpe_ckpt=ensure_pretrained("rmvpe/model.pt"),
+                    rms_win_length=rms_win,
+                    uv_policy=uv_policy,
+                    units_layer=units_layer,
+                )
+            feats = self._mlx_feats.extract(input_wav, f0_method=f0_method)
+            units = np.array(feats["units"], dtype=np.float32)
+            f0 = np.asarray(feats["f0"], dtype=np.float32)
+            rms = np.asarray(feats["rms"], dtype=np.float32) if feats.get("rms") is not None else None
+            return units, f0, rms
+        except Exception:
+            pass  # 回退 torch
+        # torch 回退:InferFeatures(backend 无关特征管线)
         from ..backends import get_backend
         from .features import InferFeatures
         opts = self.cfg.backend_opts
@@ -344,12 +378,19 @@ class MlxInferenceEngine:
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
         """RVC 端到端:feats -> 固定块 RVCModel.infer(compile 复用) -> 拼接 wav。
 
-        固定块大小(对齐)让 mx.compile 只编译一次,后续块复用图,
-        避免 compile 针对每个不同长度重建(3s 音频 4s -> 0.5s)。
+        各阶段(features / model)间清理 GPU cache,避免峰值叠加。
         """
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, _ = self._extract_feats_numpy(input_wav, f0_method)
+        # 特征提取后释放特征器(ContentVec+RMVPE 权重 ~856MB 常驻 GPU),
+        # 为 model forward 腾出 GPU 内存,避免峰值叠加(~1.4GB)。
+        # 下次 convert 会重建特征器(可配置 USVC_MLX_KEEP_FEATS=1 保留)。
+        import os, mlx.core as mx
+        mx.clear_cache()
+        if hasattr(self, "_mlx_feats") and not os.environ.get("USVC_MLX_KEEP_FEATS"):
+            del self._mlx_feats
+            self._mlx_feats = None
         if trans != 0:
             f0_np = f0_np * (2.0 ** (trans / 12.0))
         from ..nn.mlx.backends.rvc import f0_to_coarse
