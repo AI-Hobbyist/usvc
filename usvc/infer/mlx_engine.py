@@ -223,8 +223,15 @@ class MlxInferenceEngine:
         mel-domain(扩散/flow)中间 mel 小,可到 ~15s。
         """
         if self.backend_name in ("rvc", "sovits"):
-            return 2 * self.sr // self.hop  # ~2s(wav O(T),实测 2s 为速度/内存最优)
-        return 15 * self.sr // self.hop   # mel-domain ~15s
+            # wav-domain O(T): 0.5s tile 平衡速度(47ms/block)与内存(542MB)。
+            # 更小可降内存但分块开销增大。可用 USVC_MLX_TILE_SEC 覆盖。
+            import os
+            tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC", "0.5"))
+            return int(tile_sec * self.sr / self.hop)
+        # mel-domain:vocoder O(T),用 USVC_MLX_TILE_SEC_MEL 控制(默认 5s)。
+        import os
+        tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC_MEL", "5.0"))
+        return int(tile_sec * self.sr / self.hop)
 
     def _chunk_indices(self, T: int, chunk: int, overlap: int = 0):
         """生成 (start, end) 分块索引,可选重叠(用于交叉淡化)。"""
