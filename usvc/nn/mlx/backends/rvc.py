@@ -34,6 +34,8 @@ __all__ = [
     "RVCSineGen",
     "RVCSourceModuleHnNSF",
     "GeneratorNSF",
+    "RVCTextEncoder",
+    "RVCModel",
     "f0_to_coarse",
 ]
 
@@ -234,7 +236,9 @@ class GeneratorNSF(nn.Module):
         """
         from .._convert import load_torch_ckpt_to_mlx
 
-        sd = load_torch_ckpt_to_mlx(ckpt_path)
+        sd = load_torch_ckpt_to_mlx(
+            ckpt_path, convtranspose_keys=cls._ups_weights(ckpt_path, key_prefix)
+        )
         cfg = config if config is not None else cls._infer_config(ckpt_path, key_prefix, sd=sd)
         obj = cls(**cfg)
         # 剥 dec 前缀
@@ -254,6 +258,23 @@ class GeneratorNSF(nn.Module):
         obj.load_weights(list(dec_sd.items()), strict=strict)
         obj.eval()
         return obj
+
+    @staticmethod
+    def _ups_weights(ckpt_path: str | Path, key_prefix: str | None = None) -> set[str]:
+        """从 ckpt 收集 ConvTranspose1d 权重键(ups.*.weight,含前缀)。
+
+        RVC GeneratorNSF 的 ups 是 weight_norm ConvTranspose1d,merge_weight_norm
+        后键为 ``{prefix}.ups.{i}.weight``,需要 (I,O,K)→(O,K,I) 转置。
+        """
+        from .._convert import load_torch_sd
+        from .._ops import merge_weight_norm
+
+        merged = merge_weight_norm(load_torch_sd(ckpt_path))
+        pref = (key_prefix + ".") if key_prefix else ""
+        return {
+            k for k in merged
+            if k.startswith(pref + "ups.") and k.endswith(".weight")
+        }
 
     @staticmethod
     def _infer_config(ckpt_path: str | Path | None = None, key_prefix: str | None = None,
@@ -389,3 +410,296 @@ def f0_to_coarse(f0, f0_min: float = 50.0, f0_max: float = 1100.0):
     )
     f0_mel = mx.clip(f0_mel, 1.0, 255.0)
     return mx.round(f0_mel).astype(mx.int32)
+
+
+# ---------------------------------------------------------------------------
+# RVC TextEncoder(prior:units + pitch → m, logs, x_mask)
+# 镜像 rvc/model.py::TextEncoder;attention 组件复用 sovits 的 Encoder
+# (RVC window_size=10,与 so-vits 4 不同)。
+# ---------------------------------------------------------------------------
+
+def sequence_mask(lengths, max_length=None):
+    """lengths: [B] int -> [B, T] bool(T = max_length)。镜像 model.py::sequence_mask。"""
+    if max_length is None:
+        max_length = int(lengths.max())
+    x = mx.arange(max_length, dtype=lengths.dtype)[None, :]
+    return x < lengths[:, None]
+
+
+class RVCTextEncoder(nn.Module):
+    """RVC prior encoder:emb_phone(Linear n_units→hidden)+ emb_pitch(Embedding 256)
+    + Encoder(attention)+ proj(Conv1d hidden→inter*2)。
+
+    Args(镜像 rvc/model.py::TextEncoder):
+        in_channels: units 维(768)。
+        out_channels: inter_channels(192),proj 输出 2*out。
+        hidden_channels / filter_channels / n_heads / n_layers / kernel_size /
+        p_dropout: Encoder 参数。
+        f0: True 时建 emb_pitch(推理恒 True)。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int,
+        kernel_size: int,
+        p_dropout: float,
+        f0: bool = True,
+    ):
+        super().__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.emb_phone = nn.Linear(in_channels, hidden_channels)
+        self.lrelu = nn.LeakyReLU(0.1)
+        if f0:
+            self.emb_pitch = nn.Embedding(256, hidden_channels)
+        # RVC 默认 window_size=10(so-vits 默认 4;影响 rel-pos emb 形状)
+        from .sovits import Encoder
+
+        self.encoder = Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+            window_size=10,
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def __call__(self, phone, pitch, lengths, skip_head=None):
+        """phone: [B, T, n_units];pitch: [B, T] token;lengths: [B] int。
+
+        Returns:
+            m: [B, T, out] 均值
+            logs: [B, T, out] 对数方差
+            x_mask: [B, T, 1]
+        """
+        if pitch is None:
+            x = self.emb_phone(phone)
+        else:
+            x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        x = x * math.sqrt(self.hidden_channels)   # [b, t, h]
+        x = self.lrelu(x)
+        # torch 转 [B, h, T] → mlx 保持 NLC [B, T, h]
+        x_mask = sequence_mask(lengths, x.shape[1])[..., None].astype(x.dtype)
+        x = self.encoder(x * x_mask, x_mask)
+        if skip_head is not None:
+            head = int(skip_head)
+            x = x[:, head:, :]
+            x_mask = x_mask[:, head:, :]
+        stats = self.proj(x) * x_mask
+        m = stats[..., : self.out_channels]
+        logs = stats[..., self.out_channels:]
+        return m, logs, x_mask
+
+
+# ---------------------------------------------------------------------------
+# RVCModel = SynthesizerTrnMs768NSFsid(RVC v2,推理路径)
+#   units → enc_p → (m, logs) → z_p → flow(reverse)→ z → dec → wav
+# 镜像 rvc/model.py::RVCModel::infer(确定性版:z = m,无采样噪声,便于数值验证)。
+# 注意 enc_q(训练 posterior)不参与推理,未移植。
+# ---------------------------------------------------------------------------
+
+class RVCModel(nn.Module):
+    """RVC v2 推理模型(emb_g + enc_p + flow + dec)。
+
+    默认参数对应 RVC configs/v2/48k.json:inter=192, hidden=192, filter=768,
+    n_heads=2, n_layers=6, kernel=3, upsample_rates=[12,10,2,2],
+    upsample_initial_channel=512, upsample_kernel_sizes=[24,20,4,4],
+    gin_channels=256, sr=48k。
+    """
+
+    def __init__(
+        self,
+        n_units=768,
+        spec_channels=1025,
+        segment_size=20,
+        inter_channels=192,
+        hidden_channels=192,
+        filter_channels=768,
+        n_heads=2,
+        n_layers=6,
+        kernel_size=3,
+        p_dropout=0.1,
+        resblock="1",
+        resblock_kernel_sizes=(3, 7, 11),
+        resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
+        upsample_rates=(12, 10, 2, 2),
+        upsample_initial_channel=512,
+        upsample_kernel_sizes=(24, 20, 4, 4),
+        spk_embed_dim=1,
+        gin_channels=256,
+        sr=48000,
+        is_half=False,
+        vol_embedding=False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.inter_channels = inter_channels
+        self.hidden_channels = hidden_channels
+        self.gin_channels = gin_channels
+        self.spk_embed_dim = spk_embed_dim
+
+        self.enc_p = RVCTextEncoder(
+            n_units,
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )
+        self.dec = GeneratorNSF(
+            inter_channels,
+            resblock,
+            list(resblock_kernel_sizes),
+            [list(d) for d in resblock_dilation_sizes],
+            list(upsample_rates),
+            upsample_initial_channel,
+            list(upsample_kernel_sizes),
+            gin_channels=gin_channels,
+            sr=sr,
+            is_half=is_half,
+        )
+        # flow:同 so-vits(mean_only=True, n_flows=4),复用 sovits 实现
+        from .sovits import ResidualCouplingBlock
+
+        self.flow = ResidualCouplingBlock(
+            inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels
+        )
+        self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
+        self.vol_embedding = vol_embedding
+        if vol_embedding:
+            self.emb_vol = nn.Linear(1, hidden_channels)
+
+    # -- 推理 ---------------------------------------------------------------
+
+    def infer(
+        self,
+        phone,
+        f0,
+        pitch,
+        lengths,
+        spk_id=0,
+        skip_head=None,
+        return_length=None,
+        vol=None,
+    ):
+        """RVC 推理链路(确定性,镜像 rvc/model.py::RVCModel.infer)。
+
+        Args:
+            phone: [B, T, n_units] content 特征(NLC)。
+            f0: [B, T] 连续 f0(Hz)。
+            pitch: [B, T] f0 token(1-255,f0_to_coarse 输出)。
+            lengths: [B] 帧长。
+            spk_id: int 或 [B] speaker id。
+            skip_head / return_length: 流式推理(可选)。
+            vol: [B, T] 音量(仅 vol_embedding)。
+
+        Returns:
+            wav: [B, L, 1](确定性 z = m,无采样噪声)。
+        """
+        g = self.emb_g(spk_id)                    # [B, gin] 或 [gin]
+        if g.ndim == 1:
+            g = g[None, :]                        # [1, gin]
+        g = g[:, None, :]                         # [B, 1, gin](NLC)
+
+        vol_emb = (
+            self.emb_vol(vol[:, :, None])
+            if vol is not None and self.vol_embedding
+            else None
+        )
+        if skip_head is not None and return_length is not None:
+            head = int(skip_head)
+            length = int(return_length)
+            flow_head = max(head - 24, 0)
+            dec_head = head - flow_head
+            m, logs, x_mask = self.enc_p(phone, pitch, lengths, skip_head=flow_head)
+            z_p = (m + mx.exp(logs) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            z = z[:, dec_head : dec_head + length, :]
+            x_mask = x_mask[:, dec_head : dec_head + length, :]
+            f0 = f0[:, head : head + length]
+        else:
+            m, logs, x_mask = self.enc_p(phone, pitch, lengths)
+            z_p = (m + mx.exp(logs) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+        o = self.dec(z * x_mask, f0, g=g)
+        return o
+
+    def f0_to_coarse(self, f0, f0_min=50.0, f0_max=1100.0):
+        """f0 → coarse token(静态方法委托)。"""
+        return f0_to_coarse(f0, f0_min, f0_max)
+
+    # -- ckpt 加载 ----------------------------------------------------------
+
+    @classmethod
+    def from_ckpt(
+        cls,
+        ckpt_path: str | Path,
+        *,
+        config: dict | None = None,
+        key_prefix: str | None = None,
+        strict: bool = False,
+    ):
+        """从 RVC torch ckpt 加载完整推理模型。
+
+        RVC ckpt 权重在 ``generator.*``(usvc 训练格式)或裸键 ``dec.*``/
+        ``enc_p.*``。
+
+        Args:
+            ckpt_path: torch ckpt(lightning/RVC wrapper)。
+            config: RVCModel 构造参数 dict;None 用默认(48k v2)。
+            key_prefix: 权重前缀(如 "generator");None 时自动探测。
+            strict: 是否严格匹配权重键。
+        """
+        from .._convert import load_torch_ckpt_to_mlx
+
+        cfg = config if config is not None else {}
+        obj = cls(**cfg)
+
+        # 探测前缀:优先 generator.(usvc/RVC 训练格式)
+        prefix = key_prefix
+        if prefix is None:
+            from .._convert import load_torch_sd
+
+            raw = load_torch_sd(ckpt_path)
+            if any(k.startswith("generator.") for k in raw):
+                prefix = "generator"
+            else:
+                prefix = ""
+        pref = (prefix + ".") if prefix else ""
+
+        sd = load_torch_ckpt_to_mlx(
+            ckpt_path,
+            convtranspose_keys=GeneratorNSF._ups_weights(
+                ckpt_path,
+                key_prefix=(prefix + ".dec") if prefix else "dec",
+            ),
+        )
+        model_sd = {}
+        for k, v in sd.items():
+            mk = k
+            if pref and k.startswith(pref):
+                mk = k[len(pref):]
+            elif not pref and ("." in k and (k.startswith("enc_p.") or k.startswith("dec.")
+                                             or k.startswith("flow.") or k.startswith("emb_g."))):
+                mk = k.split(".", 1)[-1]
+            # 只保留推理需要的模块(enc_q 训练专用)
+            if mk.startswith("enc_q."):
+                continue
+            model_sd[mk] = v
+        obj.load_weights(list(model_sd.items()), strict=strict)
+        obj.eval()
+        return obj
