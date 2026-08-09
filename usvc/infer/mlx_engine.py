@@ -83,14 +83,11 @@ class MlxInferenceEngine:
         self._build_pipeline()
 
     def _build_pipeline(self):
-        """构建 mlx 特征提取器 + backend 模型 + 可选 vocoder。"""
-        # 特征提取:ContentVec(units,16kHz)
-        from ..hub import ensure_pretrained
-        cvec_path = ensure_pretrained("contentvec/pytorch_model.bin")
-        from ..nn.mlx.contentvec import contentvec_from_hf_ckpt
-        self.cvec = contentvec_from_hf_ckpt(cvec_path)
-        self.cvec.eval()
+        """构建 mlx backend 模型 + 可选 vocoder。
 
+        特征提取(units/f0/rms/uv)由 ``_extract_feats_numpy`` 按需调用
+        ``InferFeatures``(torch 特征管线,backend 无关),此处不预加载。
+        """
         # backend 模型分发
         if self.backend_name == "rvc":
             self._build_rvc()
@@ -175,17 +172,6 @@ class MlxInferenceEngine:
         self.model.eval()
 
     # ------------------------------------------------------------------
-    # 特征提取(mlx)
-    # ------------------------------------------------------------------
-
-    def _extract_units(self, wav_16k: mx.array) -> mx.array:
-        """wav 16kHz [T] -> units [T_frames, 768]。"""
-        # ContentVec 输入 [B, T, 1]
-        x = wav_16k[None, :, None]
-        hidden = self.cvec.encode(x)  # [1, T', 768]
-        return hidden[0]  # [T', 768]
-
-    # ------------------------------------------------------------------
     # convert(接口对齐 torch InferenceEngine)
     # ------------------------------------------------------------------
 
@@ -206,19 +192,26 @@ class MlxInferenceEngine:
         )
 
     def _extract_feats_numpy(self, input_wav, f0_method="rmvpe"):
-        """复用 torch engine 的特征提取(返回 numpy units/f0/rms/uv)。"""
-        if not hasattr(self, "_torch_eng_for_feats"):
-            from .engine import InferenceEngine
-            self._torch_eng_for_feats = InferenceEngine(
-                config_path=self._config_path,
-                ckpt_path=self.ckpt_path,
-                device="cpu", impl="torch",
-            )
-        feats = self._torch_eng_for_feats.features.extract(
-            input_wav, f0_method=f0_method
-        )
-        units = feats["units"].cpu().numpy()  # [T, D]
-        f0 = feats["f0"].cpu().numpy()        # [T]
+        """复用 torch 特征提取管线(绕过 torch model 加载)。
+
+        直接用 ``get_backend(name).feature_spec()`` + ``InferFeatures``,避免
+        ``InferenceEngine`` 构造时强制加载 torch ckpt(与 mlx 场景冲突)。
+        """
+        from ..backends import get_backend
+        from .features import InferFeatures
+        opts = self.cfg.backend_opts
+        spec = get_backend(self.backend_name).feature_spec({
+            k: v for k, v in opts.items()
+            if k in ("units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt",
+                     "uv_policy", "n_mels", "fmin", "fmax",
+                     "rvc_version", "version")
+        })
+        if not hasattr(self, "_feats"):
+            self._feats = InferFeatures(spec, sr=self.sr, hop=self.hop,
+                                        device="cpu", dtype="fp32")
+        feats = self._feats.extract(input_wav, f0_method=f0_method)
+        units = feats["units"].cpu().numpy()
+        f0 = feats["f0"].cpu().numpy()
         rms = feats["rms"].cpu().numpy() if feats["rms"] is not None else None
         return units, f0, rms
 
