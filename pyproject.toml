@@ -17,6 +17,10 @@ dependencies = [
     "lightning>=2.4",        # unified training framework (all backends)
     "schedulefree>=1.4",    # AdamWScheduleFree (rift_dit default optimizer)
     "x-transformers>=2.0",  # RotaryEmbedding (rift_dit DiT)
+    # triton: torch.compile 后端 + 手写 _triton/ kernel。
+    # Linux 上 CUDA 版 torch 自动带 triton，这里显式声明保证 torch.compile 可用。
+    # Windows 无官方 triton wheel，用 environment marker 跳过（见 [gui] extra + _compat.py fallback）。
+    "triton>=3.1; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +30,12 @@ train = [
     "schedulefree>=1.4",
     "tensorboard>=2.15",
 ]
+# Windows: 官方 triton 无 Windows wheel，装 triton-windows（版本需与 torch 严格对应）。
+# 用法（Windows）: pip install usvc[gui]  （或单独 pip install triton-windows）
+# 对应关系: torch 2.4/2.5→triton 3.1, 2.6→3.2, 2.7→3.3, 2.8→3.4, 2.9→3.5, 2.10→3.6
+gui = [
+    "triton-windows>=3.1; sys_platform == 'win32'",
+]
 
 [project.scripts]
 usvc-preprocess = "usvc.cli.preprocess:main"
@@ -34,6 +44,7 @@ usvc-infer = "usvc.cli.infer:main"
 usvc-export = "usvc.cli.export:main"
 usvc-index = "usvc.retrieval.cli:main_index"
 usvc-cluster = "usvc.retrieval.cli:main_cluster"
+usvc-checkenv = "usvc._envcheck:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -200,6 +200,17 @@ class InferenceEngine:
         self.half = half
         self.ckpt_path = str(ckpt_path)
 
+        # channels_last (NHWC) 原生支持需 Ampere+ (sm80+)。更早架构（Turing sm75 /
+        # Volta sm70）无硬件 NHWC 路径，dec_cl/vocoder_cl 反而引入逐层布局转换开销，
+        # 故在 sm<80 上自动降级关闭（TensorCore fp16 加速不受影响）。
+        if device.startswith("cuda"):
+            _cap = torch.cuda.get_device_capability(device)
+            if _cap[0] < 8:
+                dec_cl = False
+                vocoder_cl = False
+        self._dec_cl_req = dec_cl
+        self._vocoder_cl_req = vocoder_cl
+
         # Sample rate / hop for inference features (from config or defaults).
         opts = self.cfg.backend_opts
         self.sr = int(opts.get("sampling_rate", opts.get("sr", _DEFAULT_SR_HOP[self.backend_name][0])))

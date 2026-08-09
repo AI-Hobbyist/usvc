@@ -20,11 +20,60 @@
 
 ## 安装
 
+### Linux（开箱即全速）
+
+```bash
+# 1. 先装 CUDA 版 PyTorch（会自动带 triton）
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 2. 装 usvc —— triton 作为依赖自动装上，全部加速生效
+pip install usvc
+```
+
+完成。`torch.compile`、手写 Triton kernel、channels_last、CUDA graph 全部
+自动生效。运行 `usvc-checkenv` 验证。
+
+### Windows（全速）
+
+```bash
+# 1. 先装 CUDA 版 PyTorch
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 2. 装 usvc 的 [gui] extra（拉取版本匹配的 triton-windows）
+pip install usvc[gui]
+```
+
+`triton-windows` 在 Windows 上提供 `triton` 模块（官方 triton 无 Windows
+wheel）。其版本**必须与 PyTorch 小版本对应**：
+
+| PyTorch | triton-windows |
+|---------|----------------|
+| 2.10    | 3.6            |
+| 2.9     | 3.5            |
+| 2.8     | 3.4            |
+| 2.7     | 3.3            |
+| 2.6     | 3.2            |
+| 2.4–2.5 | 3.1            |
+
+若版本不匹配，`pip install usvc[gui]` 可能拉错版本——此时手动
+`pip install triton-windows==<对应版本>`。
+
+### 仅 CPU / 无 Triton（优雅降级）
+
 ```bash
 pip install usvc
 ```
 
-需要 Python ≥ 3.10，PyTorch ≥ 2.4（CUDA 版本）。
+无 triton 时，`torch.compile` 回退 eager、手写 kernel 回退 PyTorch 原生——
+一切仍**可用**，只是变慢。`import usvc` 时会有一次性提示。恢复全速请装
+triton（Linux：`pip install triton`；Windows：`pip install usvc[gui]`）。
+
+### 验证环境
+
+```bash
+usvc-checkenv
+```
+
+需要 Python ≥ 3.10，NVIDIA GPU sm ≥ 8.0（Ampere+）才能用 channels_last；
+更老的 GPU（Turing/Volta）仍有 TensorCore fp16 + torch.compile 加速。
 
 ### 预训练权重
 

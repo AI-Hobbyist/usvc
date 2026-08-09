@@ -23,11 +23,61 @@ the `reflow_shallow` or `diffusion` enhancer.
 
 ## Install
 
+### Linux (full acceleration out of the box)
+
+```bash
+# 1. Install CUDA build of PyTorch first (brings triton automatically)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 2. Install usvc — triton comes as a dependency, all acceleration enabled
+pip install usvc
+```
+
+That's it. `torch.compile`, hand-written Triton kernels, channels_last, and
+CUDA graphs all work automatically. Run `usvc-checkenv` to verify.
+
+### Windows (full acceleration)
+
+```bash
+# 1. Install CUDA build of PyTorch first
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 2. Install usvc with the [gui] extra (pulls triton-windows, version-matched)
+pip install usvc[gui]
+```
+
+`triton-windows` provides the `triton` module on Windows (official `triton`
+has no Windows wheels). Its version **must match** your PyTorch minor version:
+
+| PyTorch | triton-windows |
+|---------|----------------|
+| 2.10    | 3.6            |
+| 2.9     | 3.5            |
+| 2.8     | 3.4            |
+| 2.7     | 3.3            |
+| 2.6     | 3.2            |
+| 2.4–2.5 | 3.1            |
+
+If the versions mismatch, `pip install usvc[gui]` may pull the wrong one — in
+that case install `triton-windows==<matching>` explicitly.
+
+### CPU-only / no Triton (graceful degradation)
+
 ```bash
 pip install usvc
 ```
 
-Requires Python ≥ 3.10, PyTorch ≥ 2.4 with CUDA.
+Without triton, `torch.compile` falls back to eager and hand-written kernels
+fall back to native PyTorch — everything still **works**, just slower. You'll
+see a one-time hint on `import usvc`. To restore full speed, install triton
+(Linux: `pip install triton`; Windows: `pip install usvc[gui]`).
+
+### Verify your setup
+
+```bash
+usvc-checkenv
+```
+
+Requires Python ≥ 3.10, NVIDIA GPU sm ≥ 8.0 (Ampere+) for channels_last;
+older GPUs (Turing/Volta) still get TensorCore fp16 + torch.compile speedups.
 
 ### Pretrained weights
 
