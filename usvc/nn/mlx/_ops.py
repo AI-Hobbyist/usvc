@@ -201,15 +201,24 @@ def stft_nv(wav, n_fft: int, hop: int, win_length: int, window):
     return mag.T
 
 
-def stft_center(wav, n_fft: int, hop: int, win_length: int, window):
+def stft_center(wav, n_fft: int, hop: int, win_length: int, window,
+                pad_mode: str = "reflect"):
     """``center=True`` 约定的 STFT(复现 RMVPE ``spec.py``)。
 
-    center=True: 两端各补 n_fft//2 零,帧数 = 1 + (L + n_fft - n_fft) // hop
-    (近似 L//hop + 1)。RMVPE 用这个约定,与 FCPE/usvc mel 的 center=False 不同。
+    center=True: 两端各补 n_fft//2。**torch.stft(center=True) 的默认
+    ``pad_mode='reflect'``**,必须用镜像补边而非零补 —— 否则短窗边界帧
+    的 mel 数值完全错位(RMVPE 实测 mel max diff ~2.1 → 修复后 <1e-4)。
+    信号短于 pad 量时(罕见)回退零补(torch 此时会直接报错)。
+
+    帧数 = (L + 2*pad - n_fft) // hop + 1 = L // hop + 1(center 约定)。
+    返回 magnitude ``[n_fft//2+1, frames]``。
     """
     import mlx.core as mx
     pad = n_fft // 2
-    padded = mx.pad(wav, [(pad, pad)])                # 两端零补
+    if pad_mode == "reflect" and pad < wav.shape[-1]:
+        padded = pad_reflect1d(wav, pad, pad)
+    else:
+        padded = mx.pad(wav, [(pad, pad)])            # 零补 fallback(短信号)
     frames = _unfold_frames(padded, win_length, hop)
     frames = frames * window
     spec = mx.fft.rfft(frames, n=n_fft)

@@ -318,7 +318,8 @@ class MelSpectrogram(nn.Module):
     """镜像 ``features/rmvpe/spec.py::MelSpectrogram``。
 
     差异:
-      - torch.stft(center=True) → ``_ops.stft_center``(两端零补 n_fft//2)
+      - torch.stft(center=True) → ``_ops.stft_center``(两端镜像补 n_fft//2,
+        torch center=True 默认 pad_mode='reflect')
       - librosa htk mel basis(htk=True!与 usvc mel.py 的 htk=False 不同)
       - hann 窗与 torch.hann_window 逐位一致(``_ops.hann_window``)
     """
@@ -514,7 +515,13 @@ class RMVPE(nn.Module):
         return self.decode(hidden, thred=thred)
 
     def decode(self, hidden, thred: float = 0.03):
-        """salience (B, T, 360) → f0 (T,)(局部加权 argmax 解码,纯 numpy)。"""
+        """salience (B, T, 360) → f0 (T,)(局部加权 argmax 解码,纯 numpy)。
+
+        镜像 torch ``utils.to_local_average_f0``:加权平均在 **cents** 域,
+        最后 ``f0 = 10 * 2**(cents/1200)`` 换算 Hz。直接返回 cents 会
+        差一个数量级(RMVPE 实测 mlx 6007Hz vs torch 321Hz,实为同一
+        f0 的 cents 值)。
+        """
         import numpy as np
         hidden_np = np.array(hidden)                    # (B, T, 360)
         cents = 20 * np.arange(N_CLASS) + 1997.3794084376191  # bin → cents
@@ -530,7 +537,10 @@ class RMVPE(nn.Module):
                 w = sal[t, start:end]
                 ps = float(np.sum(w * cents[start:end]))
                 ws = float(np.sum(w))
-                f0_b[t] = ps / ws if np.max(w) > thred else 0.0
+                if np.max(w) > thred:
+                    f0_b[t] = 10.0 * 2.0 ** ((ps / ws) / 1200.0)
+                else:
+                    f0_b[t] = 0.0
             out.append(f0_b)
         return out[0] if len(out) == 1 else np.stack(out)
 
