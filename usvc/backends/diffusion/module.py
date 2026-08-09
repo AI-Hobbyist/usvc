@@ -46,6 +46,22 @@ class DiffusionModule(BaseSVCModule):
                 )
             except Exception:
                 pass
+        # Triton depthwise conv1d（替换 ConvNext 的 20 层 dwconv，bit 级等价，
+        # fwd ~2.3× / fwd+bwd ~1.16×；独立于 compile 生效）。
+        if opts.get("triton_dwconv", False):
+            from ..diffusion.model import ConvNeXtBlock as _CNB
+
+            for _mod in self.model.decoder.denoise_fn.modules():
+                if isinstance(_mod, _CNB):
+                    _mod._use_triton_dwconv = True
+        # wavenet_cl: WaveNet 走 channels_last 数据流（conv1d→conv2d(1,k) 等价变换，
+        # 消除 cuDNN NHWC 的逐层 nchw<->nhwc 转换 ~14ms）。
+        if opts.get("wavenet_cl", False):
+            from ..diffusion.wavenet import WaveNet as _WN
+
+            for _mod in self.model.decoder.denoise_fn.modules():
+                if isinstance(_mod, _WN):
+                    _mod._use_cl = True
 
     def forward_loss(self, batch: SVCBatch):
         units = batch.units

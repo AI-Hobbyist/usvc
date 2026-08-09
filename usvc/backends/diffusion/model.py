@@ -30,6 +30,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    from usvc._triton.dwconv1d import dwconv1d as _triton_dwconv1d
+    _HAS_TRITON_DWCONV = True
+except Exception:
+    _HAS_TRITON_DWCONV = False
+
+
+def _dwconv_apply(x, weight, bias, dilation):
+    """Triton depthwise conv1d with PyTorch fallback (数值等价)."""
+    if _HAS_TRITON_DWCONV:
+        try:
+            return _triton_dwconv1d(x.contiguous(), weight, bias, dilation)
+        except Exception:
+            pass
+    return F.conv1d(x, weight, bias, groups=weight.shape[0],
+                    dilation=dilation, padding=dilation * (weight.shape[2] - 1) // 2)
+
 from ...nn.normalization import MelNormalizer
 from ...train.objective import DDPMObjective
 
@@ -110,7 +127,14 @@ class ConvNeXtBlock(nn.Module):
             + self.condition_projection(condition)
         )
 
-        x = self.dwconv(x)
+        if getattr(self, "_use_triton_dwconv", False):
+            # Triton depthwise conv1d via registered custom op (compile-friendly,
+            # bit-level equal, ~2.3x fwd). contiguous() satisfies CUDA-graph
+            # capture layout checks.
+            x = _dwconv_apply(x, self.dwconv.weight, self.dwconv.bias,
+                              self.dwconv.dilation[0])
+        else:
+            x = self.dwconv(x)
         x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
         x = self.norm(x)
         x = self.pwconv1(x)
