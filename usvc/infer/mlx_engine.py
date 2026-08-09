@@ -59,12 +59,23 @@ class MlxInferenceEngine:
         ckpt_path: str | Path,
         vocoder_dir: str | Path | None = None,
         device: str = "gpu",
+        compile_model: bool = True,
     ):
         if device == "gpu":
             mx.set_default_device(mx.gpu)
+            # M4 16GB:iOS 风格限制会 OOM,改用 macOS 合理上限。
+            # wired memory 允许 GPU 常驻大量权重;cache 控制中间结果。
+            # 0 = 不限制(用系统默认管理),但设 wired 上限避免独占。
+            try:
+                mx.set_memory_limit(0)      # 不设 active 上限
+                mx.set_cache_limit(512 * 1024 * 1024)  # 512MB 计算缓存
+                mx.set_wired_limit(4 * 1024 * 1024 * 1024)  # 4GB wired
+            except Exception:
+                pass  # 旧版 mlx 或 CPU 无效
         else:
             mx.set_default_device(mx.cpu)
 
+        self.compile_model = compile_model
         # 解析 config(纯 yaml,无 torch 依赖)
         from ..train.config import TrainConfig
         self.cfg = TrainConfig.from_yaml(config_path)
@@ -81,6 +92,36 @@ class MlxInferenceEngine:
 
         # 构建 mlx 推理管线
         self._build_pipeline()
+        # 编译模型 forward(图融合,降低峰值内存 + 加速)
+        if compile_model:
+            self._compile_models()
+
+    def _compile_models(self):
+        """编译 model forward(mx.compile 图融合)。
+
+        对 backend model 和 vocoder 的核心计算路径编译。compile 后首次调用
+        会触发图构建(预热),后续调用复用编译图,显著降低峰值内存和加速。
+        """
+        import functools
+        # backend model:包装 infer/sample 的底层计算
+        m = getattr(self, "model", None)
+        if m is not None and hasattr(m, "__call__"):
+            # 不直接 compile infer(含 spk_id 分支/动态逻辑),
+            # 而是让 model 内部的 nn.Module __call__ 走 compile。
+            # mlx nn.Module 的子模块调用会进 compile 边界。
+            try:
+                m._compiled_call = mx.compile(m.__call__)
+                m.__call__ = m._compiled_call
+            except Exception:
+                pass
+        # vocoder
+        v = getattr(self, "vocoder", None)
+        if v is not None:
+            try:
+                v._compiled_infer = mx.compile(v.infer)
+                v.infer = v._compiled_infer
+            except Exception:
+                pass
 
     def _build_pipeline(self):
         """构建 mlx backend 模型 + 可选 vocoder。
@@ -172,6 +213,34 @@ class MlxInferenceEngine:
         self.model.eval()
 
     # ------------------------------------------------------------------
+    # 分块推理(内存与时长解耦)
+    # ------------------------------------------------------------------
+
+    def _max_chunk_frames(self) -> int:
+        """每块最大帧数(wav-domain 更小:O(T) wav 分配;mel-domain 可大)。
+
+        经验值:wav-domain(GAN vocoder)在 ~5s 内峰值可控;
+        mel-domain(扩散/flow)中间 mel 小,可到 ~15s。
+        """
+        if self.backend_name in ("rvc", "sovits"):
+            return 2 * self.sr // self.hop  # ~2s(wav O(T),实测 2s 为速度/内存最优)
+        return 15 * self.sr // self.hop   # mel-domain ~15s
+
+    def _chunk_indices(self, T: int, chunk: int, overlap: int = 0):
+        """生成 (start, end) 分块索引,可选重叠(用于交叉淡化)。"""
+        if T <= chunk:
+            return [(0, T)]
+        idx = []
+        start = 0
+        while start < T:
+            end = min(start + chunk, T)
+            idx.append((start, end))
+            if end >= T:
+                break
+            start = end - overlap
+        return idx
+
+    # ------------------------------------------------------------------
     # convert(接口对齐 torch InferenceEngine)
     # ------------------------------------------------------------------
 
@@ -234,68 +303,65 @@ class MlxInferenceEngine:
         return wav
 
     def _convert_mel_domain(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """mel-domain pipeline:feats -> backend.sample -> mel -> vocoder -> wav。"""
+        """mel-domain pipeline:feats -> 分块 sample -> 分块 vocoder -> 拼接 wav。"""
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
-        # pitch shift
         if trans != 0:
             f0_np = f0_np * (2.0 ** (trans / 12.0))
-        # volume:用 rms(若无填 1.0)
         vol_np = rms_np if rms_np is not None else np.ones_like(f0_np) * 0.5
-        units = mx.array(units_np)[None]   # [1, T, D]
-        f0 = mx.array(f0_np)[None]        # [1, T]
-        vol = mx.array(vol_np)[None]      # [1, T]
-        # backend.sample -> mel [1, T, M]
+        T = units_np.shape[0]
+        chunk = self._max_chunk_frames()
+        chunks = self._chunk_indices(T, chunk)
+        wav_parts = []
+        for start, end in chunks:
+            u = mx.array(units_np[start:end])[None]
+            f = mx.array(f0_np[start:end])[None]
+            v = mx.array(vol_np[start:end])[None]
+            mel = self._run_mel_backend_sample(u, f, v, spk, **kwargs)
+            mel = mel if mel.shape[0] == 1 else mel[0:1]
+            wav = np.array(self.vocoder.infer(mel, f)).reshape(-1).astype(np.float32)
+            wav_parts.append(wav)
+            mx.eval(mel)
+        return np.concatenate(wav_parts)
+
+    def _run_mel_backend_sample(self, units, f0, vol, spk, **kwargs):
+        """调 backend.sample -> mel(由具体 backend 分发)。"""
         be = self.backend_name
         if be == "diffusion":
-            speedup = int(kwargs.get("diffusion_speedup", 10))
-            method = kwargs.get("diffusion_method", "ddim")
-            k_step = int(kwargs.get("k_step", 1000))
-            mel = self.model.sample(units, f0, vol, spk_id=mx.array([spk]),
-                                    infer_speedup=speedup, method=method,
-                                    k_step=k_step)
+            return self.model.sample(units, f0, vol, spk_id=mx.array([spk]),
+                infer_speedup=int(kwargs.get("diffusion_speedup", 10)),
+                method=kwargs.get("diffusion_method", "ddim"),
+                k_step=int(kwargs.get("k_step", 1000)))
         elif be == "ddsp6":
-            mel = self.model.sample(units, f0, vol, spk_id=spk,
-                                    infer_step=int(kwargs.get("steps", 10)),
-                                    method=kwargs.get("method", "euler"))
+            return self.model.sample(units, f0, vol, spk_id=spk,
+                infer_step=int(kwargs.get("steps", 10)),
+                method=kwargs.get("method", "euler"))
         else:  # reflow_vae
-            mel = self.model.sample(units, f0, vol, spk_id=spk,
-                                    infer_step=int(kwargs.get("steps", 10)))
-        # vocoder: mel -> wav
-        mel = mel if mel.shape[0] == 1 else mel[0:1]
-        f0_voc = f0  # [1, T]
-        wav_mlx = np.array(self.vocoder.infer(mel, f0_voc))  # [1, L, 1]
-        return wav_mlx.reshape(-1).astype(np.float32)
+            return self.model.sample(units, f0, vol, spk_id=spk,
+                infer_step=int(kwargs.get("steps", 10)))
 
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """RVC 端到端:feats(torch engine) -> RVCModel.infer(mlx) -> wav。
-
-        复用 torch ``InferenceEngine`` 的特征提取(units/f0/rms/uv),
-        pitch shift 与 torch 一致,最后 mlx ``RVCModel.infer``。
-        torch engine 仅用于特征提取(model forward 由 mlx 接管)。
-        """
+        """RVC 端到端:feats -> 分块 RVCModel.infer -> 拼接 wav。"""
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, _ = self._extract_feats_numpy(input_wav, f0_method)
-        units = units_np
-        f0 = f0_np
-
-        # 2. Pitch shift
         if trans != 0:
-            f0 = f0 * (2.0 ** (trans / 12.0))
-
-        # 3. f0 -> pitch token(coarse,与 RVC torch infer 一致)
+            f0_np = f0_np * (2.0 ** (trans / 12.0))
         from ..nn.mlx.backends.rvc import f0_to_coarse
-        pitch = np.array(f0_to_coarse(mx.array(f0)))  # [T] int32 numpy
-
-        # 4. mlx model.infer
-        units_mlx = mx.array(units)[None]      # [1, T, 768]
-        f0_mlx = mx.array(f0)[None]           # [1, T]
-        pitch_mlx = mx.array(pitch.astype(np.int32))[None]  # [1, T]
-        lengths = mx.array([units.shape[0]])
-        wav_mlx = np.array(self.model.infer(
-            units_mlx, f0_mlx, pitch_mlx, lengths, spk_id=spk
-        ))
-        # [1, L, 1] -> [L]
-        return wav_mlx.reshape(-1).astype(np.float32)
+        pitch_np = np.array(f0_to_coarse(mx.array(f0_np))).astype(np.int32)
+        T = units_np.shape[0]
+        # 分块推理(避免长音频 OOM)
+        chunk = self._max_chunk_frames()
+        chunks = self._chunk_indices(T, chunk)
+        wav_parts = []
+        for start, end in chunks:
+            u = mx.array(units_np[start:end])[None]
+            f = mx.array(f0_np[start:end])[None]
+            p = mx.array(pitch_np[start:end])[None]
+            ln = mx.array([end - start])
+            o = self.model.infer(u, f, p, ln, spk_id=spk)
+            o_np = np.array(o).reshape(-1).astype(np.float32)
+            wav_parts.append(o_np)
+            mx.eval(o)  # 触发计算,允许释放中间结果
+        return np.concatenate(wav_parts)
