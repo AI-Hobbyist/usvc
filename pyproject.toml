@@ -56,5 +56,11 @@ exclude = [
     "usvc/features/fcpe/assets",  # 42MB FCPE weight — download separately
 ]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "AGENTS.md",      # 本地 agent 约束（含硬件/路径信息，不发布）
+    ".pi-subagents",  # pi agent 会话产物
+]
+
 [tool.uv]
 # torch 通过 PyTorch index 安装(见 [[tool.uv.index]])

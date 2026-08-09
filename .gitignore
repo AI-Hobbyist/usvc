@@ -41,3 +41,10 @@ meta.json
 logs
 usvc-spec
 experiments
+configs
+
+# Local-only planning/profiling docs (never committed, never pushed)
+docs/
+*.local.md
+# Local agent constraints (never published)
+AGENTS.md
