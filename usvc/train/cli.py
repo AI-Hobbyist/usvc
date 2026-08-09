@@ -76,6 +76,10 @@ def run_training(cfg: TrainConfig, resume: str | None = None, device: str | None
     import torch as _t
     _t.backends.cuda.matmul.allow_tf32 = True
     _t.backends.cudnn.allow_tf32 = True
+    # cudnn.benchmark: 让 cuDNN 为每个 conv 形状 benchmark 选最优算法（含 TensorCore dgrad）。
+    # 实测 rvc dgrad 290→111ms (62%↓)，总步 712→626ms (1.14×)；所有 conv 后端普遍受益。
+    # 代价：首次 forward 慢（benchmark 各算法），但训练形状固定，后续都走最优算法。
+    _t.backends.cudnn.benchmark = True
 
     from ..backends import get_backend
 

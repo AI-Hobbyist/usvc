@@ -68,6 +68,7 @@ sr2sr = {
 # ---------------------------------------------------------------------------
 
 
+@torch.compiler.disable
 class SineGen(torch.nn.Module):
     """RVC sine generator (harmonic_num harmonics above F0)."""
 
@@ -142,6 +143,7 @@ class SineGen(torch.nn.Module):
         return sine_waves, uv, noise
 
 
+@torch.compiler.disable
 class SourceModuleHnNSF(torch.nn.Module):
     """RVC source module for hn-nsf (returns (sine_merge, None, None))."""
 
