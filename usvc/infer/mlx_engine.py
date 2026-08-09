@@ -342,7 +342,11 @@ class MlxInferenceEngine:
                 infer_step=int(kwargs.get("steps", 10)))
 
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """RVC 端到端:feats -> 分块 RVCModel.infer -> 拼接 wav。"""
+        """RVC 端到端:feats -> 固定块 RVCModel.infer(compile 复用) -> 拼接 wav。
+
+        固定块大小(对齐)让 mx.compile 只编译一次,后续块复用图,
+        避免 compile 针对每个不同长度重建(3s 音频 4s -> 0.5s)。
+        """
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, _ = self._extract_feats_numpy(input_wav, f0_method)
@@ -351,17 +355,30 @@ class MlxInferenceEngine:
         from ..nn.mlx.backends.rvc import f0_to_coarse
         pitch_np = np.array(f0_to_coarse(mx.array(f0_np))).astype(np.int32)
         T = units_np.shape[0]
-        # 分块推理(避免长音频 OOM)
-        chunk = self._max_chunk_frames()
-        chunks = self._chunk_indices(T, chunk)
+        tile = self._max_chunk_frames()
+        wav_hop = self.hop * self._rvc_upsample_total()  # 每帧对应样本数
         wav_parts = []
-        for start, end in chunks:
-            u = mx.array(units_np[start:end])[None]
-            f = mx.array(f0_np[start:end])[None]
-            p = mx.array(pitch_np[start:end])[None]
-            ln = mx.array([end - start])
+        for start in range(0, T, tile):
+            end = min(start + tile, T)
+            block_len = end - start
+            # pad 到 tile(compile 复用),infer 后裁回 block_len
+            u = np.pad(units_np[start:end], ((0, tile - block_len), (0, 0)))
+            f = np.pad(f0_np[start:end], (0, tile - block_len))
+            p = np.pad(pitch_np[start:end], (0, tile - block_len))
+            u = mx.array(u)[None]; f = mx.array(f)[None]
+            p = mx.array(p)[None]; ln = mx.array([tile])
             o = self.model.infer(u, f, p, ln, spk_id=spk)
             o_np = np.array(o).reshape(-1).astype(np.float32)
-            wav_parts.append(o_np)
-            mx.eval(o)  # 触发计算,允许释放中间结果
+            wav_parts.append(o_np[:block_len * wav_hop])
+            mx.eval(o)
         return np.concatenate(wav_parts)
+
+    def _rvc_upsample_total(self) -> int:
+        """RVC GeneratorNSF 总上采样率(帧->样本)。"""
+        # rvc v2 48k: upsample_rates = [12,10,2,2] -> 480
+        opts = self.cfg.backend_opts
+        rates = opts.get("upsample_rates", [12, 10, 2, 2])
+        n = 1
+        for r in rates:
+            n *= int(r)
+        return n
