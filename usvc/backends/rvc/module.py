@@ -73,6 +73,8 @@ class RVCModule(BaseGANModule):
         # (1) discriminator 的 Conv2d 权重转 channels_last，+ patch DiscriminatorP.forward
         #     让输入也走 channels_last → 消除 nchw↔nhwc 转换胶水（实测 −5%）。
         # (2) torch.compile enc_p/dec（m_source 已 @disable 避 cumsum blocker）。
+        # (3) batched_disc：real+fake 拼成 2B 一次过判别器 → 小 conv 填满 SM，
+        #     TFLOPS 利用率提升（37.8%→46.1%）。wall time 持平但有效计算占比上升。
         if opts.get("channels_last_disc", False):
             import torch.nn as _nn
             for _mod in self.discriminator.modules():
@@ -106,6 +108,21 @@ class RVCModule(BaseGANModule):
             self.generator.dec = torch.compile(
                 self.generator.dec, mode=opts.get("compile_mode", "default"),
                 dynamic=False)
+        # (3) batched_disc: real+fake 拼成 2B 一次过判别器。
+        # ⚠ 实测 wall time 负优化（计算量翻倍 > 效率提升），保留开关但默认关、不推荐。
+        # monkey-patch MultiPeriodDiscriminatorV2.forward（数学等价：conv 是 batch 维独立的）。
+        if opts.get("batched_disc", False):
+            from .model import MultiPeriodDiscriminatorV2 as _MPD
+            def _batched_forward(_self, y, y_hat):
+                B = y.shape[0]
+                cat = torch.cat([y, y_hat], dim=0)
+                y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+                for d in _self.discriminators:
+                    out, fmap = d(cat)
+                    y_d_rs.append(out[:B]); y_d_gs.append(out[B:])
+                    fmap_rs.append([f[:B] for f in fmap]); fmap_gs.append([f[B:] for f in fmap])
+                return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+            _MPD.forward = _batched_forward
 
         self.c_mel = opts.get("c_mel", 45.0)
         self.c_kl = opts.get("c_kl", 1.0)
