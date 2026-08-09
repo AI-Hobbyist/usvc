@@ -31,6 +31,16 @@ def _torch_cuda_available() -> bool:
         return False
 
 
+def _mlx_available() -> bool:
+    """探测 MLX 是否可用(安装 + Metal 可计算)。"""
+    try:
+        from ._device import mlx_available
+
+        return mlx_available()
+    except Exception:
+        return False
+
+
 def check_once() -> None:
     """import usvc 时调用：triton 缺失则提示一次（跨平台差异化建议）。"""
     global _warned
@@ -66,6 +76,7 @@ def full_report() -> dict:
         "torch": torch.__version__,
         "torch_cuda": torch.cuda.is_available(),
         "triton": _has_triton(),
+        "mlx": _mlx_available(),
     }
     if info["torch_cuda"]:
         cap = torch.cuda.get_device_capability()
@@ -121,6 +132,7 @@ def main() -> int:
         print(f"  GPU:           {info['gpu']}")
         print(f"  计算能力:      sm{info['compute_capability']}")
     print(f"  triton:        {'✓' if info['triton'] else '✗ 缺失'}")
+    print(f"  mlx:           {'✓' if info['mlx'] else '✗ 未安装/不可用'}")
     print(f"  torch.compile: {'✓' if info['compile_ok'] else '✗ 回退 eager'}")
     print(f"  channels_last: {'✓' if info['channels_last_ok'] else '△ 降级'}")
     print("-" * 56)

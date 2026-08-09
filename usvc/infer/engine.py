@@ -191,7 +191,25 @@ class InferenceEngine:
         compile_graph: bool = False,
         dec_cl: bool = True,
         vocoder_cl: bool = True,
+        impl: str | None = None,
     ) -> None:
+        # ---- MLX 后端分发(与 torch 并列,torch 路径零改动)----
+        # impl='mlx'(或 USVC_BACKEND=mlx 且 impl='auto')时,委托给
+        # MlxInferenceEngine,跳过下面的 torch 初始化。
+        from .._device import resolve_impl
+        resolved_impl = resolve_impl(impl)
+        if resolved_impl == "mlx":
+            from .mlx_engine import MlxInferenceEngine
+            self._mlx_delegate = MlxInferenceEngine(
+                config_path=config_path,
+                ckpt_path=ckpt_path,
+                vocoder_dir=vocoder_dir,
+                device=device if device != "cuda" else "gpu",
+            )
+            self.impl = "mlx"
+            return
+        self.impl = "torch"
+
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
         if self.backend_name not in MEL_DOMAIN + WAV_DOMAIN:
@@ -530,6 +548,8 @@ class InferenceEngine:
             vocoder). The model sees f0/(2^(shift/12)) while the vocoder sees
             the original f0: pitch stays, register shifts. 0.0 = off.
         """
+        if self.impl == "mlx":
+            return self._mlx_delegate.convert(input_wav, spk=spk, trans=trans)
         if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError(
                 "shallow_diffusion=True requires diffusion_ckpt+diffusion_config "
