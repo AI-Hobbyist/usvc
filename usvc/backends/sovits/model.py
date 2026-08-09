@@ -927,6 +927,7 @@ def padDiff(x):
     return F.pad(F.pad(x, (0, 0, -1, 1), "constant", 0) - x, (0, 0, 0, -1), "constant", 0)
 
 
+@torch.compiler.disable
 class SineGen(torch.nn.Module):
     """Sine generator for NSF-HiFiGAN."""
 
@@ -1095,6 +1096,7 @@ class Generator(torch.nn.Module):
         self.onnx = False
         self._arange_cache = None  # cached [1..upp] for fast_sinegen
 
+    @torch.compiler.disable
     def fast_sinegen(self, f0):
         """Frame-domain sine generator (mathematically equivalent to the
         sample-domain cumsum path, but ~200x faster).

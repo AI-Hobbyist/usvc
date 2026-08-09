@@ -53,6 +53,44 @@ class SoVITSModule(BaseGANModule):
             use_spectral_norm=opts.get("use_spectral_norm", False),
         )
 
+        # --- sovits 训练加速（不改语义；与 rvc 同套策略）---
+        # (1) channels_last_disc: discriminator 的 Conv2d 走 channels_last，消除 nchw↔nhwc 胶水。
+        # (2) compile_enc_dec: torch.compile enc_p/dec（SineGen 已 @disable 避 cumsum blocker）。
+        if opts.get("channels_last_disc", False):
+            import torch.nn as _nn
+            for _mod in self.discriminator.modules():
+                if isinstance(_mod, _nn.Conv2d):
+                    _mod.weight.data = _mod.weight.data.to(
+                        memory_format=torch.channels_last)
+            from .model import DiscriminatorP as _DP
+            _LRELU = 0.1
+            def _cl_forward(_self, x):
+                import torch.nn.functional as _F
+                fmap = []; b, c, t = x.shape
+                period = _self.period
+                if t % period != 0:
+                    n_pad = period - (t % period)
+                    x = _F.pad(x, (0, n_pad), "reflect"); t = t + n_pad
+                x = x.view(b, c, t // period, period).to(
+                    memory_format=torch.channels_last)
+                for l in _self.convs:
+                    x = l(x).to(memory_format=torch.channels_last)
+                    x = _F.leaky_relu(x, _LRELU); fmap.append(x)
+                x = _self.conv_post(x); fmap.append(x)
+                x = torch.flatten(x, 1, -1)
+                return x, fmap
+            _DP.forward = _cl_forward
+        if opts.get("compile_enc_dec", False):
+            self.generator.enc_p = torch.compile(
+                self.generator.enc_p, mode=opts.get("compile_mode", "default"),
+                dynamic=False)
+            self.generator.dec = torch.compile(
+                self.generator.dec, mode=opts.get("compile_mode", "default"),
+                dynamic=False)
+            self.generator.flow = torch.compile(
+                self.generator.flow, mode=opts.get("compile_mode", "default"),
+                dynamic=False)
+
         # Loss weights
         self.c_mel = opts.get("c_mel", 45.0)
         self.c_kl = opts.get("c_kl", 1.0)
