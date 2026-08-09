@@ -501,17 +501,20 @@ class GaussianDiffusion(nn.Module):
                     x, mx.full((b,), i, dtype=mx.int32),
                     infer_speedup, cond=cond,
                 )
+                mx.eval(x)
         elif method == "ddim":
             for i in range(t - infer_speedup, -1, -infer_speedup):
                 x = self.p_sample_ddim(
                     x, mx.full((b,), i, dtype=mx.int32),
                     infer_speedup, cond=cond,
                 )
+                mx.eval(x)  # 强制计算,释放上步中间结果(降峰值)
         elif method == "ddpm":
             for i in range(t - 1, -1, -1):
                 x = self.p_sample(
                     x, mx.full((b,), i, dtype=mx.int32), cond
                 )
+                mx.eval(x)
         else:
             raise NotImplementedError(method)
 

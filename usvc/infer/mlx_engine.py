@@ -228,9 +228,10 @@ class MlxInferenceEngine:
             import os
             tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC", "0.5"))
             return int(tile_sec * self.sr / self.hop)
-        # mel-domain:vocoder O(T),用 USVC_MLX_TILE_SEC_MEL 控制(默认 5s)。
+        # mel-domain:vocoder O(T) 内存大,用 USVC_MLX_TILE_SEC_MEL 控制(默认 3s)。
+        # 实测 vocoder:0.6s=670MB, 1.7s=1744MB。扩散分块开销大,默认 3s 平衡。
         import os
-        tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC_MEL", "5.0"))
+        tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC_MEL", "3.0"))
         return int(tile_sec * self.sr / self.hop)
 
     def _chunk_indices(self, T: int, chunk: int, overlap: int = 0):
@@ -344,26 +345,62 @@ class MlxInferenceEngine:
         return wav
 
     def _convert_mel_domain(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """mel-domain pipeline:feats -> 分块 sample -> 分块 vocoder -> 拼接 wav。"""
+        """mel-domain:feats -> mel sample -> vocoder -> wav。
+
+        ddsp6:分块 sample+vocoder(DDSP 谱路径不适合全 mel)。
+        diffusion/reflow_vae:全 mel sample + vocoder 0.5s 分块(峰值最优)。
+        """
         import mlx.core as mx
+        if self.backend_name == "ddsp6":
+            return self._convert_mel_domain_chunked(input_wav, spk, trans, **kwargs)
+        return self._convert_mel_domain_full_sample(input_wav, spk, trans, **kwargs)
+
+    def _convert_mel_domain_chunked(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
+        """分块 sample+vocoder(ddsp6):每块独立 sample,小 tile 控峰值。"""
+        import mlx.core as mx, os
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
         if trans != 0:
             f0_np = f0_np * (2.0 ** (trans / 12.0))
         vol_np = rms_np if rms_np is not None else np.ones_like(f0_np) * 0.5
+        if hasattr(self, "_mlx_feats") and not os.environ.get("USVC_MLX_KEEP_FEATS"):
+            del self._mlx_feats; self._mlx_feats = None
         T = units_np.shape[0]
-        chunk = self._max_chunk_frames()
-        chunks = self._chunk_indices(T, chunk)
+        chunk = int(1.0 * self.sr / self.hop)  # 1s tile
         wav_parts = []
-        for start, end in chunks:
-            u = mx.array(units_np[start:end])[None]
-            f = mx.array(f0_np[start:end])[None]
-            v = mx.array(vol_np[start:end])[None]
+        for s in range(0, T, chunk):
+            e = min(s + chunk, T)
+            u = mx.array(units_np[s:e])[None]; f = mx.array(f0_np[s:e])[None]
+            v = mx.array(vol_np[s:e])[None]
             mel = self._run_mel_backend_sample(u, f, v, spk, **kwargs)
             mel = mel if mel.shape[0] == 1 else mel[0:1]
-            wav = np.array(self.vocoder.infer(mel, f)).reshape(-1).astype(np.float32)
-            wav_parts.append(wav)
-            mx.eval(mel)
+            w = np.array(self.vocoder.infer(mel, f)).reshape(-1).astype(np.float32)
+            wav_parts.append(w); mx.eval(mel)
+        return np.concatenate(wav_parts)
+
+    def _convert_mel_domain_full_sample(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
+        """全 mel sample + vocoder 0.5s 分块(diffusion/reflow_vae:峰值最优)。"""
+        import os, mlx.core as mx
+        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
+        units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
+        if trans != 0:
+            f0_np = f0_np * (2.0 ** (trans / 12.0))
+        vol_np = rms_np if rms_np is not None else np.ones_like(f0_np) * 0.5
+        mx.clear_cache()
+        if hasattr(self, "_mlx_feats") and not os.environ.get("USVC_MLX_KEEP_FEATS"):
+            del self._mlx_feats; self._mlx_feats = None
+        units = mx.array(units_np)[None]; f0 = mx.array(f0_np)[None]; vol = mx.array(vol_np)[None]
+        mel = self._run_mel_backend_sample(units, f0, vol, spk, **kwargs)
+        mel_np = np.array(mel)
+        mx.clear_cache()
+        T = mel_np.shape[1]
+        voc_tile = max(1, int(0.5 * self.sr / self.hop))
+        wav_parts = []
+        for s in range(0, T, voc_tile):
+            e = min(s + voc_tile, T)
+            m = mx.array(mel_np[0:1, s:e]); f_blk = mx.array(f0_np[s:e])[None]
+            w = np.array(self.vocoder.infer(m, f_blk)).reshape(-1).astype(np.float32)
+            wav_parts.append(w)
         return np.concatenate(wav_parts)
 
     def _run_mel_backend_sample(self, units, f0, vol, spk, **kwargs):
