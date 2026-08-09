@@ -306,6 +306,16 @@ class MlxInferenceEngine:
                     uv_policy=uv_policy,
                     units_layer=units_layer,
                 )
+                # compile 特征器核心(加速重复调用)
+                if self.compile_model:
+                    try:
+                        self._mlx_feats.cvec.encode = mx.compile(self._mlx_feats.cvec.encode)
+                    except Exception:
+                        pass
+                    try:
+                        self._mlx_feats.rmvpe.model.__call__ = mx.compile(self._mlx_feats.rmvpe.model.__call__)
+                    except Exception:
+                        pass
             feats = self._mlx_feats.extract(input_wav, f0_method=f0_method)
             units = np.array(feats["units"], dtype=np.float32)
             f0 = np.asarray(feats["f0"], dtype=np.float32)
@@ -452,7 +462,6 @@ class MlxInferenceEngine:
         for start in range(0, T, tile):
             end = min(start + tile, T)
             block_len = end - start
-            # pad 到 tile(compile 复用),infer 后裁回 block_len
             u = np.pad(units_np[start:end], ((0, tile - block_len), (0, 0)))
             f = np.pad(f0_np[start:end], (0, tile - block_len))
             p = np.pad(pitch_np[start:end], (0, tile - block_len))
@@ -461,7 +470,7 @@ class MlxInferenceEngine:
             o = self.model.infer(u, f, p, ln, spk_id=spk)
             o_np = np.array(o).reshape(-1).astype(np.float32)
             wav_parts.append(o_np[:block_len * wav_hop])
-            mx.eval(o)
+            mx.eval(o)  # 释放中间结果(控峰值)
         return np.concatenate(wav_parts)
 
     def _rvc_upsample_total(self) -> int:
