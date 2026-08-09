@@ -28,6 +28,48 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+
+# ---------------------------------------------------------------------------
+# channels_last 推理辅助（与 usvc/backends/rvc/model.py 同款：Conv1d ->
+# Conv2d(1,k) 在 [B,C,1,T] channels_last 上执行，消除逐层 nchw<->nhwc 转换）。
+# ---------------------------------------------------------------------------
+_WN_CACHE: dict[tuple[object, int, int], torch.Tensor] = {}
+
+
+def _wn_weight(conv):
+    """weight_norm 包装 conv 的归一化权重（否则返回原始权重）。"""
+    if hasattr(conv, "weight_g") and hasattr(conv, "weight_v"):
+        key = (conv, conv.weight_v._version, conv.weight_g._version)
+        w = _WN_CACHE.get(key)
+        if w is None:
+            # 必须用 torch._weight_norm（与模块 forward 完全一致）；
+            # 手写 v*(g/||v||) fp32 下偏差达 0.16。
+            w = torch._weight_norm(conv.weight_v, conv.weight_g, 0)
+            _WN_CACHE[key] = w
+        return w
+    return conv.weight
+
+
+def _conv2d_cl(x4, conv):
+    """Conv1d -> Conv2d(1,k) on channels_last [B,C,1,T] (weight_norm-safe)."""
+    w = _wn_weight(conv)[:, :, None, :]
+    return F.conv2d(
+        x4, w, conv.bias,
+        stride=(1, conv.stride[0]),
+        padding=(0, conv.padding[0]),
+        dilation=(1, conv.dilation[0]),
+    )
+
+
+def _convT2d_cl(x4, conv):
+    """ConvTranspose1d -> ConvTranspose2d(1,k) on channels_last."""
+    w = _wn_weight(conv)[:, :, None, :]
+    return F.conv_transpose2d(
+        x4, w, conv.bias,
+        stride=(1, conv.stride[0]),
+        padding=(0, conv.padding[0]),
+        output_padding=(0, conv.output_padding[0]),
+    )
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
@@ -112,6 +154,16 @@ class ResBlock1(torch.nn.Module):
             x = xt + x
         return x
 
+    def forward_cl(self, x):
+        """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            xt = _conv2d_cl(xt, c1)
+            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            xt = _conv2d_cl(xt, c2)
+            x = xt + x
+        return x
+
     def remove_weight_norm(self):
         for l in self.convs1:
             remove_weight_norm(l)
@@ -135,6 +187,14 @@ class ResBlock2(torch.nn.Module):
         for c in self.convs:
             xt = F.leaky_relu(x, LRELU_SLOPE)
             xt = c(xt)
+            x = xt + x
+        return x
+
+    def forward_cl(self, x):
+        """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
+        for c in self.convs:
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            xt = _conv2d_cl(xt, c)
             x = xt + x
         return x
 
@@ -273,6 +333,7 @@ class Generator(torch.nn.Module):
             self.noise_convs = nn.ModuleList()
 
         self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
+        self._use_cl = False  # engine 推理时置 True 走 forward_cl
 
         self.ups = nn.ModuleList()
         self.resblocks = nn.ModuleList()
@@ -312,6 +373,8 @@ class Generator(torch.nn.Module):
         return sines
 
     def forward(self, x, f0):
+        if self._use_cl:
+            return self.forward_cl(x, f0)
         if self.mini_nsf:
             har_source = self.fastsinegen(f0)
         else:
@@ -341,6 +404,39 @@ class Generator(torch.nn.Module):
         x = self.conv_post(x)
         x = torch.tanh(x)
         return x
+
+    def forward_cl(self, x, f0):
+        """channels_last 版（x: [B,M,1,T] CL，等价于 forward）。"""
+        if self.mini_nsf:
+            har_source = self.fastsinegen(f0)
+        else:
+            har_source = self.m_source(f0, self.upp).transpose(1, 2)
+        hs4 = har_source[:, :, None, :].to(memory_format=torch.channels_last)
+        x4 = x[:, :, None, :].to(memory_format=torch.channels_last)
+        x = _conv2d_cl(x4, self.conv_pre)
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, LRELU_SLOPE)
+            x = _convT2d_cl(x, self.ups[i])
+            if not self.mini_nsf:
+                x_source = _conv2d_cl(hs4, self.noise_convs[i])
+                minl = min(x.size(3), x_source.size(3))
+                x = x[:, :, :, :minl] + x_source[:, :, :, :minl]
+            elif i == 1:
+                x_source = _conv2d_cl(hs4, self.source_conv)
+                minl = min(x.size(3), x_source.size(3))
+                x = x[:, :, :, :minl] + x_source[:, :, :, :minl]
+            xs = None
+            for j in range(self.num_kernels):
+                rb = self.resblocks[i * self.num_kernels + j]
+                if xs is None:
+                    xs = rb.forward_cl(x)
+                else:
+                    xs = xs + rb.forward_cl(x)
+            x = xs / self.num_kernels
+        x = F.leaky_relu(x)
+        x = _conv2d_cl(x, self.conv_post)
+        x = torch.tanh(x)
+        return x[:, :, 0, :]  # [B,1,T]（view，无拷贝，与 forward 同形状）
 
     def remove_weight_norm(self):
         for l in self.ups:

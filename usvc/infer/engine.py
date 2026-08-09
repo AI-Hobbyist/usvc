@@ -190,6 +190,7 @@ class InferenceEngine:
         t_start: float = 0.5,
         compile_graph: bool = False,
         dec_cl: bool = True,
+        vocoder_cl: bool = True,
     ) -> None:
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
@@ -226,29 +227,38 @@ class InferenceEngine:
         # runs in half for the mel->wav stage.
         self.half = half and self.backend_name != "diffusion"
         self.module = self.module.to(device)
-        # rvc dec channels_last 推理（conv1d→conv2d(1,k) 等价变换，消除逐层
-        # nchw<->nhwc 转换 ~12ms）。仅 rvc GAN 后端生效。
-        if dec_cl and self.backend_name == "rvc":
-            from ..backends.rvc.model import GeneratorNSF as _GNSF, _WN_CACHE
+        # rvc/sovits dec channels_last 推理（conv1d→conv2d(1,k) 等价变换，消除逐层
+        # nchw<->nhwc 转换 ~12ms）。仅 GAN 后端生效。
+        if dec_cl and self.backend_name in ("rvc", "sovits"):
+            from ..backends.rvc.model import GeneratorNSF as _GNSF, _WN_CACHE as _RWN
+            from ..backends.sovits.model import Generator as _SGen, _WN_CACHE as _SWN
 
-            _WN_CACHE.clear()  # 新引擎从干净缓存开始（权重已冻结）
+            _RWN.clear()  # 新引擎从干净缓存开始（权重已冻结）
+            _SWN.clear()
             for _mod in self.module.generator.modules():
-                if isinstance(_mod, _GNSF):
+                if isinstance(_mod, (_GNSF, _SGen)):
                     _mod._use_cl = True
         # torch.compile 可编译的推理路径（reduce-overhead 走 CUDA graph，减发射开销）。
         # 实测 rvc 162→140ms (1.16×)，SM 61% launch-bound 场景收益明显。
-        # GAN 后端编 generator，mel-domain 后端编 model。默认关。
+        # GAN 后端编 generator；mel-domain 后端编 module.sample（不是 model——
+        # 推理走 sample 方法，DDPM/Flow 采样循环整体进 CUDA graph，否则
+        # 每步的 Python 发射开销是 launch-bound 主瓶颈）。默认关。
         if compile_graph:
-            target = getattr(self.module, "generator", None) or self.module.model
-            try:
-                import torch as _t
-                compiled = _t.compile(target, mode="reduce-overhead", dynamic=False)
-                if getattr(self.module, "generator", None) is not None:
-                    self.module.generator = compiled
-                else:
-                    self.module.model = compiled
-            except Exception:
-                pass
+            if getattr(self.module, "generator", None) is not None:
+                target = self.module.generator
+                try:
+                    import torch as _t
+                    self.module.generator = _t.compile(
+                        target, mode="reduce-overhead", dynamic=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import torch as _t
+                    self.module.sample = _t.compile(
+                        self.module.sample, mode="reduce-overhead", dynamic=False)
+                except Exception:
+                    pass
         # autocast: conv-heavy nets (NSF-HiFiGAN, GAN generators) get fp16
         # tensor-core acceleration while accumulation/reductions stay fp32.
         # Unlike pure .half(), autocast keeps weight_norm norms in fp32,
@@ -282,6 +292,11 @@ class InferenceEngine:
                 # handles fp16 tensor-core acceleration at forward time.
                 is_half=False,
             )
+            if vocoder_cl:
+                from ..nn.vocoder.nsf_hifigan import _WN_CACHE as _VWN_CACHE
+
+                _VWN_CACHE.clear()  # 新引擎从干净缓存开始（权重已冻结）
+                self.vocoder.generator._use_cl = True
 
         self.t_start = float(t_start)
 
@@ -312,6 +327,7 @@ class InferenceEngine:
                 self.diffusion_enhancer = DiffusionEnhancer(
                     diffusion_ckpt, diffusion_config, vocoder_dir,
                     device=device, half=half, sr=self.sr, hop=self.hop,
+                    compile_sample=compile_graph,
                 )
             if reflow_ckpt is not None or reflow_config is not None:
                 if reflow_ckpt is None or reflow_config is None:
@@ -323,6 +339,7 @@ class InferenceEngine:
                 self.reflow_enhancer = ReflowEnhancer(
                     reflow_ckpt, reflow_config, vocoder_dir,
                     device=device, half=half, sr=self.sr, hop=self.hop,
+                    compile_sample=compile_graph,
                 )
 
     @property
@@ -336,12 +353,17 @@ class InferenceEngine:
         sd = _load_ckpt_state(self.ckpt_path)
         module_sd = module.state_dict()
 
+        # torch.compile 包装（OptimizedModule）会让子模块 state_dict 键带
+        # ``_orig_mod.`` 前缀（如 denoise_fn._orig_mod.input_projection.weight）；
+        # 把 module 侧键去前缀后对比，保持与未编译 ckpt 兼容。
+        module_sd_flat = {k.replace("._orig_mod.", "."): v for k, v in module_sd.items()}
+
         # Remap bare keys -> prefixed keys: original RVC/so-vits checkpoints
         # store weights without the ``generator.``/``model.`` wrapper. Match
         # each key individually against the module state_dict, trying (no
         # prefix, generator., model.) in order (same strategy as
         # train/cli.py pretrained loading).
-        module_keys = set(module_sd.keys())
+        module_keys = set(module_sd_flat.keys())
         remapped: dict = {}
         for k, v in sd.items():
             if k in module_keys:
@@ -360,10 +382,13 @@ class InferenceEngine:
         # of crashing load_state_dict.
         skipped_shape = {
             k for k, v in remapped.items()
-            if k in module_sd and v.shape != module_sd[k].shape
+            if k in module_sd_flat and v.shape != module_sd_flat[k].shape
         }
         filtered = {k: v for k, v in remapped.items() if k not in skipped_shape}
-        missing, unexpected = module.load_state_dict(filtered, strict=False)
+        # flat 键（无 _orig_mod.）映射回 module 真实键后再加载。
+        flat_to_real = {k.replace("._orig_mod.", "."): k for k in module_sd}
+        filtered_real = {flat_to_real.get(k, k): v for k, v in filtered.items()}
+        missing, unexpected = module.load_state_dict(filtered_real, strict=False)
         # strict=False tolerates optimizer/discriminator-only keys in lightning
         # ckpts (sovits/rvc have discriminator + generator keys; generator is
         # required). Filter expected suffixes: bare model ckpts may drop

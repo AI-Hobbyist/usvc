@@ -55,6 +55,7 @@ class ReflowEnhancer:
         half: bool = False,
         sr: int = 44100,
         hop: int = 512,
+        compile_sample: bool = False,
     ) -> None:
         self.device = device
         # The enhancer always operates in the DDSP6 mel domain (44.1k/512).
@@ -177,6 +178,10 @@ class ReflowEnhancer:
             device=device,
             is_half=False,
         )
+        # 推理加速: channels_last 数据流（conv1d→conv2d(1,k) 等价变换）。
+        # 数值等价已验证（SNR ≥ 64dB）；autocast fp16 下消除逐层布局转换。
+        if hasattr(self.vocoder, "generator"):  # 测试用 _DummyVocoder 无此属性
+            self.vocoder.generator._use_cl = True
 
     # -- weight loading ----------------------------------------------------
 
