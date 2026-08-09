@@ -16,6 +16,17 @@ from ._compat import _HAS_TRITON
 if _HAS_TRITON:
     import triton
     import triton.language as tl
+else:
+    # 无 triton 环境(macOS):提供 no-op jit,让 @triton.jit 装饰的
+    # kernel 定义不报 NameError(实际不调用,attention() 走 torch fallback)
+    class _TritonStub:
+        @staticmethod
+        def jit(fn=None, **kw):
+            if fn is None:
+                return lambda f: f
+            return fn
+    triton = _TritonStub()
+    tl = None
 
 
 @triton.jit

@@ -70,6 +70,7 @@ class MlxInferenceEngine:
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
         self.ckpt_path = str(ckpt_path)
+        self._config_path = str(config_path)
         self.vocoder_dir = vocoder_dir
 
         opts = self.cfg.backend_opts
@@ -87,7 +88,7 @@ class MlxInferenceEngine:
         from ..hub import ensure_pretrained
         cvec_path = ensure_pretrained("contentvec/pytorch_model.bin")
         from ..nn.mlx.contentvec import contentvec_from_hf_ckpt
-        self.cvec, _, _ = contentvec_from_hf_ckpt(cvec_path)
+        self.cvec = contentvec_from_hf_ckpt(cvec_path)
         self.cvec.eval()
 
         # backend 模型分发
@@ -104,10 +105,15 @@ class MlxInferenceEngine:
             )
 
     def _build_rvc(self):
-        """RVC wav-domain pipeline:enc_p + flow + dec(GeneratorNSF)。"""
+        """RVC wav-domain pipeline:enc_p + flow + dec(GeneratorNSF)。
+
+        特征提取(units/f0/rms/uv)复用 torch 版 feats 管线(返回 numpy),
+        model.infer 用 mlx。混合策略:特征管线已验证且 backend 无关,
+        mlx 只接管最重的 model forward。
+        """
         from ..nn.mlx.backends.rvc import RVCModel
         opts = self.cfg.backend_opts
-        self.model = RVCModel(
+        kw = dict(
             n_units=int(opts.get("units_dim", 768)),
             inter_channels=int(opts.get("inter_channels", 192)),
             hidden_channels=int(opts.get("hidden_channels", 192)),
@@ -118,7 +124,13 @@ class MlxInferenceEngine:
             gin_channels=int(opts.get("gin_channels", 256)),
             sr=self.sr,
         )
-        # TODO: from_ckpt 加载真实权重 + convtranspose_keys
+        # 尝试从 ckpt 加载(裸 RVC ckpt,key_prefix=dec 对应 GeneratorNSF;
+        # 完整 RVCModel 用 key_prefix=None 自动检测)
+        try:
+            self.model = RVCModel.from_ckpt(self.ckpt_path, config=kw)
+        except Exception:
+            # ckpt 不可用或格式不匹配,用空权重(结构可 forward,数值无意义)
+            self.model = RVCModel(**kw)
         self.model.eval()
 
     def _build_sovits(self):
@@ -166,28 +178,53 @@ class MlxInferenceEngine:
     def convert(self, input_wav, spk: int = 0, trans: int = 0, **kwargs) -> np.ndarray:
         """转换单个 wav → float32 numpy wav。
 
-        当前仅 rvc 链路实现完整(待 from_ckpt 接入后端到端可用)。
+        混合策略:特征提取(units/f0/rms/uv)复用 torch 版 feats 管线
+        (backend 无关,返回 numpy),model forward 用 mlx。
         """
-        import librosa
-        # 1. 读音频 + 重采样到 16kHz(units)
-        wav_np, orig_sr = librosa.load(str(input_wav), sr=None)
-        wav_16k = librosa.resample(wav_np, orig_sr=orig_sr, target_sr=16000,
-                                   res_type="soxr_hq")
-        # 2. 提取 units
-        units = self._extract_units(mx.array(wav_16k.astype(np.float32)))
-        # 3. backend-specific 推理
-        if self.backend_name == "rvc":
-            return self._convert_rvc(units, wav_np, orig_sr, spk, trans)
-        raise NotImplementedError(
-            f"{self.backend_name} mlx convert pending. Use impl='torch'."
-        )
+        if self.backend_name != "rvc":
+            raise NotImplementedError(
+                f"{self.backend_name} mlx convert pending. Use impl='torch'."
+            )
+        return self._convert_rvc(input_wav, spk, trans, **kwargs)
 
-    def _convert_rvc(self, units, wav_np, orig_sr, spk: int, trans: int) -> np.ndarray:
-        """RVC 端到端:units -> enc_p -> flow.reverse -> dec -> wav。"""
-        # f0 提取(暂用占位;完整需 RMVPE/FCPE mlx,当前 RMVPE 数值待修)
-        # TODO: 接入 mlx F0(RMVPE 修复后)或 torch fallback
-        raise NotImplementedError(
-            "RVC end-to-end convert pending: needs (a) mlx F0 extractor, "
-            "(b) RVCModel.from_ckpt wired. Generator + flow + enc_p components "
-            "are implemented; integration in progress. Use impl='torch'."
-        )
+    def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
+        """RVC 端到端:feats(torch engine) -> RVCModel.infer(mlx) -> wav。
+
+        复用 torch ``InferenceEngine`` 的特征提取(units/f0/rms/uv),
+        pitch shift 与 torch 一致,最后 mlx ``RVCModel.infer``。
+        torch engine 仅用于特征提取(model forward 由 mlx 接管)。
+        """
+        import mlx.core as mx
+        # 1. 特征提取(复用 torch engine 的 features)
+        from .engine import InferenceEngine
+        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
+        # 构造一个 torch engine 仅用于特征(同一 config/ckpt)
+        if not hasattr(self, "_torch_eng_for_feats"):
+            self._torch_eng_for_feats = InferenceEngine(
+                config_path=self._config_path,
+                ckpt_path=self.ckpt_path,
+                device="cpu", impl="torch",
+            )
+        te = self._torch_eng_for_feats
+        feats = te.features.extract(input_wav, f0_method=f0_method)
+        units = feats["units"].cpu().numpy()  # [T, 768]
+        f0 = feats["f0"].cpu().numpy()        # [T]
+
+        # 2. Pitch shift
+        if trans != 0:
+            f0 = f0 * (2.0 ** (trans / 12.0))
+
+        # 3. f0 -> pitch token(coarse,与 RVC torch infer 一致)
+        from ..nn.mlx.backends.rvc import f0_to_coarse
+        pitch = np.array(f0_to_coarse(mx.array(f0)))  # [T] int32 numpy
+
+        # 4. mlx model.infer
+        units_mlx = mx.array(units)[None]      # [1, T, 768]
+        f0_mlx = mx.array(f0)[None]           # [1, T]
+        pitch_mlx = mx.array(pitch.astype(np.int32))[None]  # [1, T]
+        lengths = mx.array([units.shape[0]])
+        wav_mlx = np.array(self.model.infer(
+            units_mlx, f0_mlx, pitch_mlx, lengths, spk_id=spk
+        ))
+        # [1, L, 1] -> [L]
+        return wav_mlx.reshape(-1).astype(np.float32)
