@@ -103,12 +103,18 @@ class MlxInferenceEngine:
         会触发图构建(预热),后续调用复用编译图,显著降低峰值内存和加速。
         """
         import functools
-        # backend model:包装 infer/sample 的底层计算
         m = getattr(self, "model", None)
-        if m is not None and hasattr(m, "__call__"):
-            # 不直接 compile infer(含 spk_id 分支/动态逻辑),
-            # 而是让 model 内部的 nn.Module __call__ 走 compile。
-            # mlx nn.Module 的子模块调用会进 compile 边界。
+        if m is not None:
+            # diffusion:编译 denoiser(采样循环每步调用,compile 收益最大)
+            if self.backend_name in ("diffusion", "reflow_vae"):
+                decoder = getattr(m, "decoder", None)
+                if decoder is not None:
+                    try:
+                        m._compiled_decoder = mx.compile(decoder.__call__)
+                        decoder.__call__ = m._compiled_decoder
+                    except Exception:
+                        pass
+            # 通用:编译 model.__call__(rvc/sovits 等含 infer 的)
             try:
                 m._compiled_call = mx.compile(m.__call__)
                 m.__call__ = m._compiled_call
