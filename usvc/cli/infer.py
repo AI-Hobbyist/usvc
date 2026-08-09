@@ -47,7 +47,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="f0 extractor for inference: rmvpe | fcpe "
                         "(default: config's f0_extractor)")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--half", action="store_true", help="use fp16 inference")
+    p.add_argument("--half", action="store_true",
+                   help="use fp16 inference (rvc 默认开；合成器/声码器后端保持 fp32 可选)")
+    p.add_argument("--no-half", action="store_true",
+                   help="强制 fp32 推理（rvc 也关闭 fp16）")
     p.add_argument("--compile-graph", action="store_true",
                    help="torch.compile the generator/model (reduce-overhead CUDA graph; launch-bound inference)")
     p.add_argument("--index-path", default=None, help="retrieval index .pt (RVC style)")
@@ -96,11 +99,22 @@ def main(argv: list[str] | None = None) -> int:
                         "loudness after conversion (only with --target-loudness)")
     args = p.parse_args(argv)
 
+    # rvc 无独立 vocoder，fp16 已验证近无损（固定 seed SNR 58dB）；
+    # 其余后端默认 fp32（--half 显式开启）。
+    backend_name = ""
+    try:
+        import yaml
+        _cfg = yaml.safe_load(open(args.config))
+        backend_name = str(_cfg.get("backend", ""))
+    except Exception:
+        pass
+    use_half = args.half or (backend_name == "rvc" and not args.no_half)
+
     from ..infer.engine import InferenceEngine
 
     engine = InferenceEngine(
         args.config, args.ckpt, vocoder_dir=args.vocoder_dir,
-        device=args.device, half=args.half,
+        device=args.device, half=use_half,
         diffusion_ckpt=args.diffusion_ckpt,
         diffusion_config=args.diffusion_config,
         reflow_ckpt=args.reflow_ckpt,

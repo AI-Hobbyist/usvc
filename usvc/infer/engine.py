@@ -189,6 +189,7 @@ class InferenceEngine:
         reflow_config: str | Path | None = None,
         t_start: float = 0.5,
         compile_graph: bool = False,
+        dec_cl: bool = True,
     ) -> None:
         self.cfg = TrainConfig.from_yaml(config_path)
         self.backend_name = self.cfg.backend
@@ -225,6 +226,15 @@ class InferenceEngine:
         # runs in half for the mel->wav stage.
         self.half = half and self.backend_name != "diffusion"
         self.module = self.module.to(device)
+        # rvc dec channels_last 推理（conv1d→conv2d(1,k) 等价变换，消除逐层
+        # nchw<->nhwc 转换 ~12ms）。仅 rvc GAN 后端生效。
+        if dec_cl and self.backend_name == "rvc":
+            from ..backends.rvc.model import GeneratorNSF as _GNSF, _WN_CACHE
+
+            _WN_CACHE.clear()  # 新引擎从干净缓存开始（权重已冻结）
+            for _mod in self.module.generator.modules():
+                if isinstance(_mod, _GNSF):
+                    _mod._use_cl = True
         # torch.compile 可编译的推理路径（reduce-overhead 走 CUDA graph，减发射开销）。
         # 实测 rvc 162→140ms (1.16×)，SM 61% launch-bound 场景收益明显。
         # GAN 后端编 generator，mel-domain 后端编 model。默认关。

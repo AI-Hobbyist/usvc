@@ -128,7 +128,9 @@ def test_all_features_44100(tmp_path: Path) -> None:
     ]
     # Patch ckpt paths to local pretrained
     for s in specs:
-        if s.f0: s.f0.params["model_ckpt"] = RMVPE
+        if s.f0:
+            s.f0.params["model_ckpt"] = RMVPE
+            s.f0.params["extractor"] = "rmvpe"  # 默认 fcpe；ckpt 换 rmvpe 必须同步换 extractor
         if s.units: s.units.params["model_ckpt"] = CVEC
 
     engine = PreprocessEngine(ds)
@@ -195,6 +197,7 @@ def test_sovits_backend(tmp_path: Path) -> None:
 
     spec = SoVitsBackend.feature_spec({})  # 默认 contentvec (4.1)
     spec.f0.params["model_ckpt"] = RMVPE
+    spec.f0.params["extractor"] = "rmvpe"  # 默认 fcpe；ckpt 换 rmvpe 必须同步换 extractor
     spec.units.params["model_ckpt"] = CVEC
     engine = PreprocessEngine(ds)
     engine.run([spec], device="cpu")
@@ -222,6 +225,8 @@ def test_rvc_backend_v1_v2(tmp_path: Path) -> None:
     spec_v1 = RVCBackend.feature_spec({"rvc_version": "v1"})
     spec_v2.f0.params["model_ckpt"] = RMVPE
     spec_v1.f0.params["model_ckpt"] = RMVPE
+    spec_v2.f0.params["extractor"] = "rmvpe"  # 默认 fcpe；ckpt 换 rmvpe 必须同步换 extractor
+    spec_v1.f0.params["extractor"] = "rmvpe"
     spec_v2.units.params["model_ckpt"] = CVEC
     spec_v1.units.params["model_ckpt"] = CVEC
     engine = PreprocessEngine(ds)
@@ -250,6 +255,7 @@ def test_hubertsoft_also_available(tmp_path: Path) -> None:
     spec_cv = DiffusionBackend.feature_spec({})  # plain contentvec
     for s in (spec_hs, spec_cv):
         s.f0.params["model_ckpt"] = RMVPE
+        s.f0.params["extractor"] = "rmvpe"  # 默认 fcpe；ckpt 换 rmvpe 必须同步换 extractor
         s.units.params["model_ckpt"] = HSOFT if s.units.params["kind"] == "hubertsoft" else CVEC
     engine = PreprocessEngine(ds)
     engine.run([spec_hs, spec_cv], device="cpu")

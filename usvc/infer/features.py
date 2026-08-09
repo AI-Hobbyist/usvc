@@ -39,7 +39,7 @@ class InferFeatures:
         self.dtype = dtype
         self.units_ext = UnitsExtractor(spec.units, sr, hop, device, dtype=dtype)
         self.f0_ext = F0Extractor(spec.f0, sr, hop, device, dtype=dtype)
-        self.rms_ext = RmsExtractor(spec.rms, sr, hop) if spec.rms is not None else None
+        self.rms_ext = RmsExtractor(spec.rms, sr, hop, device) if spec.rms is not None else None
         # Runtime-switchable f0 extractors (keyed by method name).
         self._f0_extractors: dict[str, F0Extractor] = {}
 
