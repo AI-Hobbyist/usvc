@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import TrainConfig
+from ..config import TrainConfig
 
 
 def _resolve_val_interval(val_interval: float | int, n_batches: int) -> int | float:
@@ -39,12 +39,12 @@ def run_training_mlx(
     device = device or "gpu"
     mx.set_default_device(mx.gpu if device == "gpu" else mx.cpu)
 
-    from ..backends import get_backend
+    from ...backends import get_backend
     backend = get_backend(cfg.backend)()
 
     # ---- dataset(复用 torch 构建逻辑)----
-    from ..data.meta import load_meta
-    from ..data.feature_config import FeatureConfig
+    from ...data.meta import load_meta
+    from ...data.feature_config import FeatureConfig
 
     meta = load_meta(cfg.dataset_dir)
     spec_cfg = dict(cfg.backend_opts or {})

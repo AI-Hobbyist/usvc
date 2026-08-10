@@ -16,7 +16,6 @@ from pathlib import Path
 import torch
 
 from ...data.meta import load_meta
-from .model import RIFTDiTModel  # noqa: F401 (avoid circular at runtime)
 from ...train.dataset import BaseSVCDataset
 
 __all__ = ["RIFTDataset"]

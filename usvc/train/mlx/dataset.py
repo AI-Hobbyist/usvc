@@ -100,7 +100,7 @@ def mlx_dataloader(
     注意:num_workers>0 时 worker 进程需可导入 torch(数据加载进程)。
     """
     from torch.utils.data import DataLoader
-    from .dataset import svc_collate
+    from ..dataset import svc_collate
 
     loader = DataLoader(
         dataset,
