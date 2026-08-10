@@ -46,6 +46,7 @@ class MlxFeatureExtractor:
         hop: int,
         units_ckpt: str | Path | None = None,
         rmvpe_ckpt: str | Path | None = None,
+        fcpe_ckpt: str | Path | None = None,
         device: str = "gpu",
         rms_win_length: int | None = None,
         uv_policy: str = "interp",
@@ -76,6 +77,10 @@ class MlxFeatureExtractor:
         self.rmvpe = RMVPE.from_ckpt(str(rmvpe_ckpt))
         self.rmvpe.eval()
 
+        # FCPE(情性加载,仅在 f0_method='fcpe' 时)
+        self.fcpe = None
+        self._fcpe_ckpt = fcpe_ckpt
+
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
@@ -104,10 +109,6 @@ class MlxFeatureExtractor:
                 sr: int
         """
         assert f0_method in ("rmvpe", "fcpe"), f"unsupported f0 method: {f0_method}"
-        if f0_method == "fcpe":
-            raise NotImplementedError(
-                "mlx 特征提取暂不支持 fcpe;请用 f0_method='rmvpe'(mlx RMVPE 已对齐)"
-            )
 
         if wav is None:
             assert wav_path is not None, "either wav_path or wav must be given"
@@ -119,8 +120,8 @@ class MlxFeatureExtractor:
         # ContentVec 的中间结果不再需要,清理避免与 RMVPE 峰值叠加
         import mlx.core as _mx
         _mx.clear_cache()
-        # f0:mlx RMVPE(@self.sr,内部重采样 16k)→ uv interp → hop 对齐
-        f0 = self._extract_f0(wav)                # [T]
+        # f0:mlx RMVPE/FCPE(按 f0_method 选择)→ uv interp → hop 对齐
+        f0 = self._extract_f0(wav, f0_method=f0_method)                # [T]
         # rms:nvSTFT grid
         rms = self._extract_rms(wav)              # [T]
         uv = (f0 > 0).astype(np.float32)
@@ -181,18 +182,26 @@ class MlxFeatureExtractor:
     # f0(RMVPE + uv interp + hop 对齐)
     # ------------------------------------------------------------------
 
-    def _extract_f0(self, wav: np.ndarray) -> np.ndarray:
+    def _extract_f0(self, wav: np.ndarray, f0_method: str = "rmvpe") -> np.ndarray:
         """wav [L]@sr → f0 [T](hop 帧,0=无声)。
 
-        复现 torch ``F0Extractor.extract``(rmvpe 分支):
-          1. mlx RMVPE infer_from_audio(@sr,内部 16k/160hop)→ ~100Hz 原生帧
-          2. uv_policy == "interp":线性填充无声帧
-          3. _align_to_hop:线性插值到 hop 帧
-        """
-        f0_native = np.asarray(
-            self.rmvpe.infer_from_audio(mx.array(wav), sample_rate=self.sr),
-            dtype=np.float32,
-        )
+        f0_method='rmvpe'(默认)或 'fcpe'。"""
+        if f0_method == "fcpe":
+            if self.fcpe is None:
+                from ...hub import ensure_pretrained
+                ckpt = self._fcpe_ckpt or ensure_pretrained("fcpe/fcpe.pt")
+                from .fcpe import FCPE
+                self.fcpe = FCPE.from_ckpt(str(ckpt))
+                self.fcpe.eval()
+            f0_native = np.asarray(
+                self.fcpe.infer_from_audio(mx.array(wav), sample_rate=self.sr),
+                dtype=np.float32,
+            )
+        else:
+            f0_native = np.asarray(
+                self.rmvpe.infer_from_audio(mx.array(wav), sample_rate=self.sr),
+                dtype=np.float32,
+            )
         if self.uv_policy == "interp":
             f0_native = self._interp_unvoiced(f0_native)
 

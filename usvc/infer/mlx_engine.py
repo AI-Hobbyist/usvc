@@ -343,21 +343,38 @@ class MlxInferenceEngine:
         return units, f0, rms
 
     def _convert_sovits(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """sovits wav-domain:feats -> SoVITSModel.infer(c, f0, uv, g) -> wav。"""
+        """sovits wav-domain:feats -> [cluster] -> SoVITSModel.infer -> [enhance] -> wav。"""
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
+        # sovits 聚类(cluster_infer_ratio)
+        cluster_path = kwargs.get("cluster_path")
+        cluster_ratio = float(kwargs.get("cluster_ratio", kwargs.get("index_ratio", 0.0)))
+        if cluster_path and cluster_ratio > 0:
+            import torch as _t
+            from ..nn.mlx._postprocess import apply_cluster
+            data = _t.load(cluster_path, map_location="cpu", weights_only=False)
+            centers = data.get("cluster_centers_", data) if isinstance(data, dict) else data
+            units_np = apply_cluster(np.asarray(centers), units_np, ratio=cluster_ratio)
+        # 释放特征器
+        import os
+        mx.clear_cache()
+        if hasattr(self, "_mlx_feats") and not os.environ.get("USVC_MLX_KEEP_FEATS"):
+            del self._mlx_feats; self._mlx_feats = None
         if trans != 0:
             f0_np = f0_np * (2.0 ** (trans / 12.0))
-        # uv:浊音标志(1=浊音)。f0>0 视为浊音。
         uv_np = (f0_np > 0).astype(np.float32)
-        c = mx.array(units_np)[None]   # [1, T, D]
-        f0 = mx.array(f0_np)[None]    # [1, T]
-        uv = mx.array(uv_np)[None]     # [1, T]
-        g = mx.array([spk])
+        c = mx.array(units_np)[None]; f0 = mx.array(f0_np)[None]
+        uv = mx.array(uv_np)[None]; g = mx.array([spk])
         ret = self.model.infer(c, f0, uv, g)
         o = ret[0] if isinstance(ret, (tuple, list)) else ret
         wav = np.array(o).reshape(-1).astype(np.float32)
+        # 浅扩散增强
+        if kwargs.get("shallow_diffusion") and kwargs.get("enhancer_ckpt"):
+            if not hasattr(self, "enhancer_model"):
+                self._load_enhancer(kwargs["enhancer_ckpt"], kwargs.get("enhancer_type", "diffusion"))
+            wav = self._enhance_shallow(wav, units_np, f0_np, rms_np, spk,
+                                        k_step=int(kwargs.get("k_step", 100)), **kwargs)
         return wav
 
     def _convert_mel_domain(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
