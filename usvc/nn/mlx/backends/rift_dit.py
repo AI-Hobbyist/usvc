@@ -624,6 +624,74 @@ class RIFTDiTModel(nn.Module):
             pred = cfg_rescale * pred_rescaled + (1 - cfg_rescale) * pred
         return pred
 
+    # -- 训练 forward(镜像 model.py::RIFTDiTModel.forward)-----------------
+
+    def compute_velocity(self, xt, t, cond):
+        """velocity_fn(xt, t, cond) -> pred。cond 为 dict(spk_id/f0/rms/cvec/mask/drop_speaker)。"""
+        return self.transformer(
+            x=xt,
+            spk=cond["spk_id"],
+            f0=cond["f0"],
+            rms=cond["rms"],
+            cvec=cond["cvec"],
+            time=t,
+            drop_speaker=cond.get("drop_speaker", False),
+            mask=cond.get("mask", None),
+        )
+
+    def forward(
+        self,
+        mel,
+        spk_id,
+        f0,
+        rms,
+        cvec,
+        frame_len=None,
+        drop_speaker=False,
+        objective=None,
+    ):
+        """Flow-matching 训练 loss。返回 (loss, pred)。
+
+        Args:
+            mel: [B, n, M] 目标 mel(raw)。
+            spk_id: [B] speaker id。
+            f0: [B, n] 或 [B, n, 1] 连续 f0。
+            rms: [B, n] 或 [B, n, 1] volume。
+            cvec: [B, n, cvec_dim] content 特征。
+            frame_len: [B] 有效帧数(可选)。
+            drop_speaker: bool 或 [B] bool(CFG 训练用)。
+            objective: 可选 FlowMatchingObjective;None 时内部创建。
+        """
+        from ....train.mlx.objective import FlowMatchingObjective, lens_to_mask
+        if objective is None:
+            objective = FlowMatchingObjective(
+                spec_min=self.spec_min, spec_max=self.spec_max,
+            )
+        batch, seq_len = mel.shape[0], mel.shape[1]
+        if frame_len is None:
+            frame_len = mx.full((batch,), seq_len, dtype=mx.int32)
+
+        mask = lens_to_mask(frame_len, length=seq_len)
+
+        cond = {
+            "spk_id": spk_id,
+            "f0": f0,
+            "rms": rms,
+            "cvec": cvec,
+            "drop_speaker": drop_speaker,
+            "mask": mask,
+        }
+
+        last_pred = {}
+
+        def vfn(xt, t, c):
+            pred = self.compute_velocity(xt, t, c)
+            last_pred["pred"] = pred
+            return pred
+
+        loss = objective.compute_loss(mel, vfn, cond, mask=mask)
+        return loss, last_pred["pred"]
+
     # -- ODE sample --------------------------------------------------------
 
     def sample(

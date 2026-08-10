@@ -48,3 +48,4 @@ docs/
 *.local.md
 # Local agent constraints (never published)
 AGENTS.md
+data

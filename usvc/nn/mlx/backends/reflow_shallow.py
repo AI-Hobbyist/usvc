@@ -218,7 +218,8 @@ class RectifiedFlow(nn.Module):
         x_t = x_0 + t[:, None, None] * (x_1 - x_0)          # [B,T,M]
         v_pred = self.velocity_fn(x_t, 1000 * t, cond)
         if mask is not None:
-            m = mask.astype(x_1.dtype)[:, None, None]        # [B,1,1] 广播
+            # mask [B, T] → [B, T, 1] 广播到 [B,T,M](NLC 3D layout)
+            m = mask.astype(x_1.dtype)[:, :, None]
             elem = mx.square(x_1 - x_0 - v_pred)
             if loss_type == "l2_lognorm":
                 weights = 0.398942 / t / (1 - t) * mx.exp(
@@ -348,6 +349,90 @@ class ReflowShallowModel(nn.Module):
             emb = emb + self.spk_embed(spk.astype(mx.int32))
         norm_mel = self.reflow_model.norm_spec(mel)          # [B,T,M]
         return mx.concatenate([norm_mel, emb], axis=-1)      # [B,T,M+H]
+
+    # -- degrade(no-grad,与 torch _degrade 一致)---------------------------
+
+    @staticmethod
+    def _sample_degrade_params():
+        """随机采样 degrade 参数(在标定范围内均匀分布)。"""
+        import random
+        return {
+            "bias": random.uniform(0.4, 0.8),
+            "noise_amp": random.uniform(0.35, 0.75),
+            "smooth_win": 5,
+        }
+
+    @staticmethod
+    def _degrade(mel, bias, noise_amp, smooth_win):
+        """模拟 RVC 伪影的 degrade 操作(纯 mlx,可被 value_and_grad 追踪)。
+
+        mel: [B, T, M](dB 域)→ 同 shape。镜像 torch reflow_shallow
+        _degrade:近平坦偏置 + 时域平滑噪声(频率衰减 exp(-bin/62),
+        lag1 自相关 ~0.7-0.8)。输出 stop_gradient(训练时条件不用梯度)。
+
+        grouped conv1d(torch F.conv1d groups=M)用 as_strided 窗口 + einsum
+        向量化实现(无 python 循环,纯 mlx 算子)。
+        """
+        B, T, M = mel.shape
+        dtype = mel.dtype
+
+        # 近平坦偏置;极低频 bin 只有 40%
+        bias_curve = mx.full((M,), bias, dtype=dtype)
+        idx_m = mx.arange(M, dtype=mx.float32)
+        bias_curve = mx.where(
+            idx_m < 16, mx.full((M,), bias * 0.4, dtype=dtype), bias_curve
+        )
+
+        # 时域平滑噪声,频率衰减幅度(exp(-bin/62))
+        taper = mx.exp(-idx_m / 62.0)
+        noise_raw = mx.random.normal(shape=(B, M, T), dtype=mx.float32) * taper[None, :, None]
+        win = max(3, int(smooth_win))
+        # torch F.conv1d(groups=M, padding=win//2): pad 后 valid 卷积(同长)
+        pad = win // 2
+        # 每通道 pad [T] -> [T+2pad] 再窗口化 [T, win] -> matmul
+        nw = mx.pad(
+            noise_raw.transpose(0, 2, 1),  # [B, T, M]
+            [(0, 0), (pad, pad), (0, 0)],
+        )  # [B, T+2pad, M]
+        # as_strided 窗口:[B, T, win, M](行主序 strides)
+        Bc, Tc, Mc = nw.shape
+        s2 = 1
+        s1 = s2 * Mc
+        s0 = s1 * Tc
+        w = mx.as_strided(
+            nw,
+            shape=(Bc, T, win, Mc),
+            strides=(s0, s1, s1, s2),
+        )
+        # kernel [win, M] -> einsum: [B, T, win, M] * [win, M] -> [B, T, M]
+        kernel = mx.full((win, M), 1.0 / win, dtype=mx.float32)
+        noise = mx.einsum("btwm,wm->btm", w, kernel)
+        noise = noise * (win ** 0.5) * noise_amp  # 撤销移动平均收缩
+
+        degraded = mel + noise + bias_curve[None, None, :]
+        return mx.stop_gradient(degraded)
+
+    def forward_loss(self, units, f0, volume, real_mel, spk_id=None,
+                     t_start: float = 0.0, frame_len=None):
+        """训练 loss:degrade(clean_mel) 条件 + clean mel 目标。
+
+        镜像 torch forward_loss(reflow_shallow/model.py:153)。
+        """
+        dp = self._sample_degrade_params()
+        degraded_mel = self._degrade(real_mel, **dp)
+        cond = self.embed_condition(units, f0, volume, degraded_mel, spk_id)
+        from ....train.mlx.objective import lens_to_mask
+        mask = None
+        if frame_len is not None:
+            mask = lens_to_mask(frame_len, length=real_mel.shape[1])
+        loss = self.reflow_model(
+            condition=cond,
+            gt_spec=real_mel,  # 目标是 clean mel
+            infer=False,
+            t_start=t_start,
+            mask=mask,
+        )
+        return loss
 
     def sample(self, units, f0, volume, sovits_mel, t_start: float = 0.5,
                infer_step: int = 10, method: str = "euler", spk_id=None):

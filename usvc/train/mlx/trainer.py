@@ -68,25 +68,36 @@ class MlxTrainer:
     # ------------------------------------------------------------------
 
     def _loss_and_grad_fn(self):
-        loss_fn = self.loss_fn
+        """返回 (loss_and_grad_fn, apply_params_fn)。
 
-        def loss_and_grad(model, batch):
-            return mx.value_and_grad(loss_fn)(model, batch)
+        MLX 官方模式:value_and_grad 对参数树求导,forward 前 update。
+        避免对 Module 实例 flatten(mlx 0.32 对含嵌套 Module 的实例
+        flatten 不可靠)。
+        """
+        loss_fn = self.loss_fn
+        model = self.model
+
+        # loss_fn 约定签名 (model, batch)。包装成 (params, batch):
+        # 先把 params 更新进 model,再调原始 loss_fn。value_and_grad
+        # 对 params(纯数组树)求导——mlx 对 Module 实例 flatten 不可靠。
+        def loss_and_grad(params, batch):
+            model.update(params)
+            return mx.value_and_grad(
+                lambda p, b: loss_fn(model, b)
+            )(params, batch)
 
         return loss_and_grad
-
     def train_step(self, batch) -> dict:
         """单步训练。返回 log dict。"""
         lag = self._loss_and_grad_fn()
-        loss, grads = lag(self.model, batch)
+        params = self.model.trainable_parameters()
+        batch = self._clean_batch(batch)
+        loss, grads = lag(params, batch)
         if self.grad_clip is not None:
             grads, _ = mopt.clip_grad_norm(grads, self.grad_clip)
         # schedulefree 特殊处理:先 train_transform(已由 loss_fn 前调),
         # 这里 update 并恢复
-        if hasattr(self.optimizer, "train_transform"):
-            self.optimizer.update(self.model, grads)
-        else:
-            self.optimizer.update(self.model, grads)
+        self.optimizer.update(self.model, grads)
         mx.eval(self.model.parameters(), self.optimizer.state)
         loss_val = float(mx.array(loss).item())
         self.step += 1
@@ -99,6 +110,15 @@ class MlxTrainer:
     # ------------------------------------------------------------------
     # 验证
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_batch(batch):
+        """过滤 batch 非数组字段(key list 等会破坏 value_and_grad 的 tree_flatten)。"""
+        if isinstance(batch, dict):
+            return type(batch)(
+                {k: v for k, v in batch.items() if hasattr(v, "shape")}
+            )
+        return batch
 
     def eval_loss(self, batch) -> float:
         """no_grad 下计算 loss(验证/监控)。"""
