@@ -212,6 +212,9 @@ class MlxInferenceEngine:
         elif self.backend_name == "reflow_vae":
             from ..nn.mlx.backends.reflow_vae import ReflowVAEModel
             self.model = ReflowVAEModel.from_ckpt(self.ckpt_path)
+        elif self.backend_name == "rift_dit":
+            from ..nn.mlx.backends.rift_dit import RIFTDiTModel
+            self.model = RIFTDiTModel.from_ckpt(self.ckpt_path)
         else:
             raise NotImplementedError(
                 f"{self.backend_name} mlx pipeline pending. Use impl='torch'."
@@ -268,7 +271,7 @@ class MlxInferenceEngine:
             return self._convert_rvc(input_wav, spk, trans, **kwargs)
         if self.backend_name == "sovits":
             return self._convert_sovits(input_wav, spk, trans, **kwargs)
-        if self.backend_name in ("diffusion", "ddsp6", "reflow_vae"):
+        if self.backend_name in ("diffusion", "ddsp6", "reflow_vae", "rift_dit"):
             return self._convert_mel_domain(input_wav, spk, trans, **kwargs)
         raise NotImplementedError(
             f"{self.backend_name} mlx convert pending. Use impl='torch'."
@@ -449,6 +452,13 @@ class MlxInferenceEngine:
             return self.model.sample(units, f0, vol, spk_id=spk,
                 infer_step=int(kwargs.get("steps", 10)),
                 method=kwargs.get("method", "euler"))
+        elif be == "rift_dit":
+            return self.model.sample(units, f0, vol, spk_id=mx.array([spk]),
+                steps=int(kwargs.get("steps", 32)),
+                t_start=float(kwargs.get("t_start", 0.0)),
+                ds_cfg_strength=float(kwargs.get("ds_cfg_strength", 0.0)),
+                spk_cfg_strength=float(kwargs.get("spk_cfg_strength", 0.0)),
+                skip_cfg_strength=float(kwargs.get("skip_cfg_strength", 0.0)))
         else:  # reflow_vae
             return self.model.sample(units, f0, vol, spk_id=spk,
                 infer_step=int(kwargs.get("steps", 10)))
