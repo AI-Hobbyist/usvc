@@ -854,9 +854,11 @@ class DDSP6Model(nn.Module):
             raise ValueError("cannot infer ddsp6 config: missing dense_out.weight")
         n_out, dim_model = dense_out[0], dense_out[1]
         win_length = 2 * (n_out // 4 - 1)
-        n_aux_layers = sum(
-            1 for k in sd if k.startswith("ddsp_model.unit2ctrl.decoder.encoder_layers.")
-        )
+        n_aux_layers = len({
+            int(k.split("encoder_layers.")[1].split(".")[0])
+            for k in sd
+            if k.startswith("ddsp_model.unit2ctrl.decoder.encoder_layers.")
+        })
         # ---- reflow_model ----
         in_proj = shape("reflow_model.velocity_fn.input_projection.weight")
         if in_proj is None:
@@ -870,9 +872,11 @@ class DDSP6Model(nn.Module):
         else:  # LYNXNet Conv1d mlx (n_chans, K, in_dims)
             n_chans, out_dims = in_proj[0], in_proj[2]
             velocity_net = "LYNXNet"
-        n_layers = sum(
-            1 for k in sd if k.startswith("reflow_model.velocity_fn.residual_layers.")
-        )
+        n_layers = len({
+            int(k.split("residual_layers.")[1].split(".")[0])
+            for k in sd
+            if k.startswith("reflow_model.velocity_fn.residual_layers.")
+        })
         n_spk = 2 if "ddsp_model.unit2ctrl.spk_embed.weight" in sd else 1
         use_pitch_aug = "ddsp_model.unit2ctrl.aug_shift_embed.weight" in sd
         return dict(
