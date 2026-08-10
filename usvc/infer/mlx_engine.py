@@ -436,17 +436,43 @@ class MlxInferenceEngine:
                 infer_step=int(kwargs.get("steps", 10)))
 
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """RVC 端到端:feats -> 固定块 RVCModel.infer(compile 复用) -> 拼接 wav。
+        """RVC 端到端:feats -> [index/cluster/protect] -> 固定块 infer -> [rms_mix] -> wav。
 
-        各阶段(features / model)间清理 GPU cache,避免峰值叠加。
+        高级功能(kwargs):
+          index_path/index_ratio: RVC 特征检索
+          cluster_path/cluster_ratio: so-vits 聚类
+          protect: 清音帧源特征混回(默认 0.5,>=0.5 禁用)
+          rms_mix_rate: 输出 RMS 包络匹配源(默认 0.0=不改)
+          noice_scale: RVC infer 噪声尺度(默认 0.66666,传给 model.infer)
         """
-        import mlx.core as mx
-        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
-        units_np, f0_np, _ = self._extract_feats_numpy(input_wav, f0_method)
-        # 特征提取后释放特征器(ContentVec+RMVPE 权重 ~856MB 常驻 GPU),
-        # 为 model forward 腾出 GPU 内存,避免峰值叠加(~1.4GB)。
-        # 下次 convert 会重建特征器(可配置 USVC_MLX_KEEP_FEATS=1 保留)。
         import os, mlx.core as mx
+        f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
+        units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
+        # ---- 高级特征处理(RVC/sovits 调音核心)----
+        from ..nn.mlx._postprocess import retrieve, apply_cluster, protect_units
+        index_path = kwargs.get("index_path")
+        index_ratio = float(kwargs.get("index_ratio", 0.0))
+        cluster_path = kwargs.get("cluster_path")
+        cluster_ratio = float(kwargs.get("cluster_ratio", 0.0))
+        units_src = units_np  # protect 用的源特征
+        if index_path and index_ratio > 0:
+            import torch as _t
+            data = _t.load(index_path, map_location="cpu", weights_only=False)
+            vectors = data["vectors"] if isinstance(data, dict) and "vectors" in data else data
+            vectors = np.asarray(vectors)
+            units_np = retrieve(vectors, units_np, ratio=index_ratio)
+        if cluster_path and cluster_ratio > 0:
+            import torch as _t
+            data = _t.load(cluster_path, map_location="cpu", weights_only=False)
+            if isinstance(data, dict) and "cluster_centers_" in data:
+                centers = np.asarray(data["cluster_centers_"])
+            else:
+                centers = np.asarray(data)
+            units_np = apply_cluster(centers, units_np, ratio=cluster_ratio)
+        protect = float(kwargs.get("protect", 0.5))
+        if protect < 0.5 and rms_np is not None:
+            units_np = protect_units(units_np, units_src, rms_np, protect)
+        # 释放特征器
         mx.clear_cache()
         if hasattr(self, "_mlx_feats") and not os.environ.get("USVC_MLX_KEEP_FEATS"):
             del self._mlx_feats
@@ -458,6 +484,7 @@ class MlxInferenceEngine:
         T = units_np.shape[0]
         tile = self._max_chunk_frames()
         wav_hop = self.hop * self._rvc_upsample_total()  # 每帧对应样本数
+        noice_scale = float(kwargs.get("noice_scale", 0.66666))
         wav_parts = []
         for start in range(0, T, tile):
             end = min(start + tile, T)
@@ -467,11 +494,94 @@ class MlxInferenceEngine:
             p = np.pad(pitch_np[start:end], (0, tile - block_len))
             u = mx.array(u)[None]; f = mx.array(f)[None]
             p = mx.array(p)[None]; ln = mx.array([tile])
-            o = self.model.infer(u, f, p, ln, spk_id=spk)
+            o = self.model.infer(u, f, p, ln, spk_id=spk, noice_scale=noice_scale)
             o_np = np.array(o).reshape(-1).astype(np.float32)
             wav_parts.append(o_np[:block_len * wav_hop])
             mx.eval(o)  # 释放中间结果(控峰值)
-        return np.concatenate(wav_parts)
+        wav_out = np.concatenate(wav_parts)
+        # ---- 浅扩散增强(可选)----
+        if kwargs.get("shallow_diffusion") and kwargs.get("enhancer_ckpt"):
+            if not hasattr(self, "enhancer_model"):
+                self._load_enhancer(kwargs["enhancer_ckpt"],
+                                    kwargs.get("enhancer_type", "diffusion"))
+            wav_out = self._enhance_shallow(
+                wav_out, units_np, f0_np, rms_np, spk,
+                k_step=int(kwargs.get("k_step", 100)), **kwargs)
+        # ---- RVC rms_mix:输出 RMS 包络匹配源音频 ----
+        rms_mix = float(kwargs.get("rms_mix_rate", 0.0))
+        if rms_mix > 0.0:
+            from ..nn.mlx._postprocess import change_rms
+            import librosa
+            src_wav, src_sr = librosa.load(str(input_wav), sr=None)
+            wav_out = change_rms(src_wav, src_sr, wav_out, self.sr, rms_mix)
+        return wav_out
+
+    def _enhance_shallow(self, wav_np, units_np, f0_np, rms_np, spk, k_step=100, **kwargs):
+        """浅扩散增强:wav -> mel -> diffusion.sample(gt_spec, k_step<1000) -> vocoder -> wav。
+
+        需加载 diffusion/reflow 增强器(由 _load_enhancer 初始化)。
+        """
+        import mlx.core as mx
+        if not hasattr(self, "enhancer_model"):
+            raise ValueError("shallow_diffusion 需先加载增强器(见 _load_enhancer)")
+        # wav -> mel(groud truth,与扩散训练一致)
+        from ..nn.mlx.mel import MelExtractor
+        mel = self._wav_to_mel(wav_np)
+        mel_mx = mx.array(mel)[None]  # [1, T, M]
+        # 条件
+        units = mx.array(units_np)[None]; f0 = mx.array(f0_np)[None]
+        vol = mx.array(rms_np if rms_np is not None else np.ones_like(f0_np)*0.5)[None]
+        # 浅扩散采样
+        denoised = self.enhancer_model.sample(
+            units, f0, vol, spk_id=mx.array([spk]),
+            gt_spec=mel_mx, k_step=k_step,
+            infer_speedup=int(kwargs.get("diffusion_speedup", 10)),
+            method=kwargs.get("diffusion_method", "ddim"),
+        )  # [1, T, M]
+        mx.clear_cache()
+        # vocoder
+        wav_out = np.array(self.vocoder.infer(denoised, f0)).reshape(-1).astype(np.float32)
+        return wav_out
+
+    def _load_enhancer(self, enhancer_ckpt, enhancer_type="diffusion"):
+        """加载浅扩散增强器模型(diffusion 或 reflow_shallow)。"""
+        import mlx.core as mx
+        if enhancer_type == "diffusion":
+            from ..nn.mlx.backends.diffusion import DiffusionModel
+            self.enhancer_model = DiffusionModel.from_ckpt(enhancer_ckpt)
+        elif enhancer_type == "reflow_shallow":
+            from ..nn.mlx.backends.reflow_shallow import ReflowShallowModel
+            self.enhancer_model = ReflowShallowModel.from_ckpt(enhancer_ckpt)
+        else:
+            raise ValueError(f"未知 enhancer_type: {enhancer_type}")
+        self.enhancer_model.eval()
+        # 确保 vocoder 已加载(mel-domain 用)
+        if not hasattr(self, "vocoder"):
+            self._ensure_vocoder()
+
+    def _ensure_vocoder(self):
+        """惰性加载 NSF-HiFiGAN vocoder(mel-domain / 增强器共用)。"""
+        if hasattr(self, "vocoder"):
+            return
+        from pathlib import Path
+        from ..hub import ensure_dir
+        from ..nn.mlx.nsf_hifigan import NSFHiFiGAN
+        vdir = Path(ensure_dir("nsf_hifigan"))
+        self.vocoder = NSFHiFiGAN(vdir / "config.json", vdir / "model.ckpt", device="gpu")
+        self.vocoder.generator.eval()
+
+    def _wav_to_mel(self, wav_np):
+        """wav [L] -> mel [T, M](与扩散训练的 mel 配置一致)。"""
+        from ..nn.mlx.mel import MelExtractor
+        from .._common import FeatureConfigLike
+        if not hasattr(self, "_mel_ext"):
+            class _FC(FeatureConfigLike):
+                kind = "mel"
+                def __init__(self, params): self.params = params
+            cfg = {"n_fft": 2048, "win_length": 2048, "n_mels": self.n_mels,
+                   "fmin": 40.0, "fmax": 16000.0, "center": False}
+            self._mel_ext = MelExtractor(_FC(cfg), sr=self.sr, hop=self.hop)
+        return np.array(self._mel_ext.extract(wav_np.astype(np.float32)))
 
     def _rvc_upsample_total(self) -> int:
         """RVC GeneratorNSF 总上采样率(帧->样本)。"""

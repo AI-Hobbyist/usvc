@@ -595,6 +595,7 @@ class RVCModel(nn.Module):
         skip_head=None,
         return_length=None,
         vol=None,
+        noice_scale: float = 0.66666,
     ):
         """RVC 推理链路(确定性,镜像 rvc/model.py::RVCModel.infer)。
 
@@ -626,14 +627,14 @@ class RVCModel(nn.Module):
             flow_head = max(head - 24, 0)
             dec_head = head - flow_head
             m, logs, x_mask = self.enc_p(phone, pitch, lengths, skip_head=flow_head)
-            z_p = (m + mx.exp(logs) * 0.66666) * x_mask
+            z_p = (m + mx.exp(logs) * noice_scale) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
             z = z[:, dec_head : dec_head + length, :]
             x_mask = x_mask[:, dec_head : dec_head + length, :]
             f0 = f0[:, head : head + length]
         else:
             m, logs, x_mask = self.enc_p(phone, pitch, lengths)
-            z_p = (m + mx.exp(logs) * 0.66666) * x_mask
+            z_p = (m + mx.exp(logs) * noice_scale) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
         o = self.dec(z * x_mask, f0, g=g)
         return o
