@@ -75,39 +75,25 @@ class MlxGANTrainer:
           g_loss_fn(g_model, d_model, batch) -> loss_g
         """
         # --- D step(D fwd#1 on detached wave_gen)---
-        # value_and_grad 对参数树求导(g_model 第一参);先 update 再 forward。
-        g_params = self.g_model.trainable_parameters()
-        d_params = self.d_model.trainable_parameters()
+        import mlx.nn as nn
         if isinstance(batch, dict):
             batch = type(batch)(
                 {k: v for k, v in batch.items() if hasattr(v, "shape")}
             )
-
-        def d_lag(d_ps, g_ps, batch):
-            self.d_model.update(d_ps)
-            self.g_model.update(g_ps)
-            return mx.value_and_grad(
-                lambda dp, gp, b: self.d_loss_fn(self.d_model, self.g_model, b)
-            )(d_ps, g_ps, batch)
-
-        loss_d, grads_d = d_lag(d_params, g_params, batch)
+        d_lag = nn.value_and_grad(
+            self.d_model, lambda b: self.d_loss_fn(self.d_model, self.g_model, b)
+        )
+        loss_d, grads_d = d_lag(batch)
         if self.grad_clip is not None:
             grads_d, _ = mopt.clip_grad_norm(grads_d, self.grad_clip)
         self.opt_d.update(self.d_model, grads_d)
         mx.eval(self.d_model.parameters(), self.opt_d.state)
 
         # --- G step(D fwd#2 on wave_gen with grad)---
-        g_params = self.g_model.trainable_parameters()
-        d_params = self.d_model.trainable_parameters()
-
-        def g_lag(g_ps, d_ps, batch):
-            self.g_model.update(g_ps)
-            self.d_model.update(d_ps)
-            return mx.value_and_grad(
-                lambda gp, dp, b: self.g_loss_fn(self.g_model, self.d_model, b)
-            )(g_ps, d_ps, batch)
-
-        loss_g, grads_g = g_lag(g_params, d_params, batch)
+        g_lag = nn.value_and_grad(
+            self.g_model, lambda b: self.g_loss_fn(self.g_model, self.d_model, b)
+        )
+        loss_g, grads_g = g_lag(batch)
         if self.grad_clip is not None:
             grads_g, _ = mopt.clip_grad_norm(grads_g, self.grad_clip)
         self.opt_g.update(self.g_model, grads_g)

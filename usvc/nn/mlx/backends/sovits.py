@@ -55,6 +55,11 @@ f0_mel_min = 1127 * math.log(1 + f0_min / 700)
 f0_mel_max = 1127 * math.log(1 + f0_max / 700)
 
 
+def n_fft_default():
+    """so-vits 默认 spec_channels = n_fft//2+1 = 1025。"""
+    return 1025
+
+
 def f0_to_coarse(f0):
     """f0: [B, T] Hz → [B, T] coarse token(1..255)。镜像 model.py::f0_to_coarse。"""
     f0 = f0.astype(mx.float32)
@@ -981,6 +986,19 @@ class SoVITSModel(nn.Module):
         )
         self.emb_uv = nn.Embedding(2, hidden_channels)
 
+        # 训练组件(posterior encoder + f0 预测头)
+        self.enc_q = EncoderQ(
+            spec_channels if spec_channels else n_fft_default(),
+            inter_channels, hidden_channels, 5, 1, 16,
+            gin_channels=gin_channels,
+        )
+        self.spec_channels = spec_channels if spec_channels else n_fft_default()
+        if self.use_automatic_f0_prediction:
+            self.f0_decoder = F0Decoder(
+                1, hidden_channels, filter_channels, n_heads, n_layers,
+                kernel_size, p_dropout, spk_channels=gin_channels,
+            )
+
     # -- 推理 ---------------------------------------------------------------
 
     def infer(
@@ -1082,3 +1100,371 @@ class SoVITSModel(nn.Module):
 
 # 别名(任务命名约定)
 SoVITSGenerator = SoVITSModel
+
+
+# 训练 forward 绑定(镜像 torch SoVITSModel.forward)
+def _sovits_forward_train(self, units, f0, spec, wave, spk_id, frame_len=None,
+                          vol=None, uv=None, segment_size=None):
+    return train_forward_sovits(
+        self, units, f0, spec, wave, spk_id,
+        frame_len=frame_len, vol=vol, uv=uv, segment_size=segment_size,
+    )
+
+
+SoVITSModel.forward_train = _sovits_forward_train
+
+
+# ---------------------------------------------------------------------------
+# 训练组件:EncoderQ / F0Decoder / MultiPeriodDiscriminator / 训练 forward
+# ---------------------------------------------------------------------------
+
+
+class EncoderQ(nn.Module):
+    """Posterior encoder: spec → z, m_q, logs_q。
+
+    镜像 torch model.py::EncoderQ(pre Conv1d + WN + proj)。NLC 布局。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        dilation_rate: int,
+        n_layers: int,
+        gin_channels: int = 0,
+    ):
+        super().__init__()
+        self.out_channels = out_channels
+        self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+        self.enc = WN(
+            hidden_channels, kernel_size, dilation_rate, n_layers,
+            gin_channels=gin_channels,
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def __call__(self, x, x_lengths, g=None):
+        """x: [B, T, spec_channels] spec;g: [B, 1, gin] 或 None。
+
+        Returns (z, m_q, logs_q, x_mask);x_mask: [B, T, 1]。
+        """
+        import mlx.core as _mx
+        B, T, _ = x.shape
+        seq = _mx.arange(T, dtype=_mx.int32)[None, :]
+        x_mask = (seq < x_lengths[:, None]).astype(x.dtype)[..., None]
+        x = self.pre(x) * x_mask
+        x = self.enc(x, x_mask, g=g)
+        stats = self.proj(x) * x_mask          # [B, T, 2*out]
+        m = stats[..., : self.out_channels]
+        logs = stats[..., self.out_channels:]
+        z = (m + _mx.random.normal(shape=m.shape) * _mx.exp(logs)) * x_mask
+        return z, m, logs, x_mask
+
+
+class _FFTForF0Decoder(nn.Module):
+    """F0Decoder 的 FFT(镜像 torch model.py::FFT,无 cond/isflow 分支)。
+
+    用 mlx MultiHeadAttention + FFN + LayerNorm 组装(causal=True 仅
+    ffn;attn 用 subsequent_mask 因果掩码)。
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int = 1,
+        kernel_size: int = 1,
+        p_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.n_layers = n_layers
+        self.drop = nn.Dropout(p_dropout)
+        self.self_attn_layers = [
+            MultiHeadAttention(
+                hidden_channels, hidden_channels, n_heads,
+                p_dropout=p_dropout, window_size=None,
+            )
+            for _ in range(n_layers)
+        ]
+        self.norm_layers_0 = [LayerNorm(hidden_channels) for _ in range(n_layers)]
+        self.ffn_layers = [
+            FFN(hidden_channels, hidden_channels, filter_channels,
+                kernel_size, p_dropout=p_dropout, causal=True)
+            for _ in range(n_layers)
+        ]
+        self.norm_layers_1 = [LayerNorm(hidden_channels) for _ in range(n_layers)]
+
+    def __call__(self, x, x_mask):
+        import mlx.core as _mx
+        T = x.shape[1]
+        # subsequent_mask:下三角 [1, 1, T, T](1=attend)
+        attn_mask = _mx.tril(_mx.ones((1, 1, T, T), dtype=x.dtype))
+        x = x * x_mask
+        for i in range(self.n_layers):
+            y = self.self_attn_layers[i](x, x, attn_mask)
+            y = self.drop(y)
+            x = self.norm_layers_0[i](x + y)
+            y = self.ffn_layers[i](x, x_mask)
+            y = self.drop(y)
+            x = self.norm_layers_1[i](x + y)
+        return x * x_mask
+
+
+class F0Decoder(nn.Module):
+    """Predict normalized f0 from hidden states(so-vits F0Decoder)。
+
+    镜像 torch model.py::F0Decoder(prenet + FFT + proj + f0_prenet + cond)。
+    """
+
+    def __init__(
+        self,
+        out_channels: int,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int,
+        kernel_size: int,
+        p_dropout: float,
+        spk_channels: int = 0,
+    ):
+        super().__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.spk_channels = spk_channels
+        self.prenet = nn.Conv1d(hidden_channels, hidden_channels, 3, padding=1)
+        self.decoder = _FFTForF0Decoder(
+            hidden_channels, filter_channels, n_heads, n_layers,
+            kernel_size, p_dropout,
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
+        self.f0_prenet = nn.Conv1d(1, hidden_channels, 3, padding=1)
+        if spk_channels > 0:
+            self.cond = nn.Conv1d(spk_channels, hidden_channels, 1)
+
+    def __call__(self, x, norm_f0, x_mask, spk_emb=None):
+        import mlx.core as _mx
+        x = _mx.stop_gradient(x)
+        if spk_emb is not None and self.spk_channels > 0:
+            x = x + self.cond(spk_emb)
+        x = x + self.f0_prenet(norm_f0)
+        x = self.prenet(x) * x_mask
+        x = self.decoder(x * x_mask, x_mask)
+        x = self.proj(x) * x_mask
+        return x
+
+
+def _normalize_f0(f0, x_mask, uv, random_scale=True):
+    """Normalize f0 by voiced mean(so-vits utils.normalize_f0)。
+
+    f0: [B, 1, T];uv: [B, T];x_mask: [B, T, 1]。
+    """
+    import mlx.core as _mx
+    uv_sum = uv.sum(axis=1, keepdims=True)              # [B, 1]
+    uv_sum = _mx.where(uv_sum == 0, _mx.full_like(uv_sum, 9999.0), uv_sum)
+    f0_b = f0[..., 0]                                    # [B, T]
+    means = (f0_b * uv).sum(axis=1, keepdims=True) / uv_sum   # [B, 1]
+    if random_scale:
+        factor = _mx.random.uniform(low=0.8, high=1.2, shape=(f0.shape[0], 1))
+    else:
+        factor = _mx.ones((f0.shape[0], 1))
+    f0_norm = (f0_b - means) * factor
+    return (f0_norm * x_mask[..., 0])[..., None]        # [B, T, 1](NLC)
+
+
+def _rand_slice_segments_with_pitch(x, pitch, x_lengths, segment_size):
+    """随机 slice 段(so-vits commons.rand_slice_segments_with_pitch)。
+
+    x: [B, T, C];pitch: [B, T];返回 (x_slice, pitch_slice, ids_str)。
+    """
+    import mlx.core as _mx
+    B, T, C = x.shape
+    ids_str_max = (x_lengths - segment_size + 1).astype(_mx.int32)
+    r = _mx.random.uniform(shape=(B,)).astype(_mx.float32) * ids_str_max.astype(_mx.float32)
+    ids_str = r.astype(_mx.int32)
+    idx = ids_str[:, None] + _mx.arange(segment_size)[None, :]   # [B, seg]
+    x_slice = _mx.take_along_axis(x, idx[..., None], axis=1)
+    pitch_slice = _mx.take_along_axis(pitch, idx, axis=1)
+    return x_slice, pitch_slice, ids_str
+
+
+class DiscriminatorP(nn.Module):
+    """Period discriminator(so-vits DiscriminatorP)。Conv2d NLC→转 NLC 4D。
+
+    注意 mlx Conv2d 输入 [B, H, W, C](NLC 4D);torch 是 [B, C, H, W]。
+    此处输入 wav [B, T, 1] → reshape [B, t/period, period, 1]。
+    """
+
+    def __init__(self, period: int, kernel_size: int = 5, stride: int = 3,
+                 use_spectral_norm: bool = False):
+        super().__init__()
+        self.period = period
+        self.use_spectral_norm = use_spectral_norm
+        pad = get_padding(kernel_size, 1)
+        self.convs = [
+            nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(pad, 0)),
+        ]
+        self.conv_post = nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0))
+
+    def __call__(self, x):
+        """x: [B, T, 1] wav → (logits [B, N], fmap list)。"""
+        import mlx.core as _mx
+        fmap = []
+        B, T, C = x.shape
+        if T % self.period != 0:
+            n_pad = self.period - (T % self.period)
+            import numpy as _np
+            x_np = _np.pad(_np.array(x), [(0, 0), (0, n_pad), (0, 0)], mode="reflect")
+            x = _mx.array(x_np)
+            T = T + n_pad
+        x = x.reshape(B, T // self.period, self.period, C)   # [B, H, W, C]
+        for l in self.convs:
+            x = l(x)
+            x = _mx.maximum(0.1 * x, x)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(B, -1)
+        return x, fmap
+
+
+class DiscriminatorS(nn.Module):
+    """Scale discriminator(so-vits DiscriminatorS)。Conv1d NLC。"""
+
+    def __init__(self, use_spectral_norm: bool = False):
+        super().__init__()
+        self.convs = [
+            nn.Conv1d(1, 16, 15, 1, padding=7),
+            nn.Conv1d(16, 64, 41, 4, groups=4, padding=20),
+            nn.Conv1d(64, 256, 41, 4, groups=16, padding=20),
+            nn.Conv1d(256, 1024, 41, 4, groups=64, padding=20),
+            nn.Conv1d(1024, 1024, 41, 4, groups=256, padding=20),
+            nn.Conv1d(1024, 1024, 5, 1, padding=2),
+        ]
+        self.conv_post = nn.Conv1d(1024, 1, 3, 1, padding=1)
+
+    def __call__(self, x):
+        import mlx.core as _mx
+        fmap = []
+        for l in self.convs:
+            x = l(x)
+            x = _mx.maximum(0.1 * x, x)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(x.shape[0], -1)
+        return x, fmap
+
+
+class MultiPeriodDiscriminator(nn.Module):
+    """MPD periods [2,3,5,7,11] + DiscriminatorS(so-vits models.py)。"""
+
+    def __init__(self, use_spectral_norm: bool = False):
+        super().__init__()
+        periods = [2, 3, 5, 7, 11]
+        discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
+        discs = discs + [
+            DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods
+        ]
+        self.discriminators = discs
+
+    def __call__(self, y, y_hat):
+        """y/y_hat: [B, T, 1] wav → (y_d_rs, y_d_gs, fmap_rs, fmap_gs)。"""
+        y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        for d in self.discriminators:
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+def _sequence_mask(lengths, max_length=None):
+    """[B] lengths → [B, max_length] bool。"""
+    import mlx.core as _mx
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    seq = _mx.arange(max_length, dtype=_mx.int32)[None, :]
+    return seq < lengths[:, None]
+
+
+def train_forward_sovits(self, units, f0, spec, wave, spk_id, frame_len=None,
+                         vol=None, uv=None, segment_size=None):
+    """so-vits 训练 forward(镜像 torch SoVITSModel.forward)。
+
+    Args:
+        units: [B, T, ssl_dim]
+        f0: [B, T] Hz
+        spec: [B, T_spec, spec_channels] linear spec(NLC)
+        wave: [B, L] 或 [B, L, 1](仅 API parity)
+        spk_id: [B]
+        frame_len: [B]
+        vol: [B, T] 音量(仅 vol_embedding)
+        uv: [B, T] 浊音
+
+    Returns dict(wave_gen, z_p, m_p, logs_p, m_q, logs_q, z_mask,
+                 ids_slice, pred_lf0, lf0, c_lengths)。
+    """
+    import mlx.core as _mx
+    B = units.shape[0]
+    if segment_size is None:
+        segment_size = self.segment_size
+    if spk_id is None:
+        spk_id = _mx.zeros((B,), dtype=_mx.int32)
+    if spk_id.ndim == 1:
+        spk_id = spk_id[:, None]
+    g = self.emb_g(spk_id)                                   # [B, 1, gin]
+
+    c = units
+    c_lengths = (
+        frame_len if frame_len is not None
+        else _mx.full((B,), c.shape[1], dtype=_mx.int32)
+    )
+    spec_lengths = c_lengths
+    if uv is None:
+        uv = (f0 > 0).astype(_mx.float32)
+
+    x_mask = _sequence_mask(c_lengths, c.shape[1])[..., None].astype(c.dtype)
+    vol_emb = (
+        self.emb_vol(vol[:, :, None]) if vol is not None and self.vol_embedding
+        else 0
+    )
+    x = self.pre(c) * x_mask + self.emb_uv(uv.astype(_mx.int32)) + vol_emb
+
+    lf0 = None
+    pred_lf0 = None
+    if self.use_automatic_f0_prediction:
+        lf0 = 2595.0 * _mx.log10(1.0 + f0[:, :, None] / 700.0) / 500.0   # [B, T, 1]
+        norm_lf0 = _normalize_f0(lf0, x_mask, uv)
+        pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g) if hasattr(self, "f0_decoder") else None
+
+    z_ptemp, m_p, logs_p, _ = self.enc_p(x, x_mask, f0=f0_to_coarse(f0))
+    z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
+    z_p = self.flow(z, spec_mask, g=g)
+
+    # rand slice:z [B, T, inter], f0 [B, T]
+    z_slice, pitch_slice, ids_slice = _rand_slice_segments_with_pitch(
+        z, f0, spec_lengths, segment_size
+    )
+    o = self.dec(z_slice, f0=pitch_slice, g=g)               # [B, seg*hop, 1]
+    return {
+        "wave_gen": o,
+        "z_p": z_p,
+        "m_p": m_p,
+        "logs_p": logs_p,
+        "m_q": m_q,
+        "logs_q": logs_q,
+        "z_mask": spec_mask,
+        "ids_slice": ids_slice,
+        "pred_lf0": pred_lf0,
+        "lf0": lf0,
+        "c_lengths": c_lengths,
+    }

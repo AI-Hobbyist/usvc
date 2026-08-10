@@ -68,35 +68,25 @@ class MlxTrainer:
     # ------------------------------------------------------------------
 
     def _loss_and_grad_fn(self):
-        """返回 (loss_and_grad_fn, apply_params_fn)。
+        """返回 loss_and_grad(batch) -> (loss, grads)。
 
-        MLX 官方模式:value_and_grad 对参数树求导,forward 前 update。
-        避免对 Module 实例 flatten(mlx 0.32 对含嵌套 Module 的实例
-        flatten 不可靠)。
+        用 mlx.nn.value_and_grad(model, fn) 官方 API:它内部对
+        trainable_parameters() 求导并自动处理 Module 参数 flatten。
+        fn 捕获 model 引用,签名 (batch) -> scalar。
         """
+        import mlx.nn as nn
         loss_fn = self.loss_fn
         model = self.model
 
-        # loss_fn 约定签名 (model, batch)。包装成 (params, batch):
-        # 先把 params 更新进 model,再调原始 loss_fn。value_and_grad
-        # 对 params(纯数组树)求导——mlx 对 Module 实例 flatten 不可靠。
-        def loss_and_grad(params, batch):
-            model.update(params)
-            return mx.value_and_grad(
-                lambda p, b: loss_fn(model, b)
-            )(params, batch)
-
-        return loss_and_grad
+        lag = nn.value_and_grad(model, lambda b: loss_fn(model, b))
+        return lag
     def train_step(self, batch) -> dict:
         """单步训练。返回 log dict。"""
         lag = self._loss_and_grad_fn()
-        params = self.model.trainable_parameters()
         batch = self._clean_batch(batch)
-        loss, grads = lag(params, batch)
+        loss, grads = lag(batch)
         if self.grad_clip is not None:
             grads, _ = mopt.clip_grad_norm(grads, self.grad_clip)
-        # schedulefree 特殊处理:先 train_transform(已由 loss_fn 前调),
-        # 这里 update 并恢复
         self.optimizer.update(self.model, grads)
         mx.eval(self.model.parameters(), self.optimizer.state)
         loss_val = float(mx.array(loss).item())

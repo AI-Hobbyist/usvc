@@ -241,15 +241,16 @@ class GeneratorNSF(nn.Module):
         )
         cfg = config if config is not None else cls._infer_config(ckpt_path, key_prefix, sd=sd)
         obj = cls(**cfg)
-        # 剥 dec 前缀
-        prefix = (key_prefix + ".") if key_prefix else ""
+        # 统一剥顶层 "generator." 前缀(训练 ckpt 的完整生成器树)
+        if any(k.startswith("generator.") for k in sd):
+            sd = {k[len("generator."):]: v for k, v in sd.items()}
+        # 剥 dec 前缀(默认 key_prefix='generator.dec',剥后剩 dec.* → 再剥 dec.)
         dec_sd = {}
         for k, v in sd.items():
-            if prefix and k.startswith(prefix):
-                dec_sd[k[len(prefix):]] = v
-            elif not prefix and (k.startswith("dec.") or ".dec." in k):
-                # 容忍 ".dec." 中间前缀(如 generator.dec.*)
-                dec_sd[k.split(".dec.")[-1]] = v
+            if k.startswith("dec."):
+                dec_sd[k[len("dec."):]] = v
+            else:
+                dec_sd[k] = v
         if not dec_sd:
             raise ValueError(
                 f"no '{prefix or 'dec'}' keys found in {ckpt_path}; "
@@ -476,8 +477,10 @@ class RVCTextEncoder(nn.Module):
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def __call__(self, phone, pitch, lengths, skip_head=None):
+    def __call__(self, phone, pitch, lengths, skip_head=None, vol_emb=None):
         """phone: [B, T, n_units];pitch: [B, T] token;lengths: [B] int。
+
+        vol_emb: [B, T, hidden] 可选音量嵌入(vol_embedding 模式)。
 
         Returns:
             m: [B, T, out] 均值
@@ -488,6 +491,8 @@ class RVCTextEncoder(nn.Module):
             x = self.emb_phone(phone)
         else:
             x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        if vol_emb is not None:
+            x = x + vol_emb
         x = x * math.sqrt(self.hidden_channels)   # [b, t, h]
         x = self.lrelu(x)
         # torch 转 [B, h, T] → mlx 保持 NLC [B, T, h]
@@ -549,6 +554,7 @@ class RVCModel(nn.Module):
         self.hidden_channels = hidden_channels
         self.gin_channels = gin_channels
         self.spk_embed_dim = spk_embed_dim
+        self.segment_size = segment_size
 
         self.enc_p = RVCTextEncoder(
             n_units,
@@ -582,6 +588,14 @@ class RVCModel(nn.Module):
         self.vol_embedding = vol_embedding
         if vol_embedding:
             self.emb_vol = nn.Linear(1, hidden_channels)
+
+        # 训练组件:posterior encoder(与 torch rvc 相同,复用 so-vits EncoderQ)
+        from .sovits import EncoderQ as _EncoderQ
+        self.enc_q = _EncoderQ(
+            spec_channels, inter_channels, hidden_channels, 5, 1, 16,
+            gin_channels=gin_channels,
+        )
+        self.spec_channels = spec_channels
 
     # -- 推理 ---------------------------------------------------------------
 
@@ -695,12 +709,196 @@ class RVCModel(nn.Module):
             if pref and k.startswith(pref):
                 mk = k[len(pref):]
             elif not pref and ("." in k and (k.startswith("enc_p.") or k.startswith("dec.")
-                                             or k.startswith("flow.") or k.startswith("emb_g."))):
+                                             or k.startswith("flow.") or k.startswith("emb_g.")
+                                             or k.startswith("enc_q."))):
                 mk = k.split(".", 1)[-1]
-            # 只保留推理需要的模块(enc_q 训练专用)
-            if mk.startswith("enc_q."):
-                continue
             model_sd[mk] = v
         obj.load_weights(list(model_sd.items()), strict=strict)
         obj.eval()
         return obj
+
+
+# ---------------------------------------------------------------------------
+# RVC 训练组件:训练 forward / MultiPeriodDiscriminatorV2
+# ---------------------------------------------------------------------------
+
+
+def _rvc_rand_slice_segments_with_pitch(z, pitch, x_lengths, segment_size):
+    """随机 slice 段(RVC,镜像 sovits commons)。z [B, T, C], pitch [B, T]。"""
+    import mlx.core as _mx
+    B, T, C = z.shape
+    ids_str_max = (x_lengths - segment_size + 1).astype(_mx.int32)
+    r = _mx.random.uniform(shape=(B,)).astype(_mx.float32) * ids_str_max.astype(_mx.float32)
+    ids_str = r.astype(_mx.int32)
+    idx = ids_str[:, None] + _mx.arange(segment_size)[None, :]
+    z_slice = _mx.take_along_axis(z, idx[..., None], axis=1)
+    pitch_slice = _mx.take_along_axis(pitch, idx, axis=1)
+    return z_slice, pitch_slice, ids_str
+
+
+def _rvc_sequence_mask(lengths, max_length=None):
+    import mlx.core as _mx
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    seq = _mx.arange(max_length, dtype=_mx.int32)[None, :]
+    return seq < lengths[:, None]
+
+
+def _rvc_train_forward(self, units, pitch_token, pitchf, spec, wave, spk_id,
+                       frame_len=None, vol=None):
+    """RVC 训练 forward(镜像 torch rvc/model.py::RVCModel.forward)。
+
+    Args:
+        units: [B, T, n_units]
+        pitch_token: [B, T] coarse token(1-255)
+        pitchf: [B, T] 连续 f0(Hz,NSF 用)
+        spec: [B, T_spec, spec_channels] linear spec(NLC)
+        wave: 未用(API parity)
+        spk_id: [B] 或 [B, 1]
+        frame_len: [B]
+        vol: [B, T](仅 vol_embedding)
+
+    Returns dict(wave_gen, z_p, m_p, logs_p, m_q, logs_q, z_mask, ids_slice,
+                 phone_lengths)。
+    """
+    import mlx.core as _mx
+    B = units.shape[0]
+    if spk_id is None:
+        spk_id = _mx.zeros((B,), dtype=_mx.int32)
+    if spk_id.ndim == 1:
+        spk_id = spk_id[:, None]
+    g = self.emb_g(spk_id)                     # [B, 1, gin](NLC)
+
+    phone_lengths = (
+        frame_len if frame_len is not None
+        else _mx.full((B,), units.shape[1], dtype=_mx.int32)
+    )
+    spec_lengths = phone_lengths
+
+    vol_emb = (
+        self.emb_vol(vol[:, :, None])
+        if vol is not None and self.vol_embedding
+        else None
+    )
+    m_p, logs_p, x_mask = self.enc_p(units, pitch_token, phone_lengths, vol_emb=vol_emb)
+    z, m_q, logs_q, y_mask = self.enc_q(spec, spec_lengths, g=g)
+    z_p = self.flow(z, y_mask, g=g)
+    z_slice, pitchf_slice, ids_slice = _rvc_rand_slice_segments_with_pitch(
+        z, pitchf, spec_lengths, self.segment_size
+    )
+    o = self.dec(z_slice, pitchf_slice, g=g)   # [B, seg*hop, 1]
+    return {
+        "wave_gen": o,
+        "z_p": z_p,
+        "m_p": m_p,
+        "logs_p": logs_p,
+        "m_q": m_q,
+        "logs_q": logs_q,
+        "z_mask": y_mask,
+        "ids_slice": ids_slice,
+        "phone_lengths": phone_lengths,
+    }
+
+
+# RVC MultiPeriodDiscriminatorV2:DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)
+class DiscriminatorP(nn.Module):
+    """Period discriminator(RVC v2,Conv2d NLC 4D 布局)。"""
+
+    def __init__(self, period: int, kernel_size: int = 5, stride: int = 3,
+                 use_spectral_norm: bool = False):
+        super().__init__()
+        self.period = period
+        self.use_spectral_norm = use_spectral_norm
+        from .sovits import get_padding
+        pad = get_padding(kernel_size, 1)
+        self.convs = [
+            nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
+            nn.Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(pad, 0)),
+        ]
+        self.conv_post = nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0))
+
+    def __call__(self, x):
+        import mlx.core as _mx
+        fmap = []
+        B, T, C = x.shape
+        if T % self.period != 0:
+            n_pad = self.period - (T % self.period)
+            import numpy as _np
+            x_np = _np.pad(_np.array(x), [(0, 0), (0, n_pad), (0, 0)], mode="reflect")
+            x = _mx.array(x_np)
+            T = T + n_pad
+        x = x.reshape(B, T // self.period, self.period, C)
+        for l in self.convs:
+            x = l(x)
+            x = _mx.maximum(0.1 * x, x)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(B, -1)
+        return x, fmap
+
+
+class DiscriminatorS(nn.Module):
+    """Scale discriminator(RVC v2,Conv1d NLC)。"""
+
+    def __init__(self, use_spectral_norm: bool = False):
+        super().__init__()
+        self.convs = [
+            nn.Conv1d(1, 16, 15, 1, padding=7),
+            nn.Conv1d(16, 64, 41, 4, groups=4, padding=20),
+            nn.Conv1d(64, 256, 41, 4, groups=16, padding=20),
+            nn.Conv1d(256, 1024, 41, 4, groups=64, padding=20),
+            nn.Conv1d(1024, 1024, 41, 4, groups=256, padding=20),
+            nn.Conv1d(1024, 1024, 5, 1, padding=2),
+        ]
+        self.conv_post = nn.Conv1d(1024, 1, 3, 1, padding=1)
+
+    def __call__(self, x):
+        import mlx.core as _mx
+        fmap = []
+        for l in self.convs:
+            x = l(x)
+            x = _mx.maximum(0.1 * x, x)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(x.shape[0], -1)
+        return x, fmap
+
+
+class MultiPeriodDiscriminatorV2(nn.Module):
+    """RVC v2 MPD: DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)。"""
+
+    def __init__(self, use_spectral_norm: bool = False):
+        super().__init__()
+        periods = [2, 3, 5, 7, 11, 17, 23, 37]
+        discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
+        discs = discs + [
+            DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods
+        ]
+        self.discriminators = discs
+
+    def __call__(self, y, y_hat):
+        y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        for d in self.discriminators:
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+def _rvc_forward_train(self, units, pitch_token, pitchf, spec, wave, spk_id,
+                       frame_len=None, vol=None):
+    return _rvc_train_forward(
+        self, units, pitch_token, pitchf, spec, wave, spk_id,
+        frame_len=frame_len, vol=vol,
+    )
+
+
+RVCModel.forward_train = _rvc_forward_train
