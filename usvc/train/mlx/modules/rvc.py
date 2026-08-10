@@ -120,7 +120,8 @@ def build(cfg):
         if pitch_token is None:
             pitch_token = f0_to_coarse(batch.f0)
         pitchf = batch.f0
-        spec = batch.mel
+        spec = batch.mel           # rvc dataset: [B, C, T] (spec 已转置)
+        spec = spec.transpose(0, 2, 1) if spec.ndim == 3 and spec.shape[1] == 1025 else spec
         wave = batch.wav
         spk_id = batch.spk_id
         frame_len = batch.frame_len
@@ -134,6 +135,7 @@ def build(cfg):
         out = _generator_out(g_model, batch)
         wave_gen = out["wave_gen"]
         spec = batch.mel
+        spec = spec.transpose(0, 2, 1) if spec.ndim == 3 and spec.shape[1] == 1025 else spec
         wave = batch.wav
         ids_slice = out["ids_slice"]
         segment = wave_gen.shape[1]

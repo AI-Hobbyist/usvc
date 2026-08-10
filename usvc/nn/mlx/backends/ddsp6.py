@@ -493,7 +493,8 @@ class Unit2Control(nn.Module):
             elif spk_id is not None:
                 x = x + self.spk_embed(spk_id)[:, None, :]
         if self.aug_shift_embed is not None and aug_shift is not None:
-            x = x + self.aug_shift_embed(aug_shift / 5)[:, None, :]
+            # aug_shift 可能为 [B]/[B,1]/[B,1,1],统一为 [B,1](torch 语义)
+            x = x + self.aug_shift_embed(aug_shift.reshape(-1, 1) / 5)[:, None, :]
         x = self.decoder(x)
         x = self.norm(x)
         e = self.dense_out(x)

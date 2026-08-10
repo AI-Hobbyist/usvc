@@ -112,10 +112,26 @@ class MlxGANTrainer:
         self.history.append(log)
         return log
 
+    def losses(self, batch) -> dict:
+        """无梯度前向 G/D loss(验证用)。"""
+        import mlx.core as _mx
+        if isinstance(batch, dict):
+            batch = type(batch)(
+                {k: v for k, v in batch.items() if hasattr(v, "shape")}
+            )
+        loss_g = self.g_loss_fn(self.g_model, self.d_model, batch)
+        loss_d = self.d_loss_fn(self.d_model, self.g_model, batch)
+        return {
+            "loss_g": float(_mx.array(loss_g).item()),
+            "loss_d": float(_mx.array(loss_d).item()),
+        }
+
     def fit(
         self,
         dataloader,
         max_steps: int = 1000,
+        val_loader=None,
+        val_interval: int = 100,
         log_interval: int = 10,
         save_interval: int = 200,
         keep_last_n: int = 5,
@@ -134,12 +150,29 @@ class MlxGANTrainer:
                         f"[mlx-gan] step {log['step']}/{max_steps} "
                         f"loss_g {log['loss_g']:.4f} loss_d {log['loss_d']:.4f}"
                     )
+                if val_loader is not None and log["step"] % val_interval == 0:
+                    self.validate(val_loader)
                 if log["step"] % save_interval == 0:
                     self.save_checkpoint(f"step_{log['step']}")
                     self._prune_ckpts(keep_last_n)
         if save_interval:
             self.save_checkpoint("last")
         return self.history
+
+    def validate(self, val_loader):
+        """验证:前向 G/D loss 均值(不更新参数)。"""
+        g_sum = d_sum = 0.0
+        n = 0
+        for batch in val_loader:
+            log = self.losses(batch)
+            g_sum += float(log["loss_g"])
+            d_sum += float(log["loss_d"])
+            n += 1
+        if n:
+            print(
+                f"[mlx-gan] val loss_g {g_sum / n:.4f} loss_d {d_sum / n:.4f}"
+            )
+        return {"val_loss_g": g_sum / max(n, 1), "val_loss_d": d_sum / max(n, 1)}
 
     def save_checkpoint(self, name: str):
         """保存 G/D 参数 + 优化器状态。"""

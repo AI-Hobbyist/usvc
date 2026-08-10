@@ -111,7 +111,8 @@ def build(cfg):
         """G fwd once → out dict(训练 forward)。"""
         units = batch.units
         f0 = batch.f0
-        spec = batch.mel           # [B, T, spec_channels]
+        spec = batch.mel           # sovits dataset: [B, C, T] (spec 已转置)
+        spec = spec.transpose(0, 2, 1) if spec.ndim == 3 and spec.shape[1] == 1025 else spec
         wave = batch.wav           # [B, L]
         spk_id = batch.spk_id
         frame_len = batch.frame_len
@@ -125,7 +126,8 @@ def build(cfg):
     def g_fn(g_model, d_model, batch):
         out = _generator_out(g_model, batch)
         wave_gen = out["wave_gen"]                      # [B, seg_samples, 1]
-        spec = batch.mel                               # [B, T, spec_channels] NLC
+        spec = batch.mel                               # [B, C, T] (sovits dataset)
+        spec = spec.transpose(0, 2, 1) if spec.ndim == 3 and spec.shape[1] == 1025 else spec
         wave = batch.wav                               # [B, L]
         ids_slice = out["ids_slice"]                   # [B]
         segment = wave_gen.shape[1]
@@ -147,8 +149,8 @@ def build(cfg):
         # mel loss:y_mel = slice(spec_to_mel(spec)), y_hat_mel = mel(wave_gen)
         from ....nn.mlx.stft import spec_to_mel, mel_spectrogram
         seg_frames = segment // hop
+        # spec 已是 NLC [B, T, F];spec_to_mel 期望 [B, F, T]
         mel_full = spec_to_mel(spec.transpose(0, 2, 1), n_fft, n_mels, sr, fmin, fmax)
-        # spec_to_mel 期望 [B, F, T],spec NLC [B, T, F] → transpose
         y_mel = _slice_mel(mel_full, ids_slice, seg_frames)
         y_hat_mel = mel_spectrogram(
             wave_gen[..., 0], n_fft, n_mels, sr, hop, win, fmin, fmax
