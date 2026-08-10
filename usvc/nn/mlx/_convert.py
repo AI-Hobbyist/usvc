@@ -176,15 +176,26 @@ def load_torch_ckpt_to_mlx(
     conv_keys: set[str] | None = None,
     convtranspose_keys: set[str] | None = None,
 ) -> dict:
-    """端到端:torch ckpt → mlx state_dict(可直接 load_weights)。
+    """端到端:torch ckpt / mlx npz → mlx state_dict(可直接 load_weights)。
 
     Args:
+        ckpt_path: torch ckpt(.pth/.pt/.ckpt)或 mlx 训练产物(.npz)。
+            .npz 直接加载(键已是扁平 path 形式,mlx tree_flatten 布局)。
         weight_norm_dims: ContentVec 传 ``CONTENTVEC_WEIGHT_NORM_DIMS``;
         key_remap: 裸键 → 前缀键映射。
         dtype: 目标精度(None=fp32, mx.float16, mx.bfloat16)。
         conv_keys: 普通 Conv 权重键集合(覆盖启发式);None 则自动扫描。
         convtranspose_keys: ConvTranspose 权重键集合(用不同转置规则)。
     """
+    if str(ckpt_path).endswith(".npz"):
+        # mlx 训练产物:扁平 path→array,直接返回
+        import mlx.core as mx
+        import numpy as np
+        data = np.load(str(ckpt_path))
+        sd = {k: mx.array(data[k]) for k in data.files}
+        if dtype is not None and dtype != mx.float32:
+            sd = {k: v.astype(dtype) for k, v in sd.items()}
+        return sd
     np_sd = load_torch_sd(ckpt_path)
     # weight_norm 合并(在 numpy 侧,精度安全)
     from ._ops import merge_weight_norm
