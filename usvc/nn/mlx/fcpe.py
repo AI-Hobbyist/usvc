@@ -197,7 +197,7 @@ class CFNaiveMelPE(nn.Module):
         # input_stack: Conv1d → GroupNorm(4) → LeakyReLU → Conv1d
         self.input_stack = [
             nn.Conv1d(input_channels, hidden_dims, 3, stride=1, padding=1),
-            nn.GroupNorm(4, hidden_dims),
+            nn.GroupNorm(4, hidden_dims, pytorch_compatible=True),
             None,                            # nn.LeakyReLU(torch Sequential 索引 2)
             nn.Conv1d(hidden_dims, hidden_dims, 3, stride=1, padding=1),
         ]
@@ -213,9 +213,11 @@ class CFNaiveMelPE(nn.Module):
 
     def __call__(self, x):
         """x: mel (B, T, input_channels) → latent (B, T, out_dims)。"""
-        for layer in self.input_stack:
-            if layer is not None:
-                x = layer(x)
+        # input_stack: conv0 → GN → LeakyReLU(0.01) → conv1
+        x = self.input_stack[0](x)
+        x = self.input_stack[1](x)
+        x = mx.maximum(x, 0.01 * x)          # LeakyReLU(negative_slope=0.01)
+        x = self.input_stack[3](x)
         x = self.net(x)
         x = self.norm(x)
         x = self.output_proj(x)

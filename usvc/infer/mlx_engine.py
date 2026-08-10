@@ -302,6 +302,7 @@ class MlxInferenceEngine:
                     sr=self.sr, hop=self.hop,
                     units_ckpt=ensure_pretrained("contentvec/pytorch_model.bin"),
                     rmvpe_ckpt=ensure_pretrained("rmvpe/model.pt"),
+                    fcpe_ckpt=ensure_pretrained("fcpe/fcpe.pt"),
                     rms_win_length=rms_win,
                     uv_policy=uv_policy,
                     units_layer=units_layer,
