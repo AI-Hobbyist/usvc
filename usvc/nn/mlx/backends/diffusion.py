@@ -634,6 +634,64 @@ class DiffusionModel(nn.Module):
             x = x + self.aug_shift_embed(aug_shift.astype(mx.float32) / 5)
         return x
 
+    def _denoise_wrapper(self, xt, t, cond):
+        """适配 DDPMObjective [B, T, M] 布局到 mlx denoiser(同 NLC)。
+
+        torch 版需 transpose→[B,1,M,T](NCL);mlx ConvNext/WaveNet 已是
+        NLC [B,T,M],直接透传。cond: [B, T, C](mlx NLC,无需转置)。
+        """
+        return self.decoder.denoise_fn(xt, t, cond)
+
+    def _objective(self):
+        """惰性创建并缓存 DDPM objective(与 decoder 的 alpha buffers 同源)。"""
+        if getattr(self, "_ddpm_obj", None) is None:
+            from ....train.mlx.objective import DDPMObjective
+            # spec_min/spec_max 与 torch MelNormalizer 默认一致
+            self._ddpm_obj = DDPMObjective(
+                spec_min=-12.0,
+                spec_max=2.0,
+                timesteps=self.decoder.num_timesteps,
+                max_beta=0.02,
+            )
+        return self._ddpm_obj
+
+    def forward(
+        self,
+        units,
+        f0,
+        volume,
+        spk_id,
+        gt_spec,
+        aug_shift=None,
+        frame_len=None,
+    ):
+        """训练 forward:DDPM epsilon-prediction loss。
+
+        Args:
+            units: [B, T, D]
+            f0: [B, T] 或 [B, T, 1]
+            volume: [B, T] 或 [B, T, 1]
+            spk_id: [B]
+            gt_spec: [B, T, M] 目标 mel(raw)
+            aug_shift: [B] 或 [B, 1] 可选音高偏移
+            frame_len: [B] 真实帧数;用于 mask 掉 padding 帧。
+
+        Returns:
+            (loss, {"eps_loss": loss})。
+        """
+        x = self._embed_condition(units, f0, volume, spk_id, aug_shift)
+        cond = x  # mlx denoiser 用 NLC [B, T, C](torch 是 [B, C, T])
+
+        from ....train.mlx.objective import lens_to_mask
+        mask = (
+            lens_to_mask(frame_len, length=gt_spec.shape[1])
+            if frame_len is not None else None
+        )
+        loss = self._objective().compute_loss(
+            gt_spec, self._denoise_wrapper, cond, t_max=self.k_step, mask=mask,
+        )
+        return loss, {"eps_loss": loss}
+
     def sample(
         self,
         units,

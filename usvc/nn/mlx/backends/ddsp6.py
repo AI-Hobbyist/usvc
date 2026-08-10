@@ -671,15 +671,54 @@ class RectifiedFlow(nn.Module):
         t = t + dt
         return x, t
 
+    def reflow_loss(self, x_1, t, cond, loss_type="l2_lognorm", mask=None):
+        """Flow-matching 训练 loss(镜像 torch ddsp6 RectifiedFlow.reflow_loss)。
+
+        x_1: [B, 1, M, T] normalized spec;t: [B] ∈ (0,1);cond: [B, M, T]。
+        x_0 = randn;x_t = x_0 + t*(x_1 - x_0);v = velocity_fn(x_t, 1000t, cond);
+        loss = weighted MSE(x_1 - x_0, v)(l2_lognorm 权重)。
+        """
+        x_0 = mx.random.normal(x_1.shape, dtype=x_1.dtype)
+        x_t = x_0 + t[:, None, None, None] * (x_1 - x_0)
+        v_pred = self.velocity_fn(x_t, 1000 * t, cond)
+
+        if mask is not None:
+            m = mask.astype(x_1.dtype)[:, None, None, :]  # [B,1,1,T]
+            elem = mx.square(x_1 - x_0 - v_pred)
+            if loss_type == "l2_lognorm":
+                weights = 0.398942 / t / (1 - t) * mx.exp(
+                    -0.5 * mx.square(mx.log(t / (1 - t)))
+                )
+                elem = weights[:, None, None, None] * elem
+            loss = (elem * m).sum() / (m.sum() * elem.shape[2] * elem.shape[3] + 1e-8)
+        elif loss_type == "l1":
+            loss = mx.abs(x_1 - x_0 - v_pred).mean()
+        elif loss_type == "l2":
+            loss = mx.mean(mx.square(x_1 - x_0 - v_pred))
+        elif loss_type == "l2_lognorm":
+            weights = 0.398942 / t / (1 - t) * mx.exp(
+                -0.5 * mx.square(mx.log(t / (1 - t)))
+            )
+            loss = mx.mean(weights[:, None, None, None] * mx.square(x_1 - x_0 - v_pred))
+        else:
+            raise NotImplementedError(loss_type)
+        return loss
+
     def __call__(self, condition, gt_spec=None, infer: bool = True,
                  infer_step: int = 10, method: str = "euler",
                  t_start: float = 0.0, use_tqdm: bool = True, mask=None):
-        if not infer:
-            raise NotImplementedError("mlx RectifiedFlow 仅支持 infer=True(训练在 torch 侧)")
         cond = condition.transpose(0, 2, 1)  # [B, T, M] -> [B, M, T]
         b = condition.shape[0]
         if t_start < 0.0:
             t_start = 0.0
+
+        if not infer:
+            # 训练:norm gt_spec → x_1 [B,1,M,T],采样 t,算 reflow loss
+            x_1 = self.norm_spec(gt_spec).transpose(0, 2, 1)[:, None, :, :]
+            t = t_start + (1.0 - t_start) * mx.random.uniform(shape=(b,))
+            t = mx.clip(t, 1e-7, 1 - 1e-7)
+            return self.reflow_loss(x_1, t, cond=cond, mask=mask)
+
         shape = (b, 1, self.out_dims, cond.shape[2])  # [B, 1, M, T]
 
         if gt_spec is None:
@@ -787,6 +826,50 @@ class DDSP6Model(nn.Module):
                 hop=self.block_size,
             )
         return self.mel_extractor
+
+    # -- 训练 ---------------------------------------------------------------
+
+    def forward(self, units, f0, volume, spk_id, gt_spec, aug_shift=None,
+                frame_len=None, lambda_ddsp=1.0, t_start=None):
+        """训练 forward(镜像 torch DDSP6Model.forward):DDSP + reflow loss。
+
+        Returns:
+            (total_loss, {"ddsp_loss": float, "reflow_loss": float})
+        """
+        if f0.ndim == 2:
+            f0 = f0[:, :, None]
+        if volume.ndim == 2:
+            volume = volume[:, :, None]
+        if t_start is None:
+            t_start = self.t_start
+
+        # DDSP 合成(可微 STFT/ISTFT 谱路径)
+        ddsp_wav, _hidden = self.ddsp_model(
+            units, f0, volume, spk_id=spk_id, aug_shift=aug_shift, infer=True,
+        )
+        mel_extractor = self._ensure_mel_extractor()
+        # mlx MelExtractor 逐条提取(纯 mlx 算子,梯度可回传)
+        ddsp_mel = mx.stack(
+            [mel_extractor.extract(ddsp_wav[i]) for i in range(ddsp_wav.shape[0])]
+        )  # [B, T, M]
+        ddsp_loss = mx.mean(mx.square(ddsp_mel - gt_spec))
+
+        if t_start < 1.0:
+            from ....train.mlx.objective import lens_to_mask
+            _mask = None
+            if frame_len is not None:
+                _mask = lens_to_mask(frame_len, length=gt_spec.shape[1])
+            reflow_loss = self.reflow_model(
+                ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False,
+                mask=_mask,
+            )
+        else:
+            reflow_loss = 0.0
+        total = lambda_ddsp * ddsp_loss + reflow_loss
+        return total, {
+            "ddsp_loss": float(ddsp_loss.item()),
+            "reflow_loss": float(reflow_loss.item()),
+        }
 
     # -- 推理 ---------------------------------------------------------------
 

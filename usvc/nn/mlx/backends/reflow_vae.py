@@ -527,7 +527,7 @@ class ReflowVAEModel(Unit2Wav_VAE):
         """训练 forward → (reflow_loss, {"reflow_loss": float})。"""
         mel = self(
             units, f0, volume, spk_id=spk_id, aug_shift=aug_shift,
-            gt_spec=gt_spec, infer=False, use_tqdm=False,
+            gt_spec=gt_spec, infer=False,
         )
         return mel, {"reflow_loss": float(mel.item())}
 
