@@ -55,17 +55,20 @@ class NsysReport:
     hardware: HardwareInfo
     total_gpu_ns: int             # 所有 kernel + memcpy 的 GPU 时间
     stages: list = None           # list[StageInfo], NVTX 阶段(可选, 需 nsys-rep)
+    compute_ops: list = None      # list[ComputeOp], conv/gemm shape+FLOPs(可选, 需 shapes.json)
 
     @property
     def total_kernel_ns(self) -> int:
         return sum(k.total_ns for k in self.kernels)
 
 
-def parse_sqlite(sqlite_path: str | Path, nsys_rep_path: str | Path | None = None) -> NsysReport:
+def parse_sqlite(sqlite_path: str | Path,
+                 nsys_rep_path: str | Path | None = None,
+                 shapes_path: str | Path | None = None) -> NsysReport:
     """解析 nsys 产出的 sqlite,返回结构化报告。
 
-    若提供 nsys_rep_path,会额外调用 nsys stats 解析 NVTX 阶段(绕过
-    sqlite textId 导出 bug)。需 nsys 在 PATH。
+    - nsys_rep_path: 提供→调用 nsys stats 解析 NVTX 阶段(绕过 sqlite textId bug)
+    - shapes_path: 提供→加载 conv/gemm shape+FLOPs(ShapeCapture 产出)
     """
     p = Path(sqlite_path)
     if not p.exists():
@@ -89,9 +92,16 @@ def parse_sqlite(sqlite_path: str | Path, nsys_rep_path: str | Path | None = Non
         except Exception:
             stages = None  # NVTX 解析失败不阻塞主报告
 
+    compute_ops = None
+    if shapes_path is not None and Path(shapes_path).exists():
+        try:
+            compute_ops = _load_compute_ops(shapes_path)
+        except Exception:
+            compute_ops = None
+
     return NsysReport(
         kernels=kernels, memcpy=memcpy, hardware=hardware,
-        total_gpu_ns=total_gpu_ns, stages=stages,
+        total_gpu_ns=total_gpu_ns, stages=stages, compute_ops=compute_ops,
     )
 
 
@@ -171,4 +181,21 @@ def _parse_kernels(conn: sqlite3.Connection) -> list[KernelRow]:
             grid=(r["gridX"], r["gridY"], r["gridZ"]),
             block=(r["blockX"], r["blockY"], r["blockZ"]),
         ))
+    return out
+
+
+def _load_compute_ops(path: str | Path) -> list:
+    """加载 shapes.json 为 ComputeOp 列表。"""
+    import json
+    from .shape_capture import ComputeOp
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    out = []
+    for d in data:
+        out.append(ComputeOp(
+            op=d["op"],
+            shapes=tuple(tuple(s) for s in d["shapes"]),
+            count=d["count"],
+            flops_per_call=d["flops_per_call"],
+        ))
+    out.sort(key=lambda o: o.total_flops, reverse=True)
     return out

@@ -119,11 +119,53 @@ def render_html(
     fig2.add_hline(y=bw_peak, line_dash="dash", line_color="#d62728",
                    annotation_text=f"带宽峰值 {bw_peak:.0f} GB/s")
     fig2.update_layout(
-        title="Roofline (elementwise 类, 从 grid 反推; conv/gemm 无 shapes 不画精确点)",
+        title="Roofline (elementwise 类, 从 grid 反推)",
         xaxis_title="算力强度 (FLOP/byte, 对数)", yaxis_title="吞吐 (GB/s, 对数)",
         xaxis_type="log", yaxis_type="log", height=380,
         margin=dict(l=50, r=20, t=60, b=40), showlegend=True,
     )
+
+    # ---- Panel 2.5: conv/gemm 算力利用率 (来自 shapes.json) ----
+    gemm_html = ""
+    if report.compute_ops:
+        # 按 op 聚合 FLOPs, 匹配 nsys 里的 conv/gemm kernel 时间
+        conv_gemm_ms = sum(r["ms"] for r in rows if r["cat"] == CUDNN_CUBLAS)
+        total_flops = sum(o.total_flops for o in report.compute_ops)
+        # 整体利用率
+        achieved_tflops = (total_flops / (conv_gemm_ms * 1e-3) / 1e12) if conv_gemm_ms > 0 else 0
+        # 按层类型分组, 看哪些层贡献最多 FLOPs
+        op_groups = {}
+        for o in report.compute_ops:
+            key = o.op.replace("aten::", "")
+            g = op_groups.setdefault(key, {"flops": 0, "count": 0})
+            g["flops"] += o.total_flops
+            g["count"] += o.count
+        groups_sorted = sorted(op_groups.items(), key=lambda x: -x[1]["flops"])[:8]
+        fig_g = go.Figure()
+        for name, g in groups_sorted:
+            gflops = g["flops"] / 1e9
+            fig_g.add_trace(go.Bar(
+                x=[name], y=[gflops], name=name,
+                text=[f"{gflops:.0f}G\nx{g['count']}"], textposition="inside",
+            ))
+        # 计算屋顶线(整体达到的算力)
+        fig_g.add_hline(y=achieved_tflops, line_dash="dot", line_color="#1f77b4",
+                        annotation_text=f"整体 {achieved_tflops:.1f} TFLOPS")
+        fig_g.update_layout(
+            title=f"conv/gemm FLOPs 分布 (总 {total_flops/1e12:.1f} TFLOPs, kernel {conv_gemm_ms:.0f}ms → {achieved_tflops:.1f} TFLOPS)",
+            yaxis_title="GFLOPs", barmode="stack", height=320, showlegend=False,
+            margin=dict(l=50, r=20, t=60, b=60),
+        )
+        # 利用率文字
+        util_tf32 = 100 * achieved_tflops / 34.1 if achieved_tflops else 0
+        util_fp16 = 100 * achieved_tflops / 68.0 if achieved_tflops else 0
+        gemm_html = f"""
+<h2>2.5 conv/gemm 算力 (shapes 来自 torch dispatcher)</h2>
+{fig_g.to_html(full_html=False, include_plotlyjs=False)}
+<p class="note">整体算力 {achieved_tflops:.1f} TFLOPS = 总FLOPs/conv-gemm kernel 时间。
+利用率: <b>{util_tf32:.0f}% of TF32 peak(34.1)</b> | {util_fp16:.0f}% of FP16 peak(68)。
+注: 粗粒度(op的FLOPs vs 同类kernel时间), 若含小矩阵 op 会被高估的 kernel 时间稀释。</p>
+"""
 
     # ---- Panel 3: kernel 构成(类别堆叠条) ----
     cat_ms = {}
@@ -229,9 +271,8 @@ memcpy {report.memcpy.total_bytes/1e9:.2f}GB ({report.memcpy.total_ns/1e6:.0f}ms
 <h2>2. Roofline</h2>
 {fig2.to_html(full_html=False, include_plotlyjs=False)}
 <p class="note">橙色点 = elementwise/reduce(从 grid 反推 FLOPs/Bytes, 可信)。
-conv/gemm 因 nsys 无 tensor shapes 无法精确反推, 不画精确坐标(见下表)。
 点大小 = 耗时占比。</p>
-
+{gemm_html}
 <h2>3. Kernel 构成</h2>
 {fig3.to_html(full_html=False, include_plotlyjs=False)}
 {stage_html}

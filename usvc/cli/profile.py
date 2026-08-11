@@ -77,6 +77,8 @@ def _profile_infer(args) -> int:
     env = dict(os.environ)
     env["USVC_PROFILE_MODE"] = "run"
     env["USVC_PROFILE_ARGS"] = json.dumps(infer_args)
+    env["USVC_PROFILE_SHAPES"] = str(outdir / f"{name}.shapes.json")
+    shape_path = outdir / f"{name}.shapes.json"
 
     cmd = [nsys, "profile",
            "--trace=cuda,nvtx",
@@ -105,7 +107,7 @@ def _profile_infer(args) -> int:
 
     print(f"[profile] 解析 {sqlite_path}...")
     nsys_rep_path = prefix + ".nsys-rep"
-    rep = parse_sqlite(sqlite_path, nsys_rep_path=nsys_rep_path)
+    rep = parse_sqlite(sqlite_path, nsys_rep_path=nsys_rep_path, shapes_path=shape_path)
     rep_dict = _report_to_dict(rep)
 
     html_path = outdir / "report.html"
@@ -136,7 +138,19 @@ def _run_inference() -> int:
         kw["vocoder_dir"] = args[args.index("--vocoder-dir") + 1]
     eng = InferenceEngine(cfg, ckpt, device="cuda", **kw)
     _ = eng.convert(inp, spk=spk, trans=trans)  # warmup
-    out = eng.convert(inp, spk=spk, trans=trans)  # profile
+    # profile: 用 ShapeCapture 包裹, 记录 conv/gemm shapes
+    from usvc._profiler.shape_capture import ShapeCapture
+    cap = ShapeCapture()
+    with cap:
+        out = eng.convert(inp, spk=spk, trans=trans)  # profile
+    # 序列化 shape 数据供后续合并
+    shape_out = os.environ.get("USVC_PROFILE_SHAPES")
+    if shape_out:
+        ops_data = [{"op": o.op, "shapes": [list(s) for s in o.shapes],
+                     "count": o.count, "flops_per_call": o.flops_per_call}
+                    for o in cap.compute_ops if o.flops_per_call]
+        Path(shape_out).write_text(json.dumps(ops_data, indent=2), encoding="utf-8")
+        print(f"[run] 记录 {len(ops_data)} 个 conv/gemm shape")
     import numpy as np
     print(f"[run] 输出 {len(out)} samples, max {np.abs(out).max():.3f}")
     return 0
