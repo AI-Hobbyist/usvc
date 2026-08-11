@@ -324,6 +324,18 @@ class InferenceEngine:
 
                 clear_wn_cache()  # 新引擎从干净缓存开始（权重已冻结）
                 self.vocoder.generator._use_cl = True
+            # compile 共享 vocoder（实测 forward_cl + reduce-overhead 1.80×：
+            # 30→17ms/10s。纯 forward + compile 反而变慢（nchw↔nhwc 胶水叠加），
+            # 必须先 _use_cl=True 再 compile。仅固定形状稳态 chunk 生效，
+            # 变长分块由上层 convert 按固定 chunk 调用保证。）
+            if compile_graph:
+                try:
+                    import torch as _t
+                    self.vocoder.generator = _t.compile(
+                        self.vocoder.generator,
+                        mode="reduce-overhead", dynamic=False)
+                except Exception:
+                    pass
 
         self.t_start = float(t_start)
 
@@ -367,6 +379,16 @@ class InferenceEngine:
                     reflow_ckpt, reflow_config, vocoder_dir,
                     device=device, sr=self.sr, hop=self.hop,
                 )
+                # reflow_enhancer 无 compile_sample 概念（ODE 不编译），
+                # 但其共享 vocoder 同样受益于 forward_cl + reduce-overhead。
+                if compile_graph and hasattr(self.reflow_enhancer.vocoder, "generator"):
+                    try:
+                        import torch as _t
+                        self.reflow_enhancer.vocoder.generator = _t.compile(
+                            self.reflow_enhancer.vocoder.generator,
+                            mode="reduce-overhead", dynamic=False)
+                    except Exception:
+                        pass
 
     @property
     def _shallow_enhancer(self):

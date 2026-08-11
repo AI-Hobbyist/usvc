@@ -140,6 +140,16 @@ class DiffusionEnhancer:
         # 数值等价已验证（SNR ≥ 64dB）；autocast fp16 下消除逐层布局转换。
         if hasattr(self.vocoder, "generator"):  # 测试用 _DummyVocoder 无此属性
             self.vocoder.generator._use_cl = True
+            # 共享 vocoder 同样受益于 forward_cl + reduce-overhead（实测 1.40×）。
+            # 必须先 _use_cl=True 再 compile（纯 forward + compile 反而变慢）。
+            if compile_sample:
+                try:
+                    import torch as _t
+                    self.vocoder.generator = _t.compile(
+                        self.vocoder.generator,
+                        mode="reduce-overhead", dynamic=False)
+                except Exception:
+                    pass
         if compile_sample:
             # 整条采样循环进 CUDA graph（launch-bound 主瓶颈），实测 -8ms。
             self.diffusion_model.sample = torch.compile(
