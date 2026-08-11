@@ -413,6 +413,15 @@ class GeneratorNSF(torch.nn.Module):
 
     def forward_cl(self, x, f0, g=None, n_res=None):
         """channels_last 版 forward（等价于 forward；x: [B,C,T]）。"""
+        # autocast 下统一输入 dtype: rvc 的 x_mask (sequence_mask 输出) 是 fp32,
+        # 污染 z_p/z 链 → dec 输入 fp32 → conv_pre/cond 走 tf32 (比 fp16 慢 2×)。
+        # 显式 cast 到 autocast dtype 让首个 conv 走 fp16 tensor core。
+        if torch.is_autocast_enabled():
+            ac_dtype = torch.get_autocast_gpu_dtype()
+            x = x.to(ac_dtype)
+            if g is not None:
+                g = g.to(ac_dtype)
+            f0 = f0.to(ac_dtype)
         har_source, noi_source, uv = self.m_source(f0, self.upp)
         har_source = har_source.transpose(1, 2)
         if n_res is not None:

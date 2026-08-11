@@ -271,31 +271,36 @@ class InferenceEngine:
         # 推理走 sample 方法，DDPM/Flow 采样循环整体进 CUDA graph，否则
         # 每步的 Python 发射开销是 launch-bound 主瓶颈）。默认关。
         if compile_graph:
-            if getattr(self.module, "generator", None) is not None:
-                # wav-domain 后端 (rvc/sovits) 推理走 generator.infer() ->
-                #   内部调 self.dec(z, f0, g) (GAN decode + NSF)，不是 forward。
-                # 编译整个 RVCModel/SoVITSModel 不生效（forward 没被调用）；
-                # 必须编 module.generator.dec (推理实际调用的 GAN generator)。
-                # _use_cl 已在 dec_cl 块设到 dec 上。
-                #
-                # compile 模式: wav-domain infer 含 randn 采样 + 动态逻辑，
-                # reduce-overhead (CUDA graph) 会报 "tensor output overwritten"
-                # （静态内存复用冲突），只能用 default 模式 (kernel fusion)。
+            gen = getattr(self.module, "generator", None)
+            if gen is not None and self.backend_name in ("rvc", "sovits"):
+                # wav-domain rvc/sovits 推理走 generator.infer() -> enc_p/flow/dec。
+                # 实测各段 (10s, A10G):
+                #   enc_p 17ms (gap 57% launch-bound), flow 9ms (gap 84%),
+                #   dec 102ms (gap 10% GPU-bound)。
+                # 策略: 编 enc_p + flow (reduce-overhead 消除 launch gap, 实测 enc_p
+                #   1.49×), 不编 dec (GAN channels_last+weight_norm 链 compile 产生
+                #   慢路径, default 无益 reduce-overhead 报 overwritten)。
+                # enc_p/flow 无 randn 采样 (z_p 的 randn 在 infer 里, 不在 enc_p/flow
+                #   内), 适合编译。用 default 模式 (kernel fusion) 避开 reduce-overhead
+                #   的 CUDA graph 边界问题 (需 cudagraph_mark_step_begin, default 几乎同快)。
                 import torch as _t
-                dec = getattr(self.module.generator, "dec", None)
-                if dec is not None:
+                for sub in ("enc_p", "flow"):
+                    mod = getattr(gen, sub, None)
+                    if mod is None:
+                        continue
                     try:
-                        self.module.generator.dec = _t.compile(
-                            dec, mode="default", dynamic=False)
+                        setattr(gen, sub, _t.compile(
+                            mod, mode="default", dynamic=False))
                     except Exception:
                         pass
-                else:
-                    try:
-                        self.module.generator = _t.compile(
-                            self.module.generator,
-                            mode="default", dynamic=False)
-                    except Exception:
-                        pass
+            elif gen is not None:
+                # 其他 wav-domain: fallback 编整个 generator
+                try:
+                    import torch as _t
+                    self.module.generator = _t.compile(
+                        gen, mode="default", dynamic=False)
+                except Exception:
+                    pass
             else:
                 try:
                     import torch as _t
