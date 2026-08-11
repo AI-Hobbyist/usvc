@@ -17,17 +17,19 @@ import importlib.metadata
 import json
 import os
 import socket
+import time
 from pathlib import Path
 
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .. import _envcheck
 from ..backends import BACKENDS
+from .audio import AudioError, AudioStore
 from .jobs import TERMINAL_STATES, JobError, JobScheduler
 
 __all__ = ["create_app", "main"]
@@ -61,6 +63,24 @@ class JobCreate(BaseModel):
     params: dict = Field(default_factory=dict)
 
 
+class AudioRegister(BaseModel):
+    path: str
+
+
+_AUDIO_MEDIA = {
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+}
+
+
+def _outputs_dir() -> Path:
+    """推理输出目录：环境变量优先，默认 cwd/outputs。"""
+    d = os.environ.get("USVC_OUTPUT_DIR")
+    return Path(d) if d else Path.cwd() / "outputs"
+
+
 def create_app(token: str | None = None) -> FastAPI:
     app = FastAPI(title="usvc-serve", version=_version())
     # CORS 最外层：浏览器模式需要跨域；本地 token 兜底防其他网页盗连 127.0.0.1
@@ -83,6 +103,23 @@ def create_app(token: str | None = None) -> FastAPI:
 
     scheduler = JobScheduler()
     app.state.scheduler = scheduler
+    audio_store = AudioStore()
+    app.state.audio = audio_store
+
+    def _on_job_success(job) -> None:
+        """infer 成功：注册输出音频并发 artifact 事件（先于终态，SSE 不丢）。"""
+        if job.kind != "infer":
+            return
+        out = job.params.get("output")
+        if not out or not Path(out).exists():
+            return
+        try:
+            rec = audio_store.register(out, job_id=job.id, kind="infer_output")
+        except AudioError:
+            return
+        job.emit("artifact", kind="wav", path=rec["path"], audio_id=rec["id"], name=rec["name"])
+
+    scheduler.on_success = _on_job_success
 
     @app.get("/api/health")
     async def health() -> dict:
@@ -136,8 +173,15 @@ def create_app(token: str | None = None) -> FastAPI:
 
     @app.post("/api/jobs", status_code=201)
     async def jobs_create(body: JobCreate) -> dict:
+        params = dict(body.params)
+        if body.kind == "infer" and not params.get("output"):
+            # 输出定向到受控目录，便于产物注册与试听
+            stem = Path(str(params.get("input", "out"))).stem or "out"
+            out_dir = _outputs_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            params["output"] = str(out_dir / f"out_{stem}_{int(time.time())}.wav")
         try:
-            job = await scheduler.submit(body.kind, body.params)
+            job = await scheduler.submit(body.kind, params)
         except JobError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         return job.snapshot()
@@ -155,6 +199,37 @@ def create_app(token: str | None = None) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         return job.snapshot()
+
+    # ---------- 音频产物 ----------
+
+    @app.post("/api/audio", status_code=201)
+    async def audio_register(body: AudioRegister) -> dict:
+        """注册服务器侧音频文件（输入/输出皆可），返回可播放的 audio id。"""
+        try:
+            return audio_store.register(body.path)
+        except AudioError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.get("/api/audio")
+    async def audio_list() -> dict:
+        return {"items": audio_store.list()}
+
+    @app.get("/api/audio/{audio_id}")
+    async def audio_stream(audio_id: str) -> FileResponse:
+        """音频文件流（支持 Range，播放器拖动）。"""
+        item = audio_store.get(audio_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="audio not found")
+        media = _AUDIO_MEDIA.get(Path(item["path"]).suffix.lower(), "application/octet-stream")
+        return FileResponse(item["path"], media_type=media, filename=item["name"])
+
+    @app.get("/api/audio/{audio_id}/peaks")
+    async def audio_peaks(audio_id: str, n: int = Query(800, ge=16, le=8192)) -> dict:
+        """波形峰值（后端预算，前端 canvas 直接画，不读原始文件）。"""
+        result = await asyncio.to_thread(audio_store.peaks, audio_id, n)
+        if result is None:
+            raise HTTPException(status_code=404, detail="audio not found")
+        return result
 
     @app.get("/api/jobs/{job_id}/events")
     async def jobs_events(job_id: str, from_seq: int = Query(0, ge=0)) -> StreamingResponse:
