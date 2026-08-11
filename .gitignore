@@ -49,3 +49,5 @@ docs/
 # Local agent constraints (never published)
 AGENTS.md
 data
+# Frontend repo (independent git repo, not tracked here)
+webui/
