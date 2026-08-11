@@ -43,6 +43,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot interpret checkpoint: {ckpt_path}")
         return 1
 
+    # Drop training-only keys (discriminator / optimizer / criterion / loss / metrics).
+    # Inference never loads them (usvc/infer/engine.py tolerates these prefixes via
+    # strict=False), so exporting them would only bloat the file.
+    drop_prefixes = ("discriminator.", "optimizer.", "criterion.", "loss.", "metrics.")
+    infer_sd = {k: v for k, v in sd.items() if not k.startswith(drop_prefixes)}
+    dropped = len(sd) - len(infer_sd)
+
     # Optionally convert to half precision
     if args.half:
         infer_sd = {k: (v.half() if v.is_floating_point() else v) for k, v in infer_sd.items()}

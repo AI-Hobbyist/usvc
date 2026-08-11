@@ -36,6 +36,11 @@ train = [
 gui = [
     "triton-windows>=3.1; sys_platform == 'win32'",
 ]
+# WebUI/桌面端（usvc-studio）本地 API 服务
+serve = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 
 [project.scripts]
 usvc-preprocess = "usvc.cli.preprocess:main"
@@ -45,6 +50,7 @@ usvc-export = "usvc.cli.export:main"
 usvc-index = "usvc.retrieval.cli:main_index"
 usvc-cluster = "usvc.retrieval.cli:main_cluster"
 usvc-checkenv = "usvc._envcheck:main"
+usvc-serve = "usvc.api.main:main"
 
 [build-system]
 requires = ["hatchling"]
