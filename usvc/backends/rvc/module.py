@@ -72,7 +72,7 @@ class RVCModule(BaseGANModule):
         # --- rvc 训练加速（不改语义）---
         # (1) discriminator 的 Conv2d 权重转 channels_last，+ patch DiscriminatorP.forward
         #     让输入也走 channels_last → 消除 nchw↔nhwc 转换胶水（实测 −5%）。
-        # (2) torch.compile enc_p/dec（m_source 已 @disable 避 cumsum blocker）。
+        # (2) torch.compile enc_p/dec（SineGen 已用 Triton fused kernel，无 cumsum blocker）。
         # (3) batched_disc：real+fake 拼成 2B 一次过判别器 → 小 conv 填满 SM，
         #     TFLOPS 利用率提升（37.8%→46.1%）。wall time 持平但有效计算占比上升。
         if opts.get("channels_last_disc", False):

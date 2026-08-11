@@ -10,7 +10,7 @@ import importlib
 
 from ._compat import _HAS_TRITON, _PLATFORM
 
-__all__ = ["_HAS_TRITON", "_PLATFORM", "fused_attention"]
+__all__ = ["_HAS_TRITON", "_PLATFORM", "fused_attention", "fused_sinegen"]
 
 
 def __getattr__(name: str):
@@ -18,6 +18,7 @@ def __getattr__(name: str):
     _LAZY = {
         "fused_attention": "usvc._triton.fused_attention",
         "fused_norm": "usvc._triton.fused_norm",
+        "fused_sinegen": "usvc._triton.fused_sinegen",
     }
     if name in _LAZY:
         mod = importlib.import_module(_LAZY[name])

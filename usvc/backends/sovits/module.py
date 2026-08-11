@@ -55,7 +55,7 @@ class SoVITSModule(BaseGANModule):
 
         # --- sovits 训练加速（不改语义；与 rvc 同套策略）---
         # (1) channels_last_disc: discriminator 的 Conv2d 走 channels_last，消除 nchw↔nhwc 胶水。
-        # (2) compile_enc_dec: torch.compile enc_p/dec（SineGen 已 @disable 避 cumsum blocker）。
+        # (2) compile_enc_dec: torch.compile enc_p/dec（SineGen 已用 Triton fused kernel）。
         if opts.get("channels_last_disc", False):
             import torch.nn as _nn
             for _mod in self.discriminator.modules():

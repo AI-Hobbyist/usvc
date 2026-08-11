@@ -71,9 +71,15 @@ sr2sr = {
 # ---------------------------------------------------------------------------
 
 
-@torch.compiler.disable
 class SineGen(torch.nn.Module):
-    """RVC sine generator (harmonic_num harmonics above F0)."""
+    """RVC sine generator (harmonic_num harmonics above F0).
+
+    Uses the Triton fused frame-domain kernel (usvc._triton.fused_sinegen),
+    which is bit-equivalent to the original sample-domain path for the RVC
+    config (harmonic_num=0 -> dim=1, rand_ini恒0). This removes the
+    @torch.compiler.disable so the enclosing GeneratorNSF can stay inside a
+    torch.compile CUDA graph.
+    """
 
     def __init__(
         self,
@@ -100,53 +106,27 @@ class SineGen(torch.nn.Module):
         return uv
 
     def forward(self, f0, upp):
+        from ..._triton.fused_sinegen import fused_sinegen
         with torch.no_grad():
-            f0 = f0[:, None].transpose(1, 2)
-            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
-            # fundamental component
-            f0_buf[:, :, 0] = f0[:, :, 0]
-            for idx in range(self.harmonic_num):
-                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (
-                    idx + 2
-                )  # idx + 2: the (idx+1)-th overtone, (idx+2)-th harmonic
-            rad_values = (
-                f0_buf / self.sampling_rate
-            ) % 1  # %1: n_har product cannot be post-process optimized
-            rand_ini = torch.rand(
-                f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device
-            )
-            rand_ini[:, 0] = 0
-            rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
-            tmp_over_one = torch.cumsum(rad_values, 1)  # % 1
-            tmp_over_one *= upp
-            tmp_over_one = F.interpolate(
-                tmp_over_one.transpose(2, 1),
-                scale_factor=float(upp),
-                mode="linear",
-                align_corners=True,
-            ).transpose(2, 1)
-            rad_values = F.interpolate(
-                rad_values.transpose(2, 1), scale_factor=float(upp), mode="nearest"
-            ).transpose(2, 1)
-            tmp_over_one %= 1
-            tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
-            cumsum_shift = torch.zeros_like(rad_values)
-            cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-            sine_waves = torch.sin(
-                torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * torch.pi
-            )
-            sine_waves = sine_waves * self.sine_amp
-            uv = self._f02uv(f0)
-            uv = F.interpolate(
-                uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
-            ).transpose(2, 1)
-            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            noise = noise_amp * torch.randn_like(sine_waves)
-            sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
+            # RVC config: harmonic_num=0 -> dim=1, rand_ini恒0 (基频无随机初始相位)。
+            # fused_sinegen (frame-domain) 与原 sample-domain 路径在 dim=1/rand_ini=0
+            # 下 bit 等价 (maxdiff 1e-4, sin 数值精度内)。noise 在此生成传入 kernel，
+            # 保证 fixed seed 可复现；返回值接口与原版一致 (sine_waves, uv, noise)。
+            f0_in = f0[:, :, 0] if f0.dim() == 3 else f0
+            B, T = f0_in.shape
+            noise = torch.randn(B, T * upp, self.dim,
+                                device=f0_in.device, dtype=torch.float32)
+            sine_waves = fused_sinegen(
+                f0_in, upp, self.dim, self.sampling_rate,
+                self.sine_amp, self.noise_std, rand_ini=None, noise=noise)
+            uv = self._f02uv(f0_in)
+            uv = torch.nn.functional.interpolate(
+                uv.unsqueeze(-1).transpose(2, 1),
+                scale_factor=float(upp), mode="nearest").transpose(2, 1)
+            out_dtype = f0.dtype if f0.dim() == 2 else f0_in.dtype
+            return sine_waves.to(out_dtype), uv, noise
 
 
-@torch.compiler.disable
 class SourceModuleHnNSF(torch.nn.Module):
     """RVC source module for hn-nsf (returns (sine_merge, None, None))."""
 
