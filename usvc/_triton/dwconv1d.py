@@ -202,7 +202,7 @@ def _register_custom_op():
     try:
         from torch.library import Library, impl, register_autograd
 
-        lib = Library("usvc", "DEF")
+        lib = Library("usvc", "FRAGMENT")
         lib.define("dwconv1d(Tensor x, Tensor w, Tensor b, int dilation) -> Tensor")
 
         @impl(lib, "dwconv1d", "CUDA")

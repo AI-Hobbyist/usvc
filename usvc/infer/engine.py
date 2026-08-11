@@ -272,13 +272,30 @@ class InferenceEngine:
         # 每步的 Python 发射开销是 launch-bound 主瓶颈）。默认关。
         if compile_graph:
             if getattr(self.module, "generator", None) is not None:
-                target = self.module.generator
-                try:
-                    import torch as _t
-                    self.module.generator = _t.compile(
-                        target, mode="reduce-overhead", dynamic=False)
-                except Exception:
-                    pass
+                # wav-domain 后端 (rvc/sovits) 推理走 generator.infer() ->
+                #   内部调 self.dec(z, f0, g) (GAN decode + NSF)，不是 forward。
+                # 编译整个 RVCModel/SoVITSModel 不生效（forward 没被调用）；
+                # 必须编 module.generator.dec (推理实际调用的 GAN generator)。
+                # _use_cl 已在 dec_cl 块设到 dec 上。
+                #
+                # compile 模式: wav-domain infer 含 randn 采样 + 动态逻辑，
+                # reduce-overhead (CUDA graph) 会报 "tensor output overwritten"
+                # （静态内存复用冲突），只能用 default 模式 (kernel fusion)。
+                import torch as _t
+                dec = getattr(self.module.generator, "dec", None)
+                if dec is not None:
+                    try:
+                        self.module.generator.dec = _t.compile(
+                            dec, mode="default", dynamic=False)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.module.generator = _t.compile(
+                            self.module.generator,
+                            mode="default", dynamic=False)
+                    except Exception:
+                        pass
             else:
                 try:
                     import torch as _t

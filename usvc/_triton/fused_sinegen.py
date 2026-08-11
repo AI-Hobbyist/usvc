@@ -204,7 +204,7 @@ def _register_custom_op():
     try:
         from torch.library import Library, impl
 
-        lib = Library("usvc", "DEF")
+        lib = Library("usvc", "FRAGMENT")
         lib.define(
             "fused_sinegen(Tensor f0, Tensor? rand_ini, Tensor? noise,"
             " int upp, int dim, float sr, float sine_amp, float noise_std)"
