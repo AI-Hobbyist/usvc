@@ -10,12 +10,31 @@ Usage (CLI):  usvc-infer input.wav --config configs/sovits.yaml --ckpt ck.ckpt
 """
 from __future__ import annotations
 
-from contextlib import nullcontext as _nullcontext
+from contextlib import contextmanager, nullcontext as _nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    """NVTX 标记范围。仅 CUDA 可用时启用, 否则 no-op。
+
+    被 nsys 采集时(usvc-profile --trace=cuda,nvtx),这些 range 会出现在
+    trace 里,供 profiler 按 extract/run_model/stitch 阶段拆分。
+    无 profiler attach 时开销 ~0.6μs/push-pop,对推理可忽略。
+    """
+    if torch.cuda.is_available():
+        from torch.cuda import nvtx
+        nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            nvtx.range_pop()
+    else:
+        yield
 
 from ..backends import get_backend
 from ..backends.sovits.dataset import interp_unvoiced_f0
@@ -612,7 +631,8 @@ class InferenceEngine:
             )
             feats = self.features.extract(wav=wav_in, f0_method=f0_method)
         else:
-            feats = self.features.extract(input_wav, f0_method=f0_method)
+            with _nvtx_range("extract"):
+                feats = self.features.extract(input_wav, f0_method=f0_method)
         units = feats["units"].to(self.device)  # [T, dim]
         f0 = feats["f0"].to(self.device)  # [T]
         rms = feats["rms"].to(self.device) if feats["rms"] is not None else None
@@ -643,8 +663,9 @@ class InferenceEngine:
         max_chunk_frames = max_chunk_sec * self.sr // self.hop
 
         if T <= max_chunk_frames:
-            out = self._run_model(
-                units, f0, rms, uv, spk,
+            with _nvtx_range("run_model"):
+                out = self._run_model(
+                    units, f0, rms, uv, spk,
                 shallow_diffusion=shallow_diffusion, k_step=k_step,
                 diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup,
@@ -670,8 +691,9 @@ class InferenceEngine:
                 chunk_f0 = f0[start:end]
                 chunk_rms = rms[start:end] if rms is not None else None
                 chunk_uv = uv[start:end]
-                wav_chunk = self._run_model(
-                    chunk_units, chunk_f0, chunk_rms, chunk_uv, spk,
+                with _nvtx_range("run_model"):
+                    wav_chunk = self._run_model(
+                        chunk_units, chunk_f0, chunk_rms, chunk_uv, spk,
                     shallow_diffusion=shallow_diffusion, k_step=k_step,
                     diffusion_method=diffusion_method,
                     diffusion_speedup=diffusion_speedup,
@@ -687,7 +709,8 @@ class InferenceEngine:
                 )
                 chunk_outputs.append(wav_chunk)
 
-            out = self._stitch_chunks(boundaries, chunk_outputs)
+            with _nvtx_range("stitch"):
+                out = self._stitch_chunks(boundaries, chunk_outputs)
 
         # Restore the input's original loudness (before RMS envelope match so
         # rms_mix_rate stays the final envelope step).

@@ -142,6 +142,52 @@ def render_html(
         margin=dict(l=50, r=20, t=60, b=60),
     )
 
+    # ---- Panel 3.5: NVTX 阶段拆解(extract/run_model/stitch)----
+    stage_html = ""
+    if report.stages:
+        st_total = sum(s.total_ms for s in report.stages)
+        # 阶段占比条
+        fig_s = go.Figure()
+        for s in report.stages:
+            fig_s.add_trace(go.Bar(
+                x=[s.name], y=[s.total_ms], name=s.name,
+                text=[f"{s.total_ms:.0f}ms ({100*s.total_ms/st_total:.0f}%) x{s.instances}"],
+                textposition="inside",
+            ))
+        fig_s.update_layout(
+            title=f"阶段拆解 (NVTX, 总 {st_total:.0f}ms)", yaxis_title="ms",
+            barmode="stack", height=300, showlegend=False,
+            margin=dict(l=50, r=20, t=60, b=40),
+        )
+        # 每 stage 的 top 5 kernel 表
+        stage_tables = ""
+        for s in report.stages:
+            stage_tables += f"<h3 style='margin:15px 0 5px'>{s.name} " \
+                f"<span style='color:#666;font-weight:normal'>({s.total_ms:.0f}ms, {s.instances}次)</span></h3>"
+            if not s.kernels:
+                stage_tables += "<p class='note'>无 GPU kernel (纯 CPU 阶段)</p>"
+                continue
+            stage_tables += "<table style='border-collapse:collapse;font-size:11px;width:100%'>"
+            stage_tables += "<tr style='background:#f5f5f5'><th style='padding:3px;text-align:left'>kernel</th>" \
+                "<th>ms</th><th>count</th></tr>"
+            for k in s.kernels[:5]:
+                kname = k.name[:65]
+                kms = k.total_ns / 1e6
+                stage_tables += (
+                    "<tr style='border-bottom:1px solid #eee'>"
+                    "<td style='padding:2px;max-width:450px'>" + kname + "</td>"
+                    "<td style='text-align:right'>" + format(kms, ".1f") + "</td>"
+                    "<td style='text-align:right'>" + str(k.count) + "</td></tr>"
+                )
+            stage_tables += "</table>"
+        stage_html = f"""
+<h2>3. 阶段拆解 (extract / run_model / stitch)</h2>
+{fig_s.to_html(full_html=False, include_plotlyjs=False)}
+<p class="note">由 NVTX range 标记拆分(需 engine 插入 nvtx 标记)。
+run_model 含 forward; extract 含特征提取(contentvec/f0); stitch 含 crossfade 拼接。</p>
+{stage_tables}
+"""
+
     # ---- Panel 4: Top kernel 表(HTML) ----
     top = rows[:15]
     table_html = "<table style='border-collapse:collapse;font-size:12px;width:100%'>"
@@ -188,7 +234,7 @@ conv/gemm 因 nsys 无 tensor shapes 无法精确反推, 不画精确坐标(见�
 
 <h2>3. Kernel 构成</h2>
 {fig3.to_html(full_html=False, include_plotlyjs=False)}
-
+{stage_html}
 <h2>4. Top 15 kernel</h2>
 {table_html}
 <p class="note">occupancy 颜色: 绿≥85% | 橙50-85% | 红&lt;50%。

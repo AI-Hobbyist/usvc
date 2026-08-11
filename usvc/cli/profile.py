@@ -104,7 +104,8 @@ def _profile_infer(args) -> int:
     from usvc._profiler.render import render_html
 
     print(f"[profile] 解析 {sqlite_path}...")
-    rep = parse_sqlite(sqlite_path)
+    nsys_rep_path = prefix + ".nsys-rep"
+    rep = parse_sqlite(sqlite_path, nsys_rep_path=nsys_rep_path)
     rep_dict = _report_to_dict(rep)
 
     html_path = outdir / "report.html"
@@ -177,6 +178,11 @@ def _report_to_dict(rep) -> dict:
                     for k in rep.kernels[:30]],
         "memcpy": {"count": rep.memcpy.count, "bytes": rep.memcpy.total_bytes,
                    "ms": rep.memcpy.total_ns / 1e6},
+        "stages": [{"name": s.name, "instances": s.instances,
+                    "total_ms": s.total_ms,
+                    "top_kernels": [{"name": k.name[:80], "ms": k.total_ns/1e6,
+                                      "count": k.count} for k in s.kernels[:5]]}
+                   for s in (rep.stages or [])],
     }
 
 
@@ -198,6 +204,12 @@ def _print_summary(rep) -> None:
     if occ_vals:
         wocc = sum(m*o for m,o in occ_vals if o>=0) / sum(m for m,o in occ_vals if o>=0)
         print(f"加权 occupancy: {wocc:.0f}% (理论)")
+    # NVTX 阶段拆解
+    if rep.stages:
+        st_total = sum(s.total_ms for s in rep.stages)
+        print("阶段拆解 (NVTX):")
+        for s in rep.stages:
+            print(f"  {s.name:12s} {s.total_ms:7.0f}ms ({100*s.total_ms/st_total:2.0f}%) x{s.instances}")
 
 
 if __name__ == "__main__":

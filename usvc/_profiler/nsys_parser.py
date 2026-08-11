@@ -54,14 +54,19 @@ class NsysReport:
     memcpy: MemcpyStat
     hardware: HardwareInfo
     total_gpu_ns: int             # 所有 kernel + memcpy 的 GPU 时间
+    stages: list = None           # list[StageInfo], NVTX 阶段(可选, 需 nsys-rep)
 
     @property
     def total_kernel_ns(self) -> int:
         return sum(k.total_ns for k in self.kernels)
 
 
-def parse_sqlite(sqlite_path: str | Path) -> NsysReport:
-    """解析 nsys 产出的 sqlite,返回结构化报告。"""
+def parse_sqlite(sqlite_path: str | Path, nsys_rep_path: str | Path | None = None) -> NsysReport:
+    """解析 nsys 产出的 sqlite,返回结构化报告。
+
+    若提供 nsys_rep_path,会额外调用 nsys stats 解析 NVTX 阶段(绕过
+    sqlite textId 导出 bug)。需 nsys 在 PATH。
+    """
     p = Path(sqlite_path)
     if not p.exists():
         raise FileNotFoundError(f"nsys sqlite 不存在: {p}")
@@ -75,8 +80,18 @@ def parse_sqlite(sqlite_path: str | Path) -> NsysReport:
         conn.close()
 
     total_gpu_ns = sum(k.total_ns for k in kernels) + memcpy.total_ns
+
+    stages = None
+    if nsys_rep_path is not None:
+        try:
+            from .nsys_nvtx import parse_nvtx_from_rep
+            stages = parse_nvtx_from_rep(nsys_rep_path)
+        except Exception:
+            stages = None  # NVTX 解析失败不阻塞主报告
+
     return NsysReport(
-        kernels=kernels, memcpy=memcpy, hardware=hardware, total_gpu_ns=total_gpu_ns
+        kernels=kernels, memcpy=memcpy, hardware=hardware,
+        total_gpu_ns=total_gpu_ns, stages=stages,
     )
 
 
