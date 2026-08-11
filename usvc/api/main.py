@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 import uvicorn
-import yaml
+import yaml as _yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -31,6 +31,7 @@ from .. import _envcheck
 from ..backends import BACKENDS
 from .audio import AudioError, AudioStore
 from .jobs import TERMINAL_STATES, JobError, JobScheduler
+from .tfevents import TfEventsStore
 
 __all__ = ["create_app", "main"]
 
@@ -81,6 +82,56 @@ def _outputs_dir() -> Path:
     return Path(d) if d else Path.cwd() / "outputs"
 
 
+#: train overrides 白名单——只允许改训练计划/位置类字段。
+#: 训练语义边界（AGENTS.md）：batch_size / max_frames / loss / 网络结构 / 优化器禁改。
+_TRAIN_OVERLAY_KEYS = {
+    "dataset_dir",
+    "exp_dir",
+    "resume",
+    "max_steps",
+    "max_epochs",
+    "save_interval",
+    "val_interval",
+    "keep_last_n",
+    "num_workers",
+}
+
+
+def _normalize_train(params: dict, out_dir: Path) -> dict:
+    """解析训练 yaml + 应用白名单 overrides → 写临时 yaml → 注入 exp_dir。
+
+    返回新 params：config 指向临时 yaml（train 子进程消费），exp_dir 供 metrics 用。
+    """
+    cfg_path = Path(params["config"])
+    if not cfg_path.is_file():
+        raise JobError(f"config not found: {cfg_path}")
+    try:
+        data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except _yaml.YAMLError as exc:
+        raise JobError(f"invalid yaml {cfg_path}: {exc}")
+    if not isinstance(data, dict) or "backend" not in data:
+        raise JobError(f"config missing 'backend' key: {cfg_path}")
+
+    overrides = dict(params.get("overrides") or {})
+    bad = set(overrides) - _TRAIN_OVERLAY_KEYS
+    if bad:
+        raise JobError(f"unsupported train overrides: {sorted(bad)} (allowed: {sorted(_TRAIN_OVERLAY_KEYS)})")
+    data.update(overrides)
+
+    exp_dir = str(data.get("exp_dir") or "")
+    cfg_dir = out_dir / "train_cfgs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cfg_dir / f"train_{int(time.time() * 1000)}.yaml"
+    tmp.write_text(_yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+
+    new_params = dict(params)
+    new_params["config"] = str(tmp)
+    new_params["exp_dir"] = exp_dir
+    if "resume" in overrides:
+        new_params["resume"] = overrides["resume"]
+    return new_params
+
+
 def create_app(token: str | None = None) -> FastAPI:
     app = FastAPI(title="usvc-serve", version=_version())
     # CORS 最外层：浏览器模式需要跨域；本地 token 兜底防其他网页盗连 127.0.0.1
@@ -105,6 +156,8 @@ def create_app(token: str | None = None) -> FastAPI:
     app.state.scheduler = scheduler
     audio_store = AudioStore()
     app.state.audio = audio_store
+    tfevents = TfEventsStore()
+    app.state.tfevents = tfevents
 
     def _on_job_success(job) -> None:
         """infer 成功：注册输出音频并发 artifact 事件（先于终态，SSE 不丢）。"""
@@ -148,8 +201,8 @@ def create_app(token: str | None = None) -> FastAPI:
         out = []
         for p in sorted(base.glob("*.yaml")):
             try:
-                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-            except yaml.YAMLError:
+                data = _yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except _yaml.YAMLError:
                 data = {}
             out.append(
                 {
@@ -174,12 +227,17 @@ def create_app(token: str | None = None) -> FastAPI:
     @app.post("/api/jobs", status_code=201)
     async def jobs_create(body: JobCreate) -> dict:
         params = dict(body.params)
+        out_dir = _outputs_dir()
         if body.kind == "infer" and not params.get("output"):
             # 输出定向到受控目录，便于产物注册与试听
             stem = Path(str(params.get("input", "out"))).stem or "out"
-            out_dir = _outputs_dir()
             out_dir.mkdir(parents=True, exist_ok=True)
             params["output"] = str(out_dir / f"out_{stem}_{int(time.time())}.wav")
+        elif body.kind == "train":
+            try:
+                params = _normalize_train(params, out_dir)
+            except JobError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
         try:
             job = await scheduler.submit(body.kind, params)
         except JobError as exc:
@@ -230,6 +288,17 @@ def create_app(token: str | None = None) -> FastAPI:
         if result is None:
             raise HTTPException(status_code=404, detail="audio not found")
         return result
+
+    @app.get("/api/jobs/{job_id}/metrics")
+    async def job_metrics(job_id: str) -> dict:
+        """训练曲线：解析 job 的 exp_dir 下 tfevents 标量（历史+增量）。"""
+        job = scheduler.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        exp_dir = (job.params or {}).get("exp_dir")
+        if not exp_dir:
+            raise HTTPException(status_code=404, detail="no exp_dir for this job")
+        return await asyncio.to_thread(tfevents.scalars, exp_dir)
 
     @app.get("/api/jobs/{job_id}/events")
     async def jobs_events(job_id: str, from_seq: int = Query(0, ge=0)) -> StreamingResponse:

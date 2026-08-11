@@ -33,6 +33,7 @@ KINDS: dict[str, dict] = {
     "checkenv": {"gpu": False, "desc": "运行 usvc-checkenv 环境诊断（流式输出日志）"},
     "sleep": {"gpu": False, "desc": "验证用：挂起 1 小时（用于测试取消）"},
     "infer": {"gpu": True, "desc": "单文件歌声转换（usvc-infer）"},
+    "train": {"gpu": True, "desc": "训练（usvc-train）"},
 }
 
 _ECHO_SCRIPT = (
@@ -57,6 +58,8 @@ def _argv_for(kind: str, params: dict | None = None) -> list[str]:
         return [sys.executable, "-c", _SLEEP_SCRIPT]
     if kind == "infer":
         return _infer_argv(params or {})
+    if kind == "train":
+        return _train_argv(params or {})
     raise JobError(f"unknown job kind: {kind!r}")
 
 
@@ -101,6 +104,18 @@ _INFER_BOOL_FLAGS = {
     "shallow_diffusion": "--shd",
     "no_restore_loudness": "--no-restore-loudness",
 }
+
+
+def _train_argv(params: dict) -> list[str]:
+    config = params.get("config")
+    if not config:
+        raise JobError("train job requires params: config")
+    argv = [sys.executable, "-m", "usvc.cli.train", "--config", str(config)]
+    if params.get("resume"):
+        argv += ["--resume", str(params["resume"])]
+    if params.get("device"):
+        argv += ["--device", str(params["device"])]
+    return argv
 
 
 def _infer_argv(params: dict) -> list[str]:
@@ -240,6 +255,8 @@ class JobScheduler:
             missing = [k for k in ("input", "config", "ckpt") if not (params or {}).get(k)]
             if missing:
                 raise JobError(f"infer job requires params: {', '.join(missing)}")
+        if kind == "train" and not (params or {}).get("config"):
+            raise JobError("train job requires params: config")
         job = Job(kind, params)
         self._jobs[job.id] = job
         task = asyncio.create_task(self._run(job))
