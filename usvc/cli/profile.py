@@ -47,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--vocoder-dir", default=None)
     pi.add_argument("--extra-arg", action="append", default=[],
                     help="extra args passed to usvc-infer (e.g. --extra-arg=--half)")
+    pi.add_argument("--half", action="store_true", help="FP16 autocast (rvc 默认开)")
+    pi.add_argument("--bf16", action="store_true", help="BF16 autocast")
+    pi.add_argument("--no-half", action="store_true", help="强制 FP32 (覆盖 rvc 默认)")
 
     args = p.parse_args(argv)
 
@@ -70,6 +73,13 @@ def _profile_infer(args) -> int:
     infer_args = ["--config", args.config, "--ckpt", args.ckpt,
                   "--input", args.input, "--spk", str(args.spk),
                   "--trans", str(args.trans)]
+    # 精度: --no-half 优先, 然后 --bf16, 然后 --half, 默认看 backend(rvc默认half)
+    if args.no_half:
+        infer_args += ["--precision", "fp32"]
+    elif args.bf16:
+        infer_args += ["--precision", "bf16"]
+    elif args.half:
+        infer_args += ["--precision", "fp16"]
     if args.vocoder_dir:
         infer_args += ["--vocoder-dir", args.vocoder_dir]
     infer_args += args.extra_arg
@@ -127,6 +137,7 @@ def _profile_infer(args) -> int:
 
 def _run_inference() -> int:
     """被 nsys 包裹运行: warmup 1 次 + profile 1 次推理。"""
+    import torch
     args = json.loads(os.environ["USVC_PROFILE_ARGS"])
     from usvc.infer.engine import InferenceEngine
     cfg, ckpt = args[args.index("--config") + 1], args[args.index("--ckpt") + 1]
@@ -137,6 +148,17 @@ def _run_inference() -> int:
     if "--vocoder-dir" in args:
         kw["vocoder_dir"] = args[args.index("--vocoder-dir") + 1]
     eng = InferenceEngine(cfg, ckpt, device="cuda", **kw)
+    # 精度设置: --precision fp32/bf16/fp16 (默认 rvc 自动 half)
+    precision = args[args.index("--precision") + 1] if "--precision" in args else "auto"
+    if precision == "fp32":
+        eng.half = False
+        eng._autocast_dtype = None
+    elif precision == "fp16":
+        eng.half = True
+        eng._autocast_dtype = torch.float16
+    elif precision == "bf16":
+        eng.half = True
+        eng._autocast_dtype = torch.bfloat16
     _ = eng.convert(inp, spk=spk, trans=trans)  # warmup
     # profile: 用 ShapeCapture 包裹, 记录 conv/gemm shapes
     from usvc._profiler.shape_capture import ShapeCapture
