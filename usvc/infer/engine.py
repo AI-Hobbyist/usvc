@@ -206,7 +206,7 @@ class InferenceEngine:
         diffusion_config: str | Path | None = None,
         reflow_ckpt: str | Path | None = None,
         reflow_config: str | Path | None = None,
-        t_start: float = 0.5,
+        t_start: float = 0.6,
         compile_graph: bool = False,
         dec_cl: bool = True,
         vocoder_cl: bool = True,
@@ -565,6 +565,7 @@ class InferenceEngine:
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
         t_start: float | None = None,
+        reflow_steps: int = 20,
         rms_mix_rate: float = 1.0,
         protect: float = 0.5,
         f0_method: str | None = None,
@@ -591,6 +592,9 @@ class InferenceEngine:
             shallow flow — whichever is loaded, reflow preferred).
         t_start: reflow ODE start time in [0,1); overrides the engine default.
             Ignored when only the diffusion enhancer is loaded.
+        reflow_steps: reflow ODE euler integration steps (smaller dt, less
+            overshoot near the t_start boundary; helps when t_start is at the
+            training lower bound).
         rms_mix_rate: RVC-style output RMS envelope match (1.0 = untouched;
             0.0 = fully input envelope).
         protect: RVC-style source-feature blend on speech frames (>= 0.5 =
@@ -670,6 +674,7 @@ class InferenceEngine:
                 diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup,
                 t_start=_t_start,
+                reflow_steps=reflow_steps,
                 steps=steps,
                 noice_scale=noice_scale,
                 predict_f0=predict_f0,
@@ -698,6 +703,7 @@ class InferenceEngine:
                     diffusion_method=diffusion_method,
                     diffusion_speedup=diffusion_speedup,
                     t_start=_t_start,
+                    reflow_steps=reflow_steps,
                     steps=steps,
                     noice_scale=noice_scale,
                     predict_f0=predict_f0,
@@ -834,7 +840,8 @@ class InferenceEngine:
         k_step: int = 100,
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
-        t_start: float = 0.5,
+        t_start: float = 0.6,
+        reflow_steps: int = 20,
         steps: int | None = None,
         noice_scale: float = 0.4,
         predict_f0: bool = False,
@@ -936,6 +943,7 @@ class InferenceEngine:
                 units, f0, rms, spk, wav[0, 0].float(),
                 k_step=k_step, diffusion_method=diffusion_method,
                 diffusion_speedup=diffusion_speedup, t_start=t_start,
+                reflow_steps=reflow_steps,
             )
 
         return wav[0, 0].float().cpu().numpy()
@@ -950,7 +958,8 @@ class InferenceEngine:
         k_step: int = 100,
         diffusion_method: str = "ddim",
         diffusion_speedup: int = 10,
-        t_start: float = 0.5,
+        t_start: float = 0.6,
+        reflow_steps: int = 20,
     ) -> np.ndarray:
         """Dispatch to the loaded shallow enhancer (diffusion or reflow).
 
@@ -980,6 +989,7 @@ class InferenceEngine:
             enh_out = self.reflow_enhancer.enhance(
                 units_in, f0_in, rms_in, spk, wav_in,
                 t_start=t_start,
+                infer_step=reflow_steps,
             )
             if backend_sr != enh_sr:
                 enh_out = _resample_wav(enh_out, enh_sr, backend_sr)

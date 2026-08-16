@@ -303,8 +303,8 @@ class ReflowEnhancer:
         rms: torch.Tensor | None,
         spk_id: int,
         gen_wav: torch.Tensor | np.ndarray,
-        t_start: float = 0.5,
-        infer_step: int = 10,
+        t_start: float = 0.6,
+        infer_step: int = 20,
         method: str = "euler",
     ) -> np.ndarray:
         """Shallow-diffuse ``gen_wav`` via DDSP6 reflow.
@@ -323,7 +323,10 @@ class ReflowEnhancer:
             gen_wav: sovits/rvc output wav [L] float (at ``self.sr``).
             t_start: reflow ODE start time in [0, 1).  0 = full generation,
                 →1 = keep gt.  Typical shallow diffusion: 0.3–0.7.
-            infer_step: ODE solver steps (10 is plenty for euler).
+            infer_step: ODE euler steps.  ≥20 recommended: with 10 steps the
+                euler dt (0.05 at t_start=0.5) overshoots near the training
+                lower bound and mangles the spectrum (1-3 kHz bulge =
+                "underwater").  20 steps / dt 0.025 measured clean.
             method: 'euler' (fast) or 'rk4' (higher order).
 
         Returns:

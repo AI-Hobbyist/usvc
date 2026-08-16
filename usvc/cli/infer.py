@@ -80,9 +80,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="DDSP6 reflow model checkpoint (enables reflow enhancer)")
     p.add_argument("--reflow-config", default=None,
                    help="DDSP6 reflow model config yaml")
-    p.add_argument("--t-start", type=float, default=0.5,
+    p.add_argument("--t-start", type=float, default=0.6,
                    help="reflow ODE start time [0,1): 0=full gen, ->1=keep gt "
-                        "(default 0.5; only used with --reflow-ckpt)")
+                        "(default 0.6; only used with --reflow-ckpt)")
+    p.add_argument("--reflow-steps", type=int, default=20,
+                   help="reflow ODE euler integration steps (default 20; "
+                        "smaller dt avoids overshoot at the training lower bound)")
     # rift_dit CFG overrides (default None = use config values)
     p.add_argument("--ds-cfg", dest="ds_cfg_strength", type=float, default=None,
                    help="rift content(units) CFG strength (overrides config; default=config)")
@@ -120,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         reflow_ckpt=args.reflow_ckpt,
         reflow_config=args.reflow_config,
         t_start=args.t_start,
+
         compile_graph=args.compile_graph,
     )
 
@@ -143,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         diffusion_method=args.diffusion_method,
         diffusion_speedup=args.diffusion_speedup,
         t_start=args.t_start,
+        reflow_steps=args.reflow_steps,
         rms_mix_rate=args.rms_mix_rate,
         protect=args.protect,
         f0_method=args.f0_method,
