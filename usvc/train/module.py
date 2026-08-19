@@ -144,5 +144,13 @@ class BaseSVCModule(LightningModule):
     # ---- Helpers ----
 
     @staticmethod
+    def _unpack(batch: SVCBatch):
+        """Unpack shared condition fields; volume falls back to mel energy."""
+        volume = batch.rms if batch.rms is not None else None
+        if volume is None:
+            volume = (batch.mel.exp() - 1e-6).clamp(min=1e-6).sqrt().mean(dim=-1)
+        return batch.units, batch.f0, volume, batch.spk_id, batch.mel, batch.aug_shift
+
+    @staticmethod
     def _bs(batch: SVCBatch) -> int:
         return batch.units.shape[0]

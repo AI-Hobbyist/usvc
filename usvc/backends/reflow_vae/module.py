@@ -43,16 +43,7 @@ class ReflowVAEModule(BaseSVCModule):
 
     def forward_loss(self, batch: SVCBatch):
         """Bi_RectifiedFlow reflow loss (l2_lognorm)."""
-        units = batch.units
-        f0 = batch.f0
-        volume = batch.rms if batch.rms is not None else None
-        spk_id = batch.spk_id
-        gt_spec = batch.mel
-        aug_shift = batch.aug_shift
-
-        if volume is None:
-            volume = (batch.mel.exp() - 1e-6).clamp(min=1e-6).sqrt().mean(dim=-1)
-
+        units, f0, volume, spk_id, gt_spec, aug_shift = self._unpack(batch)
         loss, sub = self.model(
             units, f0, volume, spk_id, gt_spec, aug_shift=aug_shift,
             frame_len=batch.frame_len,
@@ -64,15 +55,7 @@ class ReflowVAEModule(BaseSVCModule):
 
         steps: ODE integration steps (default 10).
         """
-        units = batch.units
-        f0 = batch.f0
-        volume = batch.rms if batch.rms is not None else None
-        spk_id = batch.spk_id
-        aug_shift = batch.aug_shift
-
-        if volume is None:
-            volume = (batch.mel.exp() - 1e-6).clamp(min=1e-6).sqrt().mean(dim=-1)
-
+        units, f0, volume, spk_id, _, aug_shift = self._unpack(batch)
         with torch.no_grad():
             mel_gen = self.model.sample(
                 units, f0, volume, spk_id, aug_shift=aug_shift,
