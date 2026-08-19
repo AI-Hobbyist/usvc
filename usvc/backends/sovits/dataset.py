@@ -2,17 +2,16 @@
 
 sovits needs: units(hubert-soft), f0, spec(linear spectrogram), wav(waveform), spk_id, uv.
 Uses filelist-based loading. Variable-length, sliced at train time.
+Shared skeleton lives in usvc/backends/_dataset.py (BaseDirDataset + crop/pad
+helpers). The random crop keeps so-vits' own random source: the per-dataset
+self._rng (seed 42, NOT the global torch generator — see RVCDataset).
 """
 from __future__ import annotations
-
-from functools import partial
-from pathlib import Path
 
 import numpy as np
 import torch
 
-from ...data.meta import load_meta
-from ...train.dataset import BaseSVCDataset
+from .._dataset import BaseDirDataset, align_spec_to_frames, align_wav, slice_or_pad
 
 __all__ = ["SoVITSDataset", "interp_unvoiced_f0"]
 
@@ -35,7 +34,7 @@ def interp_unvoiced_f0(f0: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(f0_np).to(device=device, dtype=dtype)
 
 
-class SoVITSDataset(BaseSVCDataset):
+class SoVITSDataset(BaseDirDataset):
     """Dataset for sovits backend (VITS + NSF-HiFiGAN)."""
 
     def __init__(
@@ -47,22 +46,7 @@ class SoVITSDataset(BaseSVCDataset):
         augment: bool = True,
         encoder_kind: str = "hubertsoft",
     ):
-        super().__init__(dataset_dir, split, max_frames, augment)
-        self.dataset_dir = Path(dataset_dir)
-        self.encoder_kind = encoder_kind
-
-        self.meta = load_meta(str(dataset_dir))
-        self.spk2idx = {s: i for i, s in enumerate(self.meta.speakers)}
-
-        if self.meta.splits:
-            split_files = set(self.meta.splits.get(split, []))
-            self.keys = [
-                (a.speaker, a.file_name)
-                for a in self.meta.audios
-                if a.file_name in split_files
-            ]
-        else:
-            self.keys = [(a.speaker, a.file_name) for a in self.meta.audios]
+        super().__init__(dataset_dir, split, feature_hashes, max_frames, augment, encoder_kind)
 
         self._units_dir = (
             self.dataset_dir / "units" / encoder_kind / feature_hashes.get("units", "")
@@ -77,8 +61,6 @@ class SoVITSDataset(BaseSVCDataset):
 
         self.sr = self.meta.sr
         self.hop = self.meta.hop
-
-        self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
 
     def _load_one(self, key) -> dict:
         spk, fn = key
@@ -119,27 +101,26 @@ class SoVITSDataset(BaseSVCDataset):
         T = units.shape[0]
         if T > mf:
             start = int(torch.randint(0, T - mf + 1, (1,), generator=self._rng).item())
-            units = units[start : start + mf]
-            f0 = f0[start : start + mf]
-            uv = uv[start : start + mf]
+            units = slice_or_pad(units, mf, T, start)
+            f0 = slice_or_pad(f0, mf, T, start)
+            uv = slice_or_pad(uv, mf, T, start)
             if rms is not None:
-                rms = rms[start : start + mf]
+                rms = slice_or_pad(rms, mf, T, start)
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
-                spec = spec[start : start + mf]
+                spec = slice_or_pad(spec, mf, T, start)
             T = mf
         elif T < mf:
-            pad_n = mf - T
-            units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
-            f0 = torch.nn.functional.pad(f0, (0, pad_n))
-            uv = torch.nn.functional.pad(uv, (0, pad_n))
+            units = slice_or_pad(units, mf, T)
+            f0 = slice_or_pad(f0, mf, T)
+            uv = slice_or_pad(uv, mf, T)
             if rms is not None:
-                rms = torch.nn.functional.pad(rms, (0, pad_n))
+                rms = slice_or_pad(rms, mf, T)
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
-                spec = torch.nn.functional.pad(spec, (0, 0, 0, pad_n))
+                spec = slice_or_pad(spec, mf, T)
             T = mf
         else:
             if spec is not None and spec.ndim == 3:
@@ -150,25 +131,10 @@ class SoVITSDataset(BaseSVCDataset):
         # frame due to len//hop + 1 convention); GAN wave slicing needs
         # ids_slice*hop + segment <= T*hop.
         if wav is not None:
-            hop = self.meta.hop
-            target_len = T * hop
-            if wav.shape[0] > target_len:
-                wav = wav[:target_len]
-            elif wav.shape[0] < target_len:
-                wav = torch.nn.functional.pad(wav, (0, target_len - wav.shape[0]))
+            wav = align_wav(wav, T * self.meta.hop)
         if spec is not None:
             # Force-align spec frames to exactly T (units frame count).
-            # spec and units may differ by ±1 frame due to differing STFT
-            # conventions (spec uses center=True len//hop+1; units align via
-            # gather). Without this, collate sees [C, 47] vs [C, 48].
-            if spec.ndim == 3:
-                spec = spec[0]  # [T_spec, C]
-            spec_T = spec.shape[0]
-            if spec_T > T:
-                spec = spec[:T]
-            elif spec_T < T:
-                spec = torch.nn.functional.pad(spec, (0, 0, 0, T - spec_T))
-            spec = spec.transpose(0, 1)  # [C, T]
+            spec = align_spec_to_frames(spec, T)
 
         return {
             "units": units,

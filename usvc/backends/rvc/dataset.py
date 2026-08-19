@@ -2,21 +2,20 @@
 
 RVC needs: units(contentvec 768d), pitch(quantized token 1-255), pitchf(continuous f0),
 spec(linear spectrogram), wav(waveform), sid(speaker id).
+Shared skeleton lives in usvc/backends/_dataset.py (BaseDirDataset + crop/pad
+helpers). The random crop keeps RVC's own random source: the GLOBAL default
+torch generator (NOT the per-dataset self._rng — see SoVITSDataset).
 """
 from __future__ import annotations
 
-from functools import partial
-from pathlib import Path
-
 import torch
 
-from ...data.meta import load_meta
-from ...train.dataset import BaseSVCDataset
+from .._dataset import BaseDirDataset, align_spec_to_frames, align_wav, slice_or_pad
 
 __all__ = ["RVCDataset"]
 
 
-class RVCDataset(BaseSVCDataset):
+class RVCDataset(BaseDirDataset):
     """Dataset for rvc backend (VITS + NSF-HiFiGAN, v2)."""
 
     def __init__(
@@ -28,22 +27,7 @@ class RVCDataset(BaseSVCDataset):
         augment: bool = True,
         encoder_kind: str = "contentvec",
     ):
-        super().__init__(dataset_dir, split, max_frames, augment)
-        self.dataset_dir = Path(dataset_dir)
-        self.encoder_kind = encoder_kind
-
-        self.meta = load_meta(str(dataset_dir))
-        self.spk2idx = {s: i for i, s in enumerate(self.meta.speakers)}
-
-        if self.meta.splits:
-            split_files = set(self.meta.splits.get(split, []))
-            self.keys = [
-                (a.speaker, a.file_name)
-                for a in self.meta.audios
-                if a.file_name in split_files
-            ]
-        else:
-            self.keys = [(a.speaker, a.file_name) for a in self.meta.audios]
+        super().__init__(dataset_dir, split, feature_hashes, max_frames, augment, encoder_kind)
 
         self._units_dir = (
             self.dataset_dir / "units" / encoder_kind / feature_hashes.get("units", "")
@@ -53,8 +37,6 @@ class RVCDataset(BaseSVCDataset):
         # rms (volume) for vol_embedding; may not exist in all datasets
         self._rms_dir = self.dataset_dir / "rms" / feature_hashes.get("rms", "")
         self._audio_dir = self.dataset_dir / "audio"
-
-        self._load_pt = partial(torch.load, weights_only=True, map_location="cpu")
 
     def _load_one(self, key) -> dict:
         spk, fn = key
@@ -83,7 +65,6 @@ class RVCDataset(BaseSVCDataset):
             wav = torch.from_numpy(wav)
 
         # RVC f0: quantize to token (1-255) + keep continuous pitchf
-        # RVC formula: pitch_token = f0_to_coarse(f0), pitchf = log2(f0/10) clamped
         pitchf = f0.clone()
         pitch_token = self._f0_to_coarse(f0)
 
@@ -92,28 +73,27 @@ class RVCDataset(BaseSVCDataset):
         # max_frames (random offset), short audio pads. RVC segment_size must fit.
         mf = self.max_frames
         if T > mf:
-            start = int(torch.randint(0, T - mf + 1, (1,)).item())
-            units = units[start : start + mf]
-            pitch_token = pitch_token[start : start + mf]
-            pitchf = pitchf[start : start + mf]
+            start = int(torch.randint(0, T - mf + 1, (1,)).item())  # global default generator
+            units = slice_or_pad(units, mf, T, start)
+            pitch_token = slice_or_pad(pitch_token, mf, T, start)
+            pitchf = slice_or_pad(pitchf, mf, T, start)
             if rms is not None:
-                rms = rms[start : start + mf]
+                rms = slice_or_pad(rms, mf, T, start)
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
-                spec = spec[start : start + mf]
+                spec = slice_or_pad(spec, mf, T, start)
             T = mf
         elif T < mf:
-            pad_n = mf - T
-            units = torch.nn.functional.pad(units, (0, 0, 0, pad_n))
-            pitch_token = torch.nn.functional.pad(pitch_token, (0, pad_n))
-            pitchf = torch.nn.functional.pad(pitchf, (0, pad_n))
+            units = slice_or_pad(units, mf, T)
+            pitch_token = slice_or_pad(pitch_token, mf, T)
+            pitchf = slice_or_pad(pitchf, mf, T)
             if rms is not None:
-                rms = torch.nn.functional.pad(rms, (0, pad_n))
+                rms = slice_or_pad(rms, mf, T)
             if spec is not None:
                 if spec.ndim == 3:
                     spec = spec[0]
-                spec = torch.nn.functional.pad(spec, (0, 0, 0, pad_n))
+                spec = slice_or_pad(spec, mf, T)
             T = mf
         else:
             if spec is not None and spec.ndim == 3:
@@ -124,26 +104,12 @@ class RVCDataset(BaseSVCDataset):
         if rms is not None:
             rms = rms[:T]
         if spec is not None:
-            # Force-align spec frames to exactly T (units frame count).
-            # spec and units may differ by ±1 frame due to STFT conventions.
-            if spec.ndim == 3:
-                spec = spec[0]
-            spec_T = spec.shape[0]
-            if spec_T > T:
-                spec = spec[:T]
-            elif spec_T < T:
-                spec = torch.nn.functional.pad(spec, (0, 0, 0, T - spec_T))
-            spec = spec.transpose(0, 1)  # [C, T]
-        # Align wav to frame_len * hop (frame count may exceed
-        # wav samples by one frame due to len//hop + 1 convention).
-        # GAN wave slicing uses ids_slice*hop + segment <= T*hop.
+            spec = align_spec_to_frames(spec, T)
+        # Align wav to frame_len * hop (frame count may exceed wav samples by one
+        # frame due to len//hop + 1 convention). GAN wave slicing uses
+        # ids_slice*hop + segment <= T*hop.
         if wav is not None:
-            hop = self.meta.hop
-            target_len = T * hop
-            if wav.shape[0] > target_len:
-                wav = wav[:target_len]
-            elif wav.shape[0] < target_len:
-                wav = torch.nn.functional.pad(wav, (0, target_len - wav.shape[0]))
+            wav = align_wav(wav, T * self.meta.hop)
 
         return {
             "units": units,
