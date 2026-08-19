@@ -30,6 +30,7 @@ import mlx.nn as nn
 from .._ops import interpolate_linear, interpolate_nearest
 from ..nsf_hifigan import ResBlock1, ResBlock2  # 复用 vocoder 的 ResBlock
 
+from .._gan import DiscriminatorP, DiscriminatorS, MultiPeriodDiscriminator
 __all__ = [
     "RVCSineGen",
     "RVCSourceModuleHnNSF",
@@ -801,98 +802,6 @@ def _rvc_train_forward(self, units, pitch_token, pitchf, spec, wave, spk_id,
 
 
 # RVC MultiPeriodDiscriminatorV2:DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)
-class DiscriminatorP(nn.Module):
-    """Period discriminator(RVC v2,Conv2d NLC 4D 布局)。"""
-
-    def __init__(self, period: int, kernel_size: int = 5, stride: int = 3,
-                 use_spectral_norm: bool = False):
-        super().__init__()
-        self.period = period
-        self.use_spectral_norm = use_spectral_norm
-        from .sovits import get_padding
-        pad = get_padding(kernel_size, 1)
-        self.convs = [
-            nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
-            nn.Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
-            nn.Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
-            nn.Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(pad, 0)),
-            nn.Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(pad, 0)),
-        ]
-        self.conv_post = nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0))
-
-    def __call__(self, x):
-        import mlx.core as _mx
-        fmap = []
-        B, T, C = x.shape
-        if T % self.period != 0:
-            n_pad = self.period - (T % self.period)
-            import numpy as _np
-            x_np = _np.pad(_np.array(x), [(0, 0), (0, n_pad), (0, 0)], mode="reflect")
-            x = _mx.array(x_np)
-            T = T + n_pad
-        x = x.reshape(B, T // self.period, self.period, C)
-        for l in self.convs:
-            x = l(x)
-            x = _mx.maximum(0.1 * x, x)
-            fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = x.reshape(B, -1)
-        return x, fmap
-
-
-class DiscriminatorS(nn.Module):
-    """Scale discriminator(RVC v2,Conv1d NLC)。"""
-
-    def __init__(self, use_spectral_norm: bool = False):
-        super().__init__()
-        self.convs = [
-            nn.Conv1d(1, 16, 15, 1, padding=7),
-            nn.Conv1d(16, 64, 41, 4, groups=4, padding=20),
-            nn.Conv1d(64, 256, 41, 4, groups=16, padding=20),
-            nn.Conv1d(256, 1024, 41, 4, groups=64, padding=20),
-            nn.Conv1d(1024, 1024, 41, 4, groups=256, padding=20),
-            nn.Conv1d(1024, 1024, 5, 1, padding=2),
-        ]
-        self.conv_post = nn.Conv1d(1024, 1, 3, 1, padding=1)
-
-    def __call__(self, x):
-        import mlx.core as _mx
-        fmap = []
-        for l in self.convs:
-            x = l(x)
-            x = _mx.maximum(0.1 * x, x)
-            fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = x.reshape(x.shape[0], -1)
-        return x, fmap
-
-
-class MultiPeriodDiscriminatorV2(nn.Module):
-    """RVC v2 MPD: DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)。"""
-
-    def __init__(self, use_spectral_norm: bool = False):
-        super().__init__()
-        periods = [2, 3, 5, 7, 11, 17, 23, 37]
-        discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
-        discs = discs + [
-            DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods
-        ]
-        self.discriminators = discs
-
-    def __call__(self, y, y_hat):
-        y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
-        for d in self.discriminators:
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            y_d_gs.append(y_d_g)
-            fmap_rs.append(fmap_r)
-            fmap_gs.append(fmap_g)
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
-
-
 def _rvc_forward_train(self, units, pitch_token, pitchf, spec, wave, spk_id,
                        frame_len=None, vol=None):
     return _rvc_train_forward(
@@ -902,3 +811,12 @@ def _rvc_forward_train(self, units, pitch_token, pitchf, spec, wave, spk_id,
 
 
 RVCModel.forward_train = _rvc_forward_train
+
+
+class MultiPeriodDiscriminatorV2(MultiPeriodDiscriminator):
+    """RVC v2 MPD: DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)."""
+
+    def __init__(self, use_spectral_norm: bool = False):
+        super().__init__(periods=(2, 3, 5, 7, 11, 17, 23, 37), use_spectral_norm=use_spectral_norm)
+
+
