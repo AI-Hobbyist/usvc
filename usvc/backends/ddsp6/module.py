@@ -23,37 +23,11 @@ from .model import DDSP6Model
 __all__ = ["DDSPModule"]
 
 # Per-release default model dims (configs/reflow.yaml model section).
-_VERSION_DEFAULTS = {
-    "6.1": dict(velocity_net="LYNXNet", n_aux_layers=3, n_aux_chans=256,
-                 n_layers=6, n_chans=512, t_start=0.7, use_norm=False),
-    "6.2": dict(velocity_net="LYNXNet", n_aux_layers=6, n_aux_chans=512,
-                 n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
-    "6.3": dict(velocity_net="LYNXNet2", n_aux_layers=6, n_aux_chans=512,
-                 n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
-}
-
-
-def _resolve_opts(opts: dict) -> dict:
-    """Version defaults overlaid by explicit backend_opts.
-
-    Returns a dict containing the version defaults PLUS every other key present
-    in ``opts`` (n_units / num_speaker / out_dims / sampling_rate / hop_length
-    / etc.), so downstream ``opts.get(...)`` calls can actually read user
-    overrides. Previously only keys already in the version-defaults dict
-    survived, which silently dropped multi-speaker / units-dim overrides.
-    """
-    version = str(opts.get("version", "6.3"))
-    if version not in _VERSION_DEFAULTS:
-        raise ValueError(f"ddsp6 version must be one of {list(_VERSION_DEFAULTS)}, got {version!r}")
-    resolved = dict(_VERSION_DEFAULTS[version])
-    # Merge ALL user opts on top of the version defaults (user wins). This keeps
-    # the version-specific knobs (velocity_net / n_layers / ...) overridable while
-    # also passing through architecture keys not listed in _VERSION_DEFAULTS.
-    for k, v in opts.items():
-        if k != "version":
-            resolved[k] = v
-    return resolved
-
+# 版本默认值表与解析函数共享于 backends._defaults(was 本文件内嵌副本)
+from .._defaults import (  # noqa: E402  (tests 仍可从本模块导入 _resolve_opts)
+    DDSP6_VERSION_DEFAULTS as _VERSION_DEFAULTS,
+    resolve_ddsp6_opts as _resolve_opts,
+)
 
 class DDSPModule(BaseSVCModule):
     """LightningModule for ddsp6 (DDSP + Rectified Flow)."""

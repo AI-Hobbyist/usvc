@@ -746,14 +746,13 @@ class DiffusionModel(nn.Module):
             k_step: 采样步数上限。None 时从 ckpt 反推(优先 hyper_parameters/
                 ``decoder.betas`` 长度,失败回退 1000)。
         """
-        from .._convert import load_torch_ckpt_to_mlx
+        from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype or mx.float32)
         if key_prefix:
-            prefix = key_prefix + "."
-            stripped = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+            stripped = strip_prefix(sd, key_prefix + ".")
             if not stripped:
-                # 前缀不匹配,尝试无前缀(裸 DiffusionModel sd)
+                # 前缀不匹配,尝试无前缀(裸 DiffusionModel sd) —— 回退顺序保留
                 stripped = sd
             sd = stripped
         cfg = cls._infer_config(sd)

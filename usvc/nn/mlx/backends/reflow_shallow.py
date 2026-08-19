@@ -439,14 +439,12 @@ class ReflowShallowModel(nn.Module):
         键形如 ``model.reflow_model.velocity_fn.*`` / ``model.unit_embed.*``
         (lightning wrapper);也兼容 ``module.`` 前缀或无前缀。
         """
-        from .._convert import load_torch_ckpt_to_mlx
+        from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype or mx.float32)
         if key_prefix:
-            prefix = key_prefix + "."
-            stripped = {k[len(prefix):]: v for k, v in sd.items()
-                        if k.startswith(prefix)}
-            if not stripped:
+            stripped = strip_prefix(sd, key_prefix + ".")
+            if not stripped:  # 裸 sd 回退(顺序保留)
                 stripped = sd
             sd = stripped
         cfg = cls._infer_config(sd)

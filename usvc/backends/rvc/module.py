@@ -13,13 +13,8 @@ __all__ = ["RVCModule"]
 
 
 # RVC upsample configs by (version, sr): prod(upsample_rates) == hop (sr/100)
-_RVC_UPSAMPLE = {
-    ("v1", 32000): ([10, 4, 2, 2, 2], [16, 16, 4, 4, 4]),
-    ("v1", 40000): ([10, 10, 2, 2], [16, 16, 4, 4]),
-    ("v1", 48000): ([10, 6, 2, 2, 2], [16, 16, 4, 4, 4]),
-    ("v2", 32000): ([10, 8, 2, 2], [20, 16, 4, 4]),
-    ("v2", 48000): ([12, 10, 2, 2], [24, 20, 4, 4]),
-}
+# upsample 默认表共享于 backends._defaults(was 本文件内嵌副本)
+from .._defaults import RVC_UPSAMPLE as _RVC_UPSAMPLE
 
 
 class RVCModule(BaseGANModule):

@@ -534,14 +534,12 @@ class ReflowVAEModel(Unit2Wav_VAE):
         strict=False 会跳过 attention 权重(结构可用,权重需键映射,见
         MLX_PITFALLS)。
         """
-        from .._convert import load_torch_ckpt_to_mlx
+        from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype or mx.float32)
         if key_prefix:
-            prefix = key_prefix + "."
-            stripped = {k[len(prefix):]: v for k, v in sd.items()
-                        if k.startswith(prefix)}
-            if not stripped:
+            stripped = strip_prefix(sd, key_prefix + ".")
+            if not stripped:  # 裸 sd 回退(顺序保留)
                 stripped = sd
             sd = stripped
         cfg = cls._infer_config(sd)

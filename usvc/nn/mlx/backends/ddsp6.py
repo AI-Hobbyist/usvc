@@ -832,12 +832,15 @@ class DDSP6Model(nn.Module):
 
         config 提供构造参数;None 时从权重 shape 反推(见 _infer_config)。
         """
+        from .._convert import load_torch_ckpt_to_mlx, strip_prefix
+
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype)
         cfg = config if config is not None else cls._infer_config(sd)
         obj = cls(**cfg)
-        # 剥 lightning model. 前缀(训练 ckpt 保存为 model.ddsp_model.*)
+        # 剥 lightning model. 前缀(训练 ckpt 保存为 model.ddsp_model.*;
+        # 探测条件保留原样,剥离动作收敛到 strip_prefix)
         if any(k.startswith("model.") for k in sd):
-            sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+            sd = strip_prefix(sd, "model.")
         obj.load_weights(list(sd.items()), strict=strict)
         obj.eval()
         return obj

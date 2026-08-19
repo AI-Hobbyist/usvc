@@ -167,6 +167,17 @@ def _transpose_conv_transpose(arr, ndim: int):
 # 一站式:torch ckpt path → mlx-ready state_dict
 # ---------------------------------------------------------------------------
 
+def strip_prefix(sd: dict, prefix: str) -> dict:
+    """机械剥离顶层前缀(仅删 ``prefix`` 开头的键,其余丢弃)。
+
+    前缀探测/回退逻辑由各 from_ckpt 自行保留(探测顺序是冻结契约,
+    见 backends/*.py);此处只做纯字符串剥离,prefix="" 时原样返回。
+    """
+    if not prefix:
+        return dict(sd)
+    return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+
 def load_torch_ckpt_to_mlx(
     ckpt_path: str | Path,
     *,

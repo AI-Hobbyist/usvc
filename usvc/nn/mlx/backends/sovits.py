@@ -818,7 +818,7 @@ class Generator(nn.Module):
             config: Generator 构造参数(h dict);None 时从权重反推。
             strict: 是否严格匹配权重键。
         """
-        from .._convert import load_torch_ckpt_to_mlx, load_torch_sd
+        from .._convert import load_torch_ckpt_to_mlx, load_torch_sd, strip_prefix
         from .._ops import merge_weight_norm
 
         if config is None:
@@ -834,12 +834,8 @@ class Generator(nn.Module):
             if k.startswith(pref + "ups.") and k.endswith(".weight")
         }
         sd = load_torch_ckpt_to_mlx(ckpt_path, convtranspose_keys=ups_keys)
-        dec_sd = {}
-        for k, v in sd.items():
-            if pref and k.startswith(pref):
-                dec_sd[k[len(pref):]] = v
-            elif not pref:
-                dec_sd[k] = v
+        # 原循环:pref 时只留 dec.* 键剥前缀,无 pref 时全留 —— strip_prefix 同语义
+        dec_sd = strip_prefix(sd, pref)
         obj.load_weights(list(dec_sd.items()), strict=strict)
         obj.eval()
         return obj

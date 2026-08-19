@@ -10,28 +10,11 @@ import mlx.core as mx
 __all__ = ["build"]
 
 # 与 torch usvc/backends/ddsp6/module.py 一致的版本默认值
-_VERSION_DEFAULTS = {
-    "6.1": dict(velocity_net="LYNXNet", n_aux_layers=3, n_aux_chans=256,
-                n_layers=6, n_chans=512, t_start=0.7, use_norm=False),
-    "6.2": dict(velocity_net="LYNXNet", n_aux_layers=6, n_aux_chans=512,
-                n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
-    "6.3": dict(velocity_net="LYNXNet2", n_aux_layers=6, n_aux_chans=512,
-                n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
-}
-
-
-def _resolve_opts(opts: dict) -> dict:
-    version = str(opts.get("version", "6.3"))
-    if version not in _VERSION_DEFAULTS:
-        raise ValueError(
-            f"ddsp6 version must be one of {list(_VERSION_DEFAULTS)}, got {version!r}"
-        )
-    resolved = dict(_VERSION_DEFAULTS[version])
-    for k, v in opts.items():
-        if k != "version":
-            resolved[k] = v
-    return resolved
-
+# 与 torch usvc/backends/ddsp6/module.py 共享同一份默认表/解析函数
+from ....backends._defaults import (
+    DDSP6_VERSION_DEFAULTS as _VERSION_DEFAULTS,
+    resolve_ddsp6_opts as _resolve_opts,
+)
 
 def build(cfg):
     from ....nn.mlx.backends.ddsp6 import DDSP6Model

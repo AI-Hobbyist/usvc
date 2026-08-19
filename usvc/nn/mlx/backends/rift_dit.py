@@ -776,13 +776,13 @@ class RIFTDiTModel(nn.Module):
         默认 ``alpha=rank``(RIFT-SVC 惯例),可用 ``lora_alpha`` 覆盖,
         或之后调用 ``merge_lora()`` 折叠成普通权重。
         """
-        from .._convert import load_torch_ckpt_to_mlx
+        from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype or mx.float32)
-        # 剥顶层 lightning wrapper
+        # 剥顶层 lightning wrapper(探测顺序保留,剥离收敛到 strip_prefix)
         for pre in ("model.", "module.", "transformer_model."):
             if any(k.startswith(pre) for k in sd):
-                sd = {k[len(pre):]: v for k, v in sd.items() if k.startswith(pre)}
+                sd = strip_prefix(sd, pre)
                 break
         # 裸 DiT sd → 包 transformer. 前缀
         if any(k.startswith("spk_embed.") for k in sd):

@@ -26,6 +26,7 @@ __all__ = ["build"]
 
 
 def build(cfg):
+    from ....backends._defaults import RVC_UPSAMPLE
     from ....nn.mlx.backends.rvc import RVCModel, MultiPeriodDiscriminatorV2
     from ....nn.mlx.backends.rvc import f0_to_coarse
 
@@ -34,14 +35,8 @@ def build(cfg):
     sr = int(opts.get("sr", 48000))
     default_n_units = 256 if version == "v1" else 768
 
-    # RVC upsample 配置(镜像 torch RVCModule._RVC_UPSAMPLE)
-    _RVC_UPSAMPLE = {
-        ("v1", 32000): ([10, 4, 2, 2, 2], [16, 16, 4, 4, 4]),
-        ("v1", 40000): ([10, 10, 2, 2], [16, 16, 4, 4]),
-        ("v1", 48000): ([10, 6, 2, 2, 2], [16, 16, 4, 4, 4]),
-        ("v2", 32000): ([10, 8, 2, 2], [20, 16, 4, 4]),
-        ("v2", 48000): ([12, 10, 2, 2], [24, 20, 4, 4]),
-    }
+    # upsample 默认表共享(was 本文件内嵌副本)
+    _RVC_UPSAMPLE = RVC_UPSAMPLE
     if "upsample_rates" in opts and "upsample_kernel_sizes" in opts:
         up, k = opts["upsample_rates"], opts["upsample_kernel_sizes"]
     else:
