@@ -5,18 +5,12 @@ Uses BaseGANModule with manual G/D optimization.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from ...train.config import TrainConfig
 from ...train.dataset import SVCBatch
 from ...train.gan_module import BaseGANModule
-from ...train.losses import (
-    feature_match_loss,
-    kl_loss,
-    lsgan_disc_loss,
-    lsgan_gen_loss,
-)
-from .model import MultiPeriodDiscriminator, SoVITSModel, mel_spectrogram, spec_to_mel
+from ...train.losses import gan_d_loss, gan_g_loss
+from .model import MultiPeriodDiscriminator, SoVITSModel
 
 __all__ = ["SoVITSModule"]
 
@@ -126,119 +120,22 @@ class SoVITSModule(BaseGANModule):
 
         Must be used in strict alternating order (see BaseGANModule):
         forward_generator once, then D fwd->bwd->step, then this fwd (reusing
-        the same `out`), then backward+step. Building both loss graphs before
-        any optimizer step raises an autograd version-check RuntimeError on
-        the later backward (AdamW mutates weight_norm params in-place).
-
-        `out` comes from forward_generator(batch); when None it is computed
-        here (compat path: two generator forwards per step, old behaviour).
+        the same `out`), then backward+step. `out` comes from
+        forward_generator(batch); when None it is computed here (compat path).
         """
         if out is None:
             out = self.forward_generator(batch)
-        wave_gen = out["wave_gen"]  # [B, 1, segment*hop]
-        spec = batch.mel  # linear spec [B, spec_channels, T] (sovits convention)
-        wave = batch.wav
-
-        # Slice real wave to match generated segment
-        ids_slice = out["ids_slice"]  # [B] start indices
-        segment = wave_gen.shape[-1]
-        hop = self.cfg.backend_opts.get("hop_length", 512)
-
-        if wave.dim() == 2:
-            wave_real = wave.unsqueeze(1)
-        else:
-            wave_real = wave
-        # Vectorized slicing (CUDA-graph friendly: no .item() sync, no python loop).
-        # Training guarantees ids_slice*hop + segment <= wave length.
-        starts = ids_slice * hop  # [B] sample start indices
-        idx = starts.unsqueeze(1) + torch.arange(segment, device=wave_real.device)  # [B, segment]
-        wave_real_sliced = wave_real[:, 0, :].gather(1, idx).unsqueeze(1)  # [B, 1, segment]
-
-        # Discriminator on real and fake
-        real_logits, fake_logits, real_fmaps, fake_fmaps = self.discriminator(
-            wave_real_sliced.detach(), wave_gen
+        return gan_g_loss(
+            self.discriminator, out, batch, self._mel_args, self.c_mel, self.c_kl,
+            self._hop, use_lf0=True,
         )
-
-        # GAN generator loss
-        loss_gen = lsgan_gen_loss(fake_logits)
-        # Feature matching
-        loss_fm = feature_match_loss(real_fmaps, fake_fmaps, weight=2.0)
-
-        # Mel loss (L1 between real mel and mel re-extracted from wave_gen)
-        # so-vits: y_mel = slice_segments(spec_to_mel(spec), ids_slice, seg_frames)
-        #          y_hat_mel = mel_spectrogram_torch(wave_gen, ...)
-        #          loss_mel = L1(y_mel, y_hat_mel) * c_mel
-        n_fft, n_mels, sr, hop, win, fmin, fmax = self._mel_args
-        seg_frames = segment // hop
-        mel_full = spec_to_mel(spec, n_fft, n_mels, sr, fmin, fmax)  # [B, n_mels, T]
-        # Vectorized frame slice (CUDA-graph friendly: no .item() sync, no python loop).
-        # Training guarantees ids_slice + seg_frames <= T (frame_len).
-        idx_mel = ids_slice.unsqueeze(1) + torch.arange(seg_frames, device=mel_full.device)  # [B, seg_frames]
-        y_mel = mel_full.gather(
-            2, idx_mel.unsqueeze(1).expand(mel_full.shape[0], mel_full.shape[1], seg_frames)
-        )  # [B, n_mels, seg_frames]
-        y_hat_mel = mel_spectrogram(
-            wave_gen.squeeze(1), n_fft, n_mels, sr, hop, win, fmin, fmax
-        )
-        loss_mel = F.l1_loss(y_mel, y_hat_mel)
-
-        # KL loss
-        loss_kl = kl_loss(
-            out["z_p"], out["logs_q"], out["m_p"], out["logs_p"], out["z_mask"]
-        )
-
-        # f0 prediction loss (so-vits: MSE(pred_lf0, lf0) when f0 decoder enabled)
-        pred_lf0 = out.get("pred_lf0")
-        if isinstance(pred_lf0, torch.Tensor):
-            loss_lf0 = F.mse_loss(pred_lf0, out["lf0"])
-        else:
-            loss_lf0 = torch.tensor(0.0, device=wave_gen.device)
-
-        loss_g_total = (
-            loss_gen + loss_fm + self.c_mel * loss_mel + self.c_kl * loss_kl + loss_lf0
-        )
-
-        sub = {
-            "g/gan": loss_gen.item(),
-            "g/fm": loss_fm.item(),
-            "g/mel": loss_mel.item(),
-            "g/kl": loss_kl.item(),
-            "g/lf0": loss_lf0.item(),
-        }
-        return loss_g_total, sub
 
     def discriminator_loss(self, batch: SVCBatch, out=None):
-        """D loss: LSGAN on real vs fake.
-
-        Must be used in strict alternating order (see BaseGANModule): this fwd
-        (on out["wave_gen"].detach()), then backward+step, before the G loss's
-        forward (D fwd#2). `out` comes from forward_generator(batch); when
-        None it is computed here under no_grad (compat path: two generator
-        forwards per step, old behaviour).
-        """
+        """D loss: LSGAN on real vs fake (strict alternating order, see above)."""
         if out is None:
             with torch.no_grad():
                 out = self.forward_generator(batch)
-        wave_gen = out["wave_gen"].detach()
-        wave = batch.wav
-        ids_slice = out["ids_slice"]
-        segment = wave_gen.shape[-1]
-        hop = self.cfg.backend_opts.get("hop_length", 512)
-
-        if wave.dim() == 2:
-            wave_real = wave.unsqueeze(1)
-        else:
-            wave_real = wave
-        # Vectorized slicing (CUDA-graph friendly: no .item() sync, no python loop).
-        # Training guarantees ids_slice*hop + segment <= wave length
-        # (rand_slice_segments_with_pitch samples ids_str in [0, x_lengths-segment_size]).
-        starts = ids_slice * hop  # [B] sample start indices
-        idx = starts.unsqueeze(1) + torch.arange(segment, device=wave_real.device)  # [B, segment]
-        wave_real_sliced = wave_real[:, 0, :].gather(1, idx).unsqueeze(1)  # [B, 1, segment]
-
-        real_logits, fake_logits, _, _ = self.discriminator(wave_real_sliced, wave_gen)
-        loss_d = lsgan_disc_loss(real_logits, fake_logits)
-        return loss_d, {"d/gan": loss_d.item()}
+        return gan_d_loss(self.discriminator, out, batch, self._hop)
 
     def sample(self, batch: SVCBatch):
         """Generate waveform for validation."""
