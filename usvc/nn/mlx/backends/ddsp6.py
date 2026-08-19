@@ -32,7 +32,16 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .._convert import load_torch_ckpt_to_mlx
-from .._ops import hann_window
+from .._ops import (
+    hann_window,
+    norm_spec as _norm_spec,
+    denorm_spec as _denorm_spec,
+    ode_euler as _ode_euler,
+    ode_rk4 as _ode_rk4,
+    reflow_loss as _reflow_loss,
+    stft_center_complex as _stft_center_complex,
+    istft_center_complex as _istft_center_complex,
+)
 
 __all__ = [
     "SwiGLU",
@@ -506,59 +515,6 @@ class Unit2Control(nn.Module):
 # DDSP 频谱路径:复杂 STFT / ISTFT(center=True, window envelop 归一化)
 # ---------------------------------------------------------------------------
 
-def _pad_reflect_2d(x, left: int, right: int):
-    """F.pad(x, (left, right), mode='reflect') 等价(沿最后一维,批量)。"""
-    if left == 0 and right == 0:
-        return x
-    parts = [x]
-    if left > 0:
-        parts.insert(0, x[:, left:0:-1])
-    if right > 0:
-        parts.append(x[:, -2:-right - 2:-1])
-    return mx.concatenate(parts, axis=-1)
-
-
-def _stft_center_complex(wav, n_fft: int, hop: int, window, pad_mode: str = "reflect"):
-    """torch.stft(center=True, return_complex=True) 等价。
-
-    wav [B, L] -> [B, n_fft//2+1, n_frames],n_frames = L//hop + 1
-    (center=True 两端各补 n_fft//2)。
-    """
-    B, L = wav.shape
-    pad = n_fft // 2
-    if pad_mode == "reflect" and pad < L:
-        padded = _pad_reflect_2d(wav, pad, pad)
-    else:
-        padded = mx.pad(wav, [(0, 0), (pad, pad)])
-    n_frames = (padded.shape[1] - n_fft) // hop + 1
-    idx = mx.arange(n_frames)[:, None] * hop + mx.arange(n_fft)[None, :]
-    frames = mx.take(padded, idx, axis=1)  # [B, n_frames, n_fft]
-    frames = frames * window
-    spec = mx.fft.rfft(frames, n=n_fft, axis=-1)  # [B, n_frames, F]
-    return spec.transpose(0, 2, 1)  # [B, F, n_frames]
-
-
-def _istft_center_complex(spec, n_fft: int, hop: int, window):
-    """torch.istft(center=True) 等价(复频谱 -> 时域,window envelop 归一化)。
-
-    spec [B, n_fft//2+1, n_frames] -> [B, hop*(n_frames-1)]。
-    """
-    B, F, n_frames = spec.shape
-    frames = mx.fft.irfft(spec.transpose(0, 2, 1), n=n_fft, axis=-1)  # [B, n_frames, n_fft]
-    frames = frames * window
-    expected = n_fft + hop * (n_frames - 1)
-    y = mx.zeros((B, expected))
-    win_env = mx.zeros((B, expected))
-    w2 = window * window
-    for i in range(n_frames):
-        sl = slice(i * hop, i * hop + n_fft)
-        y = y.at[:, sl].add(frames[:, i])
-        win_env = win_env.at[:, sl].add(w2)
-    start = n_fft // 2
-    end = expected - n_fft // 2
-    return y[:, start:end] / win_env[:, start:end]
-
-
 def _sinc(x):
     """torch.sinc:sin(pi*x)/(pi*x),sinc(0)=1。"""
     return mx.where(x == 0, mx.ones_like(x), mx.sin(mx.pi * x) / (mx.pi * x))
@@ -659,51 +615,15 @@ class RectifiedFlow(nn.Module):
         self.spec_max = spec_max
 
     def sample_euler(self, x, t, dt, cond):
-        x = x + self.velocity_fn(x, 1000 * t, cond) * dt
-        t = t + dt
-        return x, t
+        return _ode_euler(self.velocity_fn, x, t, dt, cond)
 
     def sample_rk4(self, x, t, dt, cond):
-        k1 = self.velocity_fn(x, 1000 * t, cond)
-        k2 = self.velocity_fn(x + 0.5 * k1 * dt, 1000 * (t + 0.5 * dt), cond)
-        k3 = self.velocity_fn(x + 0.5 * k2 * dt, 1000 * (t + 0.5 * dt), cond)
-        k4 = self.velocity_fn(x + k3 * dt, 1000 * (t + dt), cond)
-        x = x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6
-        t = t + dt
-        return x, t
+        return _ode_rk4(self.velocity_fn, x, t, dt, cond)
 
     def reflow_loss(self, x_1, t, cond, loss_type="l2_lognorm", mask=None):
-        """Flow-matching 训练 loss(镜像 torch ddsp6 RectifiedFlow.reflow_loss)。
-
-        x_1: [B, 1, M, T] normalized spec;t: [B] ∈ (0,1);cond: [B, M, T]。
-        x_0 = randn;x_t = x_0 + t*(x_1 - x_0);v = velocity_fn(x_t, 1000t, cond);
-        loss = weighted MSE(x_1 - x_0, v)(l2_lognorm 权重)。
-        """
-        x_0 = mx.random.normal(x_1.shape, dtype=x_1.dtype)
-        x_t = x_0 + t[:, None, None, None] * (x_1 - x_0)
-        v_pred = self.velocity_fn(x_t, 1000 * t, cond)
-
-        if mask is not None:
-            m = mask.astype(x_1.dtype)[:, None, None, :]  # [B,1,1,T]
-            elem = mx.square(x_1 - x_0 - v_pred)
-            if loss_type == "l2_lognorm":
-                weights = 0.398942 / t / (1 - t) * mx.exp(
-                    -0.5 * mx.square(mx.log(t / (1 - t)))
-                )
-                elem = weights[:, None, None, None] * elem
-            loss = (elem * m).sum() / (m.sum() * elem.shape[2] * elem.shape[3] + 1e-8)
-        elif loss_type == "l1":
-            loss = mx.abs(x_1 - x_0 - v_pred).mean()
-        elif loss_type == "l2":
-            loss = mx.mean(mx.square(x_1 - x_0 - v_pred))
-        elif loss_type == "l2_lognorm":
-            weights = 0.398942 / t / (1 - t) * mx.exp(
-                -0.5 * mx.square(mx.log(t / (1 - t)))
-            )
-            loss = mx.mean(weights[:, None, None, None] * mx.square(x_1 - x_0 - v_pred))
-        else:
-            raise NotImplementedError(loss_type)
-        return loss
+        """Flow-matching 训练 loss;layout [B,1,M,T] 见 _ops.reflow_loss."""
+        return _reflow_loss(self.velocity_fn, x_1, t, cond, loss_type, mask,
+                            layout="b1mt")
 
     def __call__(self, condition, gt_spec=None, infer: bool = True,
                  infer_step: int = 10, method: str = "euler",
@@ -745,10 +665,10 @@ class RectifiedFlow(nn.Module):
         return self.denorm_spec(x)
 
     def norm_spec(self, x):
-        return (x - self.spec_min) / (self.spec_max - self.spec_min) * 2 - 1
+        return _norm_spec(x, self.spec_min, self.spec_max, cast=False)
 
     def denorm_spec(self, x):
-        return (x + 1) / 2 * (self.spec_max - self.spec_min) + self.spec_min
+        return _denorm_spec(x, self.spec_min, self.spec_max)
 
 
 # ---------------------------------------------------------------------------

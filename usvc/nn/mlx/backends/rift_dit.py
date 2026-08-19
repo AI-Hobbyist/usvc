@@ -28,6 +28,8 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from .._ops import denorm_spec as _denorm_spec, norm_spec as _norm_spec
+
 __all__ = [
     "RIFTDiTModel",
     "DiT",
@@ -532,10 +534,10 @@ class RIFTDiTModel(nn.Module):
     # -- 归一化(与 MelNormalizer -12/2 一致)-------------------------------
 
     def norm_spec(self, x):
-        return (x - self.spec_min) / (self.spec_max - self.spec_min) * 2 - 1
+        return _norm_spec(x, self.spec_min, self.spec_max, cast=False)  # rift 旧代码无 astype
 
     def denorm_spec(self, x):
-        return (x + 1) / 2 * (self.spec_max - self.spec_min) + self.spec_min
+        return _denorm_spec(x, self.spec_min, self.spec_max)
 
     # -- ODE 速度(CFG)------------------------------------------------------
 

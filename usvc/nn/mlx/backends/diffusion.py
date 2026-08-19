@@ -25,6 +25,8 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
+from .._ops import denorm_spec as _denorm_spec, norm_spec as _norm_spec
+
 __all__ = [
     "DiffusionEmbedding",
     "SinusoidalPosEmb",
@@ -523,11 +525,10 @@ class GaussianDiffusion(nn.Module):
     # -- 归一化(与 torch 采样器一致)-------------------------------------
 
     def norm_spec(self, x):
-        x = x.astype(mx.float32)
-        return (x - self.spec_min) / (self.spec_max - self.spec_min) * 2 - 1
+        return _norm_spec(x, self.spec_min, self.spec_max, cast=True)
 
     def denorm_spec(self, x):
-        return (x + 1) / 2 * (self.spec_max - self.spec_min) + self.spec_min
+        return _denorm_spec(x, self.spec_min, self.spec_max)
 
 
 # ---------------------------------------------------------------------------

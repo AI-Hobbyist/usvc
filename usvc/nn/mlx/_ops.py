@@ -27,6 +27,14 @@ __all__ = [
     "pad_reflect1d",
     "pad_reflect1d_fallback",
     "masked_fill",
+    "norm_spec",
+    "denorm_spec",
+    "ode_euler",
+    "ode_rk4",
+    "reflow_loss",
+    "sequence_mask",
+    "stft_center_complex",
+    "istft_center_complex",
 ]
 
 
@@ -347,3 +355,155 @@ def masked_fill(x, mask, fill_value):
     """
     import mlx.core as mx
     return mx.where(mask, mx.full(x.shape, fill_value, dtype=x.dtype), x)
+
+
+# ===========================================================================
+# E4 共享 kernel: 从后端文件收敛而来(verbatim 搬迁,layout/参数化差异显式化)
+# ===========================================================================
+
+def norm_spec(x, spec_min: float, spec_max: float, cast: bool = False):
+    """Mel spec 归一化到 [-1, 1] (was per-backend 5 copies).
+
+    cast=True 先转 float32(diffusion/reflow_shallow/reflow_vae 旧行为);
+    ddsp6/rift_dit 旧代码没有 astype → 传 cast=False。
+    """
+    import mlx.core as mx
+    if cast:
+        x = x.astype(mx.float32)
+    return (x - spec_min) / (spec_max - spec_min) * 2 - 1
+
+
+def denorm_spec(x, spec_min: float, spec_max: float):
+    """norm_spec 的逆变换 (-1,1] → [spec_min, spec_max] 区间。"""
+    return (x + 1) / 2 * (spec_max - spec_min) + spec_min
+
+
+def ode_euler(v, x, t, dt, cond):
+    """Euler 单步: x += v(x, 1000t, cond)*dt (was 3 per-backend copies)."""
+    x = x + v(x, 1000 * t, cond) * dt
+    return x, t + dt
+
+
+def ode_rk4(v, x, t, dt, cond):
+    """RK4 单步 (was 3 per-backend copies)."""
+    k1 = v(x, 1000 * t, cond)
+    k2 = v(x + 0.5 * k1 * dt, 1000 * (t + 0.5 * dt), cond)
+    k3 = v(x + 0.5 * k2 * dt, 1000 * (t + 0.5 * dt), cond)
+    k4 = v(x + k3 * dt, 1000 * (t + dt), cond)
+    x = x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6
+    return x, t + dt
+
+
+def reflow_loss(v, x_1, t, cond, loss_type="l2_lognorm", mask=None, x_0=None,
+                layout="btm"):
+    """Flow-matching 训练 loss (was ddsp6/reflow_shallow/reflow_vae 3 copies).
+
+    x_0 is drawn inside when None (ddsp6/shallow behavior); vae passes it in.
+    layout: "btm"  = [B, T, M] (reflow_shallow/reflow_vae; mask [B, T])
+            "b1mt" = [B, 1, M, T] (ddsp6; mask [B, 1, 1, T])
+    Both broadcast dims AND normalization denominators differ per layout
+    (b1mt: m.sum()*M*T; btm: m.sum()*M) — kept verbatim from each original.
+    """
+    import mlx.core as mx
+    b1mt = layout == "b1mt"
+    if x_0 is None:
+        x_0 = mx.random.normal(x_1.shape, dtype=x_1.dtype)
+    t_b = t[:, None, None, None] if b1mt else t[:, None, None]
+    x_t = x_0 + t_b * (x_1 - x_0)
+    v_pred = v(x_t, 1000 * t, cond)
+
+    if mask is not None:
+        m = mask.astype(x_1.dtype)
+        m = m[:, None, None, :] if b1mt else m[:, :, None]
+        elem = mx.square(x_1 - x_0 - v_pred)
+        if loss_type == "l2_lognorm":
+            weights = 0.398942 / t / (1 - t) * mx.exp(
+                -0.5 * mx.square(mx.log(t / (1 - t)))
+            )
+            w_b = weights[:, None, None, None] if b1mt else weights[:, None, None]
+            elem = w_b * elem
+        denom = (m.sum() * elem.shape[2] * elem.shape[3] if b1mt
+                 else m.sum() * x_1.shape[2]) + 1e-8
+        loss = (elem * m).sum() / denom
+    elif loss_type == "l1":
+        loss = mx.abs(x_1 - x_0 - v_pred).mean()
+    elif loss_type == "l2":
+        loss = mx.mean(mx.square(x_1 - x_0 - v_pred))
+    elif loss_type == "l2_lognorm":
+        weights = 0.398942 / t / (1 - t) * mx.exp(
+            -0.5 * mx.square(mx.log(t / (1 - t)))
+        )
+        w_b = weights[:, None, None, None] if b1mt else weights[:, None, None]
+        loss = mx.mean(w_b * mx.square(x_1 - x_0 - v_pred))
+    else:
+        raise NotImplementedError(loss_type)
+    return loss
+
+
+def sequence_mask(lengths, max_length=None):
+    """[B] lengths → [B, T] bool (was rvc/sovits 3 copies, int32 arange)."""
+    import mlx.core as mx
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    seq = mx.arange(max_length, dtype=mx.int32)[None, :]
+    return seq < lengths[:, None]
+
+
+def _pad_reflect_last(x, left: int, right: int):
+    """F.pad(x, (left, right), mode='reflect') 等价,沿最后一维(2D 批量)。
+
+    ⚠ 不同于 pad_reflect1d(切 dim0,仅 1D 输入正确)。此版用 x[..., l:0:-1],
+    对 1D/2D 都正确;was ddsp6 local _pad_reflect_2d。
+    """
+    import mlx.core as mx
+    if left == 0 and right == 0:
+        return x
+    parts = [x]
+    if left > 0:
+        parts.insert(0, x[..., left:0:-1])
+    if right > 0:
+        parts.append(x[..., -2:-right - 2:-1])
+    return mx.concatenate(parts, axis=-1)
+
+
+def stft_center_complex(wav, n_fft: int, hop: int, window, pad_mode: str = "reflect"):
+    """torch.stft(center=True, return_complex=True) 等价 (was ddsp6 local copy).
+
+    wav [B, L] -> [B, n_fft//2+1, n_frames], n_frames = L//hop + 1
+    (center=True 两端各补 n_fft//2)。
+    """
+    import mlx.core as mx
+    B, L = wav.shape
+    pad = n_fft // 2
+    if pad_mode == "reflect" and pad < L:
+        padded = _pad_reflect_last(wav, pad, pad)
+    else:
+        padded = mx.pad(wav, [(0, 0), (pad, pad)])
+    n_frames = (padded.shape[1] - n_fft) // hop + 1
+    idx = mx.arange(n_frames)[:, None] * hop + mx.arange(n_fft)[None, :]
+    frames = mx.take(padded, idx, axis=1)  # [B, n_frames, n_fft]
+    frames = frames * window
+    spec = mx.fft.rfft(frames, n=n_fft, axis=-1)  # [B, n_frames, F]
+    return spec.transpose(0, 2, 1)  # [B, F, n_frames]
+
+
+def istft_center_complex(spec, n_fft: int, hop: int, window):
+    """torch.istft(center=True) 等价 (was ddsp6 local copy)。
+
+    spec [B, n_fft//2+1, n_frames] -> [B, hop*(n_frames-1)].
+    """
+    import mlx.core as mx
+    B, F, n_frames = spec.shape
+    frames = mx.fft.irfft(spec.transpose(0, 2, 1), n=n_fft, axis=-1)  # [B, n_frames, n_fft]
+    frames = frames * window
+    expected = n_fft + hop * (n_frames - 1)
+    y = mx.zeros((B, expected))
+    win_env = mx.zeros((B, expected))
+    w2 = window * window
+    for i in range(n_frames):
+        sl = slice(i * hop, i * hop + n_fft)
+        y = y.at[:, sl].add(frames[:, i])
+        win_env = win_env.at[:, sl].add(w2)
+    start = n_fft // 2
+    end = expected - n_fft // 2
+    return y[:, start:end] / win_env[:, start:end]

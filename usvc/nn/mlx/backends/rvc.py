@@ -400,6 +400,9 @@ def f0_to_coarse(f0, f0_min: float = 50.0, f0_max: float = 1100.0):
     """f0: [B, T] Hz -> [B, T] tokens in [1, 255]。
 
     torch 版用 ``1127 * log(1 + f/700)``(mel 刻度)。
+    ⚠ 与 sovits.f0_to_coarse 数学等价但 FP 舍入不同:220k 样本实测 1 个
+    round 边界 token 差(f0≈942.9Hz, rvc=229 vs sovits=228)。两式必须各保留
+    一份,不可合并(合并会在边界 f0 上改变推理 token 网格)。
     """
     f0 = f0.astype(mx.float32)
     f0_mel_min = 1127.0 * mx.log(1.0 + f0_min / 700.0)
@@ -420,12 +423,9 @@ def f0_to_coarse(f0, f0_min: float = 50.0, f0_max: float = 1100.0):
 # (RVC window_size=10,与 so-vits 4 不同)。
 # ---------------------------------------------------------------------------
 
-def sequence_mask(lengths, max_length=None):
-    """lengths: [B] int -> [B, T] bool(T = max_length)。镜像 model.py::sequence_mask。"""
-    if max_length is None:
-        max_length = int(lengths.max())
-    x = mx.arange(max_length, dtype=lengths.dtype)[None, :]
-    return x < lengths[:, None]
+# sequence_mask 由 .._ops 提供单一实现(原 rvc 模块级 copy 与 _rvc_sequence_mask
+# 死代码已删除;输出 dtype=bool,arange 用 int32,与旧实现等价)。
+from .._ops import sequence_mask
 
 
 class RVCTextEncoder(nn.Module):
@@ -735,14 +735,6 @@ def _rvc_rand_slice_segments_with_pitch(z, pitch, x_lengths, segment_size):
     z_slice = _mx.take_along_axis(z, idx[..., None], axis=1)
     pitch_slice = _mx.take_along_axis(pitch, idx, axis=1)
     return z_slice, pitch_slice, ids_str
-
-
-def _rvc_sequence_mask(lengths, max_length=None):
-    import mlx.core as _mx
-    if max_length is None:
-        max_length = int(lengths.max().item())
-    seq = _mx.arange(max_length, dtype=_mx.int32)[None, :]
-    return seq < lengths[:, None]
 
 
 def _rvc_train_forward(self, units, pitch_token, pitchf, spec, wave, spk_id,

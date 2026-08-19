@@ -25,6 +25,13 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from .._ops import (
+    denorm_spec as _denorm_spec,
+    norm_spec as _norm_spec,
+    ode_euler as _ode_euler,
+    ode_rk4 as _ode_rk4,
+    reflow_loss as _reflow_loss,
+)
 from .diffusion import DiffusionEmbedding, SinusoidalPosEmb, WaveNet
 
 __all__ = [
@@ -57,21 +64,13 @@ class Bi_RectifiedFlow(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
 
-    # -- ODE 单步 ----------------------------------------------------------
+    # -- ODE 单步 / 训练 loss(euler/rk4 共享 kernel 见 _ops) -------------
 
     def sample_euler(self, x, t, dt, cond=None):
-        x = x + self.velocity_fn(x, 1000 * t, cond=cond) * dt
-        t = t + dt
-        return x, t
+        return _ode_euler(self.velocity_fn, x, t, dt, cond)
 
     def sample_rk4(self, x, t, dt, cond=None):
-        k_1 = self.velocity_fn(x, 1000 * t, cond=cond)
-        k_2 = self.velocity_fn(x + 0.5 * k_1 * dt, 1000 * (t + 0.5 * dt), cond=cond)
-        k_3 = self.velocity_fn(x + 0.5 * k_2 * dt, 1000 * (t + 0.5 * dt), cond=cond)
-        k_4 = self.velocity_fn(x + k_3 * dt, 1000 * (t + dt), cond=cond)
-        x = x + (k_1 + 2 * k_2 + 2 * k_3 + k_4) * dt / 6
-        t = t + dt
-        return x, t
+        return _ode_rk4(self.velocity_fn, x, t, dt, cond)
 
     def sample_heun(self, x, t, dt, cond=None):
         k_1 = self.velocity_fn(x, 1000 * t, cond=cond)
@@ -98,29 +97,9 @@ class Bi_RectifiedFlow(nn.Module):
     # -- 训练 loss ---------------------------------------------------------
 
     def reflow_loss(self, x_1, x_0, t, cond=None, loss_type="l2_lognorm", mask=None):
-        x_t = x_0 + t[:, None, None] * (x_1 - x_0)              # [B,T,M]
-        v_pred = self.velocity_fn(x_t, 1000 * t, cond=cond)
-        if mask is not None:
-            m = mask.astype(x_1.dtype)[:, None, None]
-            elem = mx.square(x_1 - x_0 - v_pred)
-            if loss_type == "l2_lognorm":
-                weights = 0.398942 / t / (1 - t) * mx.exp(
-                    -0.5 * mx.square(mx.log(t / (1 - t)))
-                )
-                elem = weights[:, None, None] * elem
-            loss = (elem * m).sum() / (m.sum() * x_1.shape[2] + 1e-8)
-        elif loss_type == "l1":
-            loss = mx.abs(x_1 - x_0 - v_pred).mean()
-        elif loss_type == "l2":
-            loss = mx.mean(mx.square(x_1 - x_0 - v_pred))
-        elif loss_type == "l2_lognorm":
-            weights = 0.398942 / t / (1 - t) * mx.exp(
-                -0.5 * mx.square(mx.log(t / (1 - t)))
-            )
-            loss = mx.mean(weights[:, None, None] * mx.square(x_1 - x_0 - v_pred))
-        else:
-            raise NotImplementedError(loss_type)
-        return loss
+        """训练 loss,layout [B,T,M] + 外部 x_0 见 _ops.reflow_loss。"""
+        return _reflow_loss(self.velocity_fn, x_1, t, cond, loss_type, mask,
+                            x_0=x_0, layout="btm")
 
     # -- 主入口 ------------------------------------------------------------
 
@@ -179,11 +158,10 @@ class Bi_RectifiedFlow(nn.Module):
                 return x
 
     def norm_spec(self, x):
-        x = x.astype(mx.float32)
-        return (x - self.spec_min) / (self.spec_max - self.spec_min) * 2 - 1
+        return _norm_spec(x, self.spec_min, self.spec_max, cast=True)
 
     def denorm_spec(self, x):
-        return (x + 1) / 2 * (self.spec_max - self.spec_min) + self.spec_min
+        return _denorm_spec(x, self.spec_min, self.spec_max)
 
 
 # ===========================================================================

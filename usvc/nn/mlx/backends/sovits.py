@@ -62,7 +62,11 @@ def n_fft_default():
 
 
 def f0_to_coarse(f0):
-    """f0: [B, T] Hz → [B, T] coarse token(1..255)。镜像 model.py::f0_to_coarse。"""
+    """f0: [B, T] Hz → [B, T] coarse token(1..255)。镜像 model.py::f0_to_coarse。
+
+    ⚠ 与 rvc.f0_to_coarse 数学等价但 FP 舍入不同(220k 样本 1 个 round 边界
+    token 差);两份实现必须共存,见 rvc.py 同注释。
+    """
     f0 = f0.astype(mx.float32)
     f0_mel = 1127.0 * mx.log(1.0 + f0 / 700.0)
     a = (f0_bin - 2) / (f0_mel_max - f0_mel_min)
@@ -1291,13 +1295,7 @@ def _rand_slice_segments_with_pitch(x, pitch, x_lengths, segment_size):
     return x_slice, pitch_slice, ids_str
 
 
-def _sequence_mask(lengths, max_length=None):
-    """[B] lengths → [B, max_length] bool。"""
-    import mlx.core as _mx
-    if max_length is None:
-        max_length = int(lengths.max().item())
-    seq = _mx.arange(max_length, dtype=_mx.int32)[None, :]
-    return seq < lengths[:, None]
+from .._ops import sequence_mask as _sequence_mask  # 单一实现(原 sovits 本地 copy 删除)
 
 
 def train_forward_sovits(self, units, f0, spec, wave, spk_id, frame_len=None,
