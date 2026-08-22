@@ -30,6 +30,7 @@ import torch.nn as nn
 
 # channels_last 推理辅助统一在 usvc/nn/cl_helper.py（rvc/sovits/vocoder/wavenet 共享）
 from ..cl_helper import conv2d_cl, convT2d_cl
+from .._commons import get_padding, init_weights
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
@@ -70,16 +71,6 @@ class AttrDict(dict):
 
     def copy(self):
         return AttrDict(self)
-
-
-def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
-
-
-def get_padding(kernel_size, dilation=1):
-    return int((kernel_size * dilation - dilation) / 2)
 
 
 class ResBlock1(torch.nn.Module):

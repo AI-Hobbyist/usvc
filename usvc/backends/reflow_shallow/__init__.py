@@ -12,27 +12,14 @@ from __future__ import annotations
 
 from ...data.feature_config import FeatureConfig, FeatureSpec
 from .._common import resolve_f0_config
+from .._defaults import MEL_44K, UNITS_CV, build_default_spec
 from ..base import Backend
 
 __all__ = ["ReflowShallowBackend"]
 
 
 def _default_spec() -> FeatureSpec:
-    return FeatureSpec(
-        mel=FeatureConfig(
-            "mel",
-            {"n_fft": 2048, "win_length": 2048, "n_mels": 128, "fmin": 40.0, "fmax": 16000.0, "center": False},
-        ),
-        f0=FeatureConfig(
-            "f0",
-            {"extractor": "fcpe", "uv_policy": "raw"},
-        ),
-        rms=FeatureConfig("rms", {"win_length": 1024}),
-        units=FeatureConfig(
-            "units",
-            {"kind": "contentvec", "layer": 12, "sr_in": 16000, "hop_native": 320, "align_mode": "gather", "model_ckpt": "pretrained/contentvec/pytorch_model.bin"},
-        ),
-    )
+    return build_default_spec(mel=MEL_44K, uv_policy="raw", rms_win=1024, units=UNITS_CV)
 
 
 class ReflowShallowBackend(Backend):

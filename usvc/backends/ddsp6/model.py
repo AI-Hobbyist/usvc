@@ -35,6 +35,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from ...nn._commons import calc_same_padding
+
 __all__ = [
     "LYNXNet",
     "LYNXNet2",
@@ -216,11 +218,6 @@ class LYNXSwiGLU(nn.Module):
 
 
 class LYNXConvModule(nn.Module):
-    @staticmethod
-    def calc_same_padding(kernel_size):
-        pad = kernel_size // 2
-        return (pad, pad - (kernel_size + 1) % 2)
-
     def __init__(self, dim, expansion_factor, kernel_size=31, in_norm=False, activation='PReLU', dropout=0.):
         super().__init__()
         inner_dim = dim * expansion_factor
@@ -233,7 +230,7 @@ class LYNXConvModule(nn.Module):
         if activation not in activation_classes:
             raise ValueError(f'{activation} is not a valid activation')
         _activation = activation_classes[activation]()
-        padding = self.calc_same_padding(kernel_size)
+        padding = calc_same_padding(kernel_size)
         if float(dropout) > 0.:
             _dropout = nn.Dropout(dropout)
         else:

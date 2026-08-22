@@ -8,36 +8,14 @@ from __future__ import annotations
 
 from ...data.feature_config import FeatureConfig, FeatureSpec
 from .._common import resolve_f0_config
+from .._defaults import MEL_80BIN, UNITS_CV, build_default_spec, hubertsoft_units
 from ..base import Backend
 
 __all__ = ["SoVitsBackend"]
 
 
 def _default_spec() -> FeatureSpec:
-    return FeatureSpec(
-        mel=FeatureConfig(
-            "mel",
-            # so-vits: 44.1k/512/2048 but 80 mel, fmin=0, fmax=22050 (sr/2)
-            {"n_fft": 2048, "win_length": 2048, "n_mels": 80, "fmin": 0.0, "fmax": 22050.0, "center": False},
-        ),
-        spec=FeatureConfig("spec", {"n_fft": 2048, "win_length": 2048, "center": False}),
-        f0=FeatureConfig(
-            "f0",
-            {"extractor": "fcpe", "uv_policy": "raw"},
-        ),
-        rms=FeatureConfig("rms", {"win_length": 512}),
-        units=FeatureConfig(
-            "units",
-            {
-                "kind": "contentvec",
-                "layer": 12,
-                "sr_in": 16000,
-                "hop_native": 320,
-                "align_mode": "gather",
-                "model_ckpt": "pretrained/contentvec/pytorch_model.bin",
-            },
-        ),
-    )
+    return build_default_spec(mel=MEL_80BIN, uv_policy="raw", rms_win=512, units=UNITS_CV, has_spec=True)
 
 
 class SoVitsBackend(Backend):
@@ -48,17 +26,8 @@ class SoVitsBackend(Backend):
         base = SoVitsBackend.DEFAULT_FEATURES
         f0 = resolve_f0_config(train_cfg)
         if train_cfg.get("units_kind") == "hubertsoft":
-            # 4.0 兼容: hubertsoft (256 维)
-            units = FeatureConfig(
-                "units",
-                {
-                    "kind": "hubertsoft",
-                    "sr_in": 16000,
-                    "hop_native": 320,
-                    "align_mode": "gather",
-                    "model_ckpt": "pretrained/hubert/hubert-soft-0d54a1f4.pt",
-                },
-            )
+            # 4.0 兼容: hubertsoft (256 维),固定 ckpt
+            units = hubertsoft_units()
         else:
             units = base.units  # 默认 contentvec (4.1 推荐)
         return FeatureSpec(mel=base.mel, spec=base.spec, f0=f0, rms=base.rms, units=units)

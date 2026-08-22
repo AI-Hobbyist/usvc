@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
+from ...nn._commons import calc_same_padding
+
 # --- Lazy transformers import (default path never needs it) ---
 try:
     from transformers.models.roformer.modeling_roformer import (
@@ -375,11 +377,6 @@ class ConformerConvModule(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-
-def calc_same_padding(kernel_size):
-    pad = kernel_size // 2
-    return (pad, pad - (kernel_size + 1) % 2)
 
 
 class Transpose(nn.Module):

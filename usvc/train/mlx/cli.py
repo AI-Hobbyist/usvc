@@ -20,12 +20,7 @@ import argparse
 from pathlib import Path
 
 from ..config import TrainConfig
-
-
-def _resolve_val_interval(val_interval: float | int, n_batches: int) -> int | float:
-    if val_interval <= 1:
-        return max(float(val_interval), 1e-6)
-    return int(val_interval)
+from .._resolvers import resolve_feature_hashes, resolve_val_interval
 
 
 def run_training_mlx(
@@ -44,7 +39,6 @@ def run_training_mlx(
 
     # ---- dataset(复用 torch 构建逻辑)----
     from ...data.meta import load_meta
-    from ...data.feature_config import FeatureConfig
 
     meta = load_meta(cfg.dataset_dir)
     spec_cfg = dict(cfg.backend_opts or {})
@@ -52,34 +46,7 @@ def run_training_mlx(
     units_kind = (
         want_spec.units.params.get("kind", "contentvec") if want_spec.units else None
     )
-
-    def _match_hash(kind, fc, entries):
-        if fc is None or not entries:
-            return entries[0]["hash"] if entries else ""
-        want = fc.hash()
-        for e in entries:
-            if e.get("hash") == want:
-                return e["hash"]
-        for e in entries:
-            if e.get("config", {}).get("n_mels") == fc.params.get("n_mels"):
-                return e["hash"]
-        return entries[0]["hash"]
-
-    feature_hashes: dict[str, str] = {}
-    for kind, entries in meta.features.items():
-        if kind == "units":
-            enc_map = entries or {}
-            if units_kind is not None and units_kind in enc_map:
-                feature_hashes["units"] = _match_hash(kind, want_spec.units, enc_map[units_kind])
-            else:
-                for enc_kind, enc_entries in enc_map.items():
-                    if enc_entries:
-                        feature_hashes["units"] = enc_entries[0]["hash"]
-                        break
-        elif isinstance(entries, list) and entries:
-            fc = getattr(want_spec, kind, None)
-            feature_hashes[kind] = _match_hash(kind, fc, entries)
-    cfg.feature_hashes = feature_hashes
+    cfg.feature_hashes = feature_hashes = resolve_feature_hashes(meta, want_spec, units_kind)
 
     train_ds = backend.build_dataset(cfg.dataset_dir, "train", cfg.feature_hashes)
     train_ds.max_frames = cfg.max_frames
@@ -144,7 +111,7 @@ def run_training_mlx(
         trainer.load_checkpoint(cfg.resume)
 
     # ---- fit ----
-    val_interval = _resolve_val_interval(cfg.val_interval, len(train_ds) // max(1, cfg.batch_size))
+    val_interval = resolve_val_interval(cfg.val_interval, len(train_ds) // max(1, cfg.batch_size))
     trainer.fit(
         train_dl,
         max_steps=max_steps,

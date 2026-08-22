@@ -8,34 +8,14 @@ from __future__ import annotations
 
 from ...data.feature_config import FeatureConfig, FeatureSpec
 from .._common import resolve_f0_config
+from .._defaults import MEL_44K, UNITS_CV, build_default_spec, hubertsoft_units
 from ..base import Backend
 
 __all__ = ["DiffusionBackend"]
 
 
 def _default_spec() -> FeatureSpec:
-    return FeatureSpec(
-        mel=FeatureConfig(
-            "mel",
-            {"n_fft": 2048, "win_length": 2048, "n_mels": 128, "fmin": 40.0, "fmax": 16000.0, "center": False},
-        ),
-        f0=FeatureConfig(
-            "f0",
-            {"extractor": "fcpe", "uv_policy": "interp"},
-        ),
-        rms=FeatureConfig("rms", {"win_length": 2048}),
-        units=FeatureConfig(
-            "units",
-            {
-                "kind": "contentvec",
-                "layer": 12,
-                "sr_in": 16000,
-                "hop_native": 320,
-                "align_mode": "gather",
-                "model_ckpt": "pretrained/contentvec/pytorch_model.bin",
-            },
-        ),
-    )
+    return build_default_spec(mel=MEL_44K, uv_policy="interp", rms_win=2048, units=UNITS_CV)
 
 
 class DiffusionBackend(Backend):
@@ -60,16 +40,7 @@ class DiffusionBackend(Backend):
             },
         )
         if train_cfg.get("units_kind") == "hubertsoft":
-            units = FeatureConfig(
-                "units",
-                {
-                    "kind": "hubertsoft",
-                    "sr_in": 16000,
-                    "hop_native": 320,
-                    "align_mode": "gather",
-                    "model_ckpt": train_cfg.get("units_ckpt", "pretrained/hubert/hubert-soft-0d54a1f4.pt"),
-                },
-            )
+            units = hubertsoft_units(train_cfg.get("units_ckpt"))
         else:
             units = base.units
         spec = FeatureSpec(mel=mel, f0=f0, rms=base.rms, units=units)
