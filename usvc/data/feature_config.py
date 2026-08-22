@@ -1,8 +1,6 @@
-"""Feature configuration & config-hash (DSP-001 §5, DSP-002 §1).
-
-Every feature artifact is located by a stable config hash derived from its
-FeatureConfig. Identical configs -> identical hash -> single artifact, computed
-once and shared across backends.
+"""Feature config & artifact-hash (DSP-001 §5, DSP-002 §1): identical configs -> identical
+hash -> one shared artifact across backends. Only params that change tensor values belong here;
+runtime knobs (device/workers/paths) must stay out or the hash turns machine-specific.
 """
 from __future__ import annotations
 
@@ -11,57 +9,37 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["FeatureConfig", "FeatureSpec"]
+_SLOTS = ("mel", "f0", "rms", "spec", "units", "aug_shift", "aug_mel")
 
 
 def _stable_json(obj: Any) -> str:
-    """Deterministic JSON: sorted keys, no ensure_ascii surprises."""
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
 
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    """One feature requirement + the params that affect its numeric output.
-
-    Only fields that change the resulting tensor values belong in `params`.
-    Runtime-only knobs (device, num_workers, verbose, force, absolute paths)
-    must NOT be here, or the hash becomes machine-specific.
-    """
-
-    kind: str  # "mel" | "f0" | "rms" | "spec" | "units" | "aug_shift" | "aug_mel"
+    kind: str  # mel | f0 | rms | spec | units | aug_shift | aug_mel
     params: dict[str, Any] = field(default_factory=dict)
 
     def hash(self) -> str:
         blob = {"kind": self.kind, **self.params}
-        # DSP grid version: mel/spec/rms share the nvSTFT center=False grid
-        # (window centered at k*hop + (win-hop)//2). Bumping this tag invalidates
-        # stale .pt artifacts produced by the old symmetric n_fft//2 padding so
-        # they are recomputed on the corrected grid. units/f0 are unaffected.
-        # aug_mel uses the same grid (keyshift keeps the frame grid).
-        if self.kind in ("mel", "spec", "rms", "aug_mel"):
-            blob["_grid"] = "nvstft_v2"
+        # nvSTFT center=False grid version tag: bumping invalidates stale .pt artifacts
+        # from the old symmetric n_fft//2 padding (mel/spec/rms/aug_mel share the grid).
+        if self.kind in ("mel", "spec", "rms", "aug_mel"): blob["_grid"] = "nvstft_v2"
         return hashlib.sha256(_stable_json(blob).encode()).hexdigest()[:16]
 
     @property
-    def path_tag(self) -> str:
-        """Sub-path segment for this feature under the dataset dir.
+    def path_tag(self) -> str:  # units bucketed per encoder kind so different models never share a dir
+        return f"{self.kind}/{self.hash()}" if self.kind != "units" \
+            else f"units/{self.params.get('kind', 'unknown')}/{self.hash()}"
 
-        For ``units`` the bucket is ``units/{encoder_kind}/{hash}`` so that
-        physically different models never share a directory. Other kinds use
-        ``{kind}/{hash}``.
-        """
-        if self.kind == "units":
-            kind = self.params.get("kind", "unknown")
-            return f"units/{kind}/{self.hash()}"
-        return f"{self.kind}/{self.hash()}"
-
-    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+    def __repr__(self) -> str:
         return f"FeatureConfig({self.kind}@{self.hash()} {self.params})"
 
 
 @dataclass(frozen=True)
 class FeatureSpec:
-    """A backend's full feature requirements (any subset of the slots)."""
+    """A backend's feature requirements (any subset of _SLOTS)."""
 
     mel: FeatureConfig | None = None
     f0: FeatureConfig | None = None
@@ -71,35 +49,12 @@ class FeatureSpec:
     aug_shift: FeatureConfig | None = None
     aug_mel: FeatureConfig | None = None
 
-    def all_required(self) -> list[FeatureConfig]:
-        # aug_shift MUST precede aug_mel: preprocessing computes aug_mel by
-        # reading the per-file aug_shift scalar (run() processes in this order).
-        return [
-            c
-            for c in (
-                self.mel,
-                self.f0,
-                self.rms,
-                self.spec,
-                self.units,
-                self.aug_shift,
-                self.aug_mel,
-            )
-            if c is not None
-        ]
+    def _named(self):
+        return [(n, getattr(self, n)) for n in _SLOTS]
 
-    def as_hash_map(self) -> dict[str, str]:
-        """Map feature kind -> hash, for dataset construction."""
-        out: dict[str, str] = {}
-        for name, cfg in (
-            ("mel", self.mel),
-            ("f0", self.f0),
-            ("rms", self.rms),
-            ("spec", self.spec),
-            ("units", self.units),
-            ("aug_shift", self.aug_shift),
-            ("aug_mel", self.aug_mel),
-        ):
-            if cfg is not None:
-                out[name] = cfg.hash()
-        return out
+    def all_required(self) -> list[FeatureConfig]:
+        # slot order matters: run() computes aug_shift before aug_mel reads it
+        return [c for _, c in self._named() if c is not None]
+
+    def as_hash_map(self) -> dict[str, str]:  # kind -> hash, for dataset construction
+        return {n: c.hash() for n, c in self._named() if c is not None}

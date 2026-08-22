@@ -1,14 +1,8 @@
-"""usvc-serve：usvc WebUI / 桌面端（usvc-studio）的本地 API 服务。
+"""usvc-serve: local API for the WebUI / usvc-studio desktop shell (WEBUI_DESIGN §3).
 
-P0 骨架（docs/WEBUI_DESIGN.md §3）：
-- 只读接口：/api/health /api/env /api/backends /api/presets
-- 统一 Job 抽象：/api/jobs（提交/列表/详情/取消）+ SSE 事件流（replay-then-tail）
-- 可选 token 鉴权（X-Usvc-Token）；CORS 全开（浏览器模式需要）
-
-启动契约（桌面端解析 stdout 首行）::
-
-    USVC_READY {"port": 9740, "token": null}
-"""
+Read-only: /api/health|env|backends|presets. Unified Jobs: /api/jobs CRUD + SSE replay-then-tail.
+Optional token auth (X-Usvc-Token); CORS fully open (browser mode). Startup contract (desktop
+parses stdout line 1)::    USVC_READY {"port": 9740, "token": null}"""
 from __future__ import annotations
 
 import argparse
@@ -33,25 +27,33 @@ from .audio import AudioError, AudioStore
 from .jobs import TERMINAL_STATES, JobError, JobScheduler
 from .tfevents import TfEventsStore
 
-__all__ = ["create_app", "main"]
-
 DEFAULT_PORT = 9740
+
+_AUDIO_MEDIA = {".wav": "audio/wav", ".flac": "audio/flac", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
+
+# train overrides whitelist — plan/location fields only; batch_size/max_frames/loss/arch/optimizer
+# are frozen training semantics (AGENTS.md) and must never be overridable from the API.
+_TRAIN_OVERLAY_KEYS = {
+    "dataset_dir", "exp_dir", "resume", "max_steps", "max_epochs",
+    "save_interval", "val_interval", "keep_last_n", "num_workers",
+}
 
 
 def _version() -> str:
-    try:
-        return importlib.metadata.version("usvc")
-    except importlib.metadata.PackageNotFoundError:
-        return "0.0.0"
+    try: return importlib.metadata.version("usvc")
+    except importlib.metadata.PackageNotFoundError: return "0.0.0"
 
 
-def _presets_dir() -> Path | None:
-    """configs/ 目录解析：环境变量优先，其次当前工作目录。"""
+def _presets_dir() -> Path | None:  # configs/: env var wins, else cwd
     d = os.environ.get("USVC_CONFIGS_DIR")
-    if d:
-        return Path(d)
+    if d: return Path(d)
     cwd = Path.cwd() / "configs"
     return cwd if cwd.is_dir() else None
+
+
+def _outputs_dir() -> Path:
+    d = os.environ.get("USVC_OUTPUT_DIR")
+    return Path(d) if d else Path.cwd() / "outputs"
 
 
 def _sse(ev) -> str:
@@ -68,45 +70,11 @@ class AudioRegister(BaseModel):
     path: str
 
 
-_AUDIO_MEDIA = {
-    ".wav": "audio/wav",
-    ".flac": "audio/flac",
-    ".mp3": "audio/mpeg",
-    ".ogg": "audio/ogg",
-}
-
-
-def _outputs_dir() -> Path:
-    """推理输出目录：环境变量优先，默认 cwd/outputs。"""
-    d = os.environ.get("USVC_OUTPUT_DIR")
-    return Path(d) if d else Path.cwd() / "outputs"
-
-
-#: train overrides 白名单——只允许改训练计划/位置类字段。
-#: 训练语义边界（AGENTS.md）：batch_size / max_frames / loss / 网络结构 / 优化器禁改。
-_TRAIN_OVERLAY_KEYS = {
-    "dataset_dir",
-    "exp_dir",
-    "resume",
-    "max_steps",
-    "max_epochs",
-    "save_interval",
-    "val_interval",
-    "keep_last_n",
-    "num_workers",
-}
-
-
 def _normalize_train(params: dict, out_dir: Path) -> dict:
-    """解析训练 yaml + 应用白名单 overrides → 写临时 yaml → 注入 exp_dir。
-
-    返回新 params：config 指向临时 yaml（train 子进程消费），exp_dir 供 metrics 用。
-    """
+    """Load train yaml + apply whitelist overrides -> write temp yaml -> inject exp_dir."""
     cfg_path = Path(params["config"])
-    if not cfg_path.is_file():
-        raise JobError(f"config not found: {cfg_path}")
-    try:
-        data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    if not cfg_path.is_file(): raise JobError(f"config not found: {cfg_path}")
+    try: data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     except _yaml.YAMLError as exc:
         raise JobError(f"invalid yaml {cfg_path}: {exc}")
     if not isinstance(data, dict) or "backend" not in data:
@@ -124,26 +92,17 @@ def _normalize_train(params: dict, out_dir: Path) -> dict:
     tmp = cfg_dir / f"train_{int(time.time() * 1000)}.yaml"
     tmp.write_text(_yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
 
-    new_params = dict(params)
-    new_params["config"] = str(tmp)
-    new_params["exp_dir"] = exp_dir
-    if "resume" in overrides:
-        new_params["resume"] = overrides["resume"]
+    new_params = dict(params); new_params["config"] = str(tmp); new_params["exp_dir"] = exp_dir
+    if "resume" in overrides: new_params["resume"] = overrides["resume"]
     return new_params
 
 
 def create_app(token: str | None = None) -> FastAPI:
     app = FastAPI(title="usvc-serve", version=_version())
-    # CORS 最外层：浏览器模式需要跨域；本地 token 兜底防其他网页盗连 127.0.0.1
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # outermost CORS: browser mode needs cross-origin; local token guards other pages from hijacking 127.0.0.1
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     if token:
-
         @app.middleware("http")
         async def _auth(request: Request, call_next):
             if request.method == "OPTIONS" or request.url.path == "/api/health":
@@ -152,193 +111,130 @@ def create_app(token: str | None = None) -> FastAPI:
                 return JSONResponse({"detail": "unauthorized"}, status_code=401)
             return await call_next(request)
 
-    scheduler = JobScheduler()
-    app.state.scheduler = scheduler
-    audio_store = AudioStore()
-    app.state.audio = audio_store
-    tfevents = TfEventsStore()
-    app.state.tfevents = tfevents
-
+    scheduler = JobScheduler(); app.state.scheduler = scheduler
+    audio_store = AudioStore(); app.state.audio = audio_store
+    tfevents = TfEventsStore(); app.state.tfevents = tfevents
     def _on_job_success(job) -> None:
-        """infer 成功：注册输出音频并发 artifact 事件（先于终态，SSE 不丢）。"""
-        if job.kind != "infer":
-            return
+        """infer success: register output audio + artifact event (before terminal state)."""
+        if job.kind != "infer": return
         out = job.params.get("output")
-        if not out or not Path(out).exists():
-            return
-        try:
-            rec = audio_store.register(out, job_id=job.id, kind="infer_output")
-        except AudioError:
-            return
+        if not out or not Path(out).exists(): return
+        try: rec = audio_store.register(out, job_id=job.id, kind="infer_output")
+        except AudioError: return
         job.emit("artifact", kind="wav", path=rec["path"], audio_id=rec["id"], name=rec["name"])
 
     scheduler.on_success = _on_job_success
-
     @app.get("/api/health")
     async def health() -> dict:
         return {"ok": True, "service": "usvc-serve", "version": _version()}
-
     @app.get("/api/env")
     async def env() -> dict:
-        """环境诊断（复用 usvc-checkenv 的 full_report）。"""
         report = _envcheck.full_report()
         return {"report": report, "verdict": _envcheck._verdict(report)}
-
     @app.get("/api/backends")
     async def backends() -> dict:
         return {"backends": [{"name": n} for n in BACKENDS]}
-
     @app.get("/api/presets")
     async def presets() -> dict:
-        """预置训练配置（configs/*.yaml）摘要。"""
         base = _presets_dir()
         if base is None:
-            return {
-                "dir": None,
-                "presets": [],
-                "note": "configs/ 目录未找到（从仓库根启动或设置 USVC_CONFIGS_DIR）",
-            }
+            return {"dir": None, "presets": [],
+                    "note": "configs/ 目录未找到（从仓库根启动或设置 USVC_CONFIGS_DIR）"}
         out = []
         for p in sorted(base.glob("*.yaml")):
-            try:
-                data = _yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-            except _yaml.YAMLError:
-                data = {}
-            out.append(
-                {
-                    "name": p.stem,
-                    "path": str(p),
-                    "backend": data.get("backend"),
-                    "dataset_dir": data.get("dataset_dir"),
-                    "exp_dir": data.get("exp_dir"),
-                    "batch_size": data.get("batch_size"),
-                    "max_steps": data.get("max_steps"),
-                }
-            )
+            try: data = _yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except _yaml.YAMLError: data = {}
+            out.append({"name": p.stem, "path": str(p),
+                        **{k: data.get(k) for k in
+                           ("backend", "dataset_dir", "exp_dir", "batch_size", "max_steps")}})
         return {"dir": str(base), "presets": out}
-
     @app.get("/api/jobs")
     async def jobs_list(state: str | None = None) -> dict:
         jobs = [j.snapshot() for j in scheduler.list()]
-        if state:
-            jobs = [j for j in jobs if j["state"] == state]
+        if state: jobs = [j for j in jobs if j["state"] == state]
         return {"jobs": jobs}
-
     @app.post("/api/jobs", status_code=201)
     async def jobs_create(body: JobCreate) -> dict:
         params = dict(body.params)
         out_dir = _outputs_dir()
         if body.kind == "infer" and not params.get("output"):
-            # 输出定向到受控目录，便于产物注册与试听
+            # route output into the controlled dir for registration/playback
             stem = Path(str(params.get("input", "out"))).stem or "out"
             out_dir.mkdir(parents=True, exist_ok=True)
             params["output"] = str(out_dir / f"out_{stem}_{int(time.time())}.wav")
         elif body.kind == "train":
-            try:
-                params = _normalize_train(params, out_dir)
-            except JobError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
-        try:
-            job = await scheduler.submit(body.kind, params)
-        except JobError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            try: params = _normalize_train(params, out_dir)
+            except JobError as exc: raise HTTPException(status_code=422, detail=str(exc))
+        try: job = await scheduler.submit(body.kind, params)
+        except JobError as exc: raise HTTPException(status_code=422, detail=str(exc))
         return job.snapshot()
-
     @app.get("/api/jobs/{job_id}")
     async def jobs_get(job_id: str) -> dict:
         job = scheduler.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="job not found")
+        if job is None: raise HTTPException(status_code=404, detail="job not found")
         return job.snapshot()
-
     @app.delete("/api/jobs/{job_id}")
     async def jobs_cancel(job_id: str) -> dict:
         job = await scheduler.cancel(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="job not found")
+        if job is None: raise HTTPException(status_code=404, detail="job not found")
         return job.snapshot()
 
-    # ---------- 音频产物 ----------
-
+    # ---------- audio artifacts ----------
     @app.post("/api/audio", status_code=201)
     async def audio_register(body: AudioRegister) -> dict:
-        """注册服务器侧音频文件（输入/输出皆可），返回可播放的 audio id。"""
-        try:
-            return audio_store.register(body.path)
-        except AudioError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-
+        """Register a server-side audio file (in/out), returns playable audio id."""
+        try: return audio_store.register(body.path)
+        except AudioError as exc: raise HTTPException(status_code=422, detail=str(exc))
     @app.get("/api/audio")
     async def audio_list() -> dict:
         return {"items": audio_store.list()}
-
     @app.get("/api/audio/{audio_id}")
     async def audio_stream(audio_id: str) -> FileResponse:
-        """音频文件流（支持 Range，播放器拖动）。"""
         item = audio_store.get(audio_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail="audio not found")
+        if item is None: raise HTTPException(status_code=404, detail="audio not found")
         media = _AUDIO_MEDIA.get(Path(item["path"]).suffix.lower(), "application/octet-stream")
-        return FileResponse(item["path"], media_type=media, filename=item["name"])
-
+        return FileResponse(item["path"], media_type=media, filename=item["name"])  # Range-capable
     @app.get("/api/audio/{audio_id}/peaks")
     async def audio_peaks(audio_id: str, n: int = Query(800, ge=16, le=8192)) -> dict:
-        """波形峰值（后端预算，前端 canvas 直接画，不读原始文件）。"""
         result = await asyncio.to_thread(audio_store.peaks, audio_id, n)
-        if result is None:
-            raise HTTPException(status_code=404, detail="audio not found")
+        if result is None: raise HTTPException(status_code=404, detail="audio not found")
         return result
-
     @app.get("/api/jobs/{job_id}/metrics")
     async def job_metrics(job_id: str) -> dict:
-        """训练曲线：解析 job 的 exp_dir 下 tfevents 标量（历史+增量）。"""
         job = scheduler.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="job not found")
+        if job is None: raise HTTPException(status_code=404, detail="job not found")
         exp_dir = (job.params or {}).get("exp_dir")
-        if not exp_dir:
-            raise HTTPException(status_code=404, detail="no exp_dir for this job")
+        if not exp_dir: raise HTTPException(status_code=404, detail="no exp_dir for this job")
         return await asyncio.to_thread(tfevents.scalars, exp_dir)
-
     @app.get("/api/jobs/{job_id}/events")
     async def jobs_events(job_id: str, from_seq: int = Query(0, ge=0)) -> StreamingResponse:
-        """SSE 事件流：replay-then-tail（先回放 from_seq 之后的历史，再续实时流）。"""
+        """SSE replay-then-tail: history after from_seq first, then live."""
         job = scheduler.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="job not found")
-
+        if job is None: raise HTTPException(status_code=404, detail="job not found")
         async def gen():
-            # 先订阅再回放：窗口内重复投递的事件按 seq 去重，终态不丢
             q: asyncio.Queue = asyncio.Queue(maxsize=4096)
-            job.subscribe(q)
+            job.subscribe(q)  # subscribe before replay; window overlap deduped by seq below
             try:
                 last = from_seq
                 for ev in job.events_after(last):
-                    yield _sse(ev)
-                    last = ev.seq
-                if job.state in TERMINAL_STATES:
-                    return
+                    yield _sse(ev); last = ev.seq
+                if job.state in TERMINAL_STATES: return
                 while True:
                     ev = await q.get()
-                    if ev is None:  # 终态哨兵
-                        return
-                    if ev.seq <= last:
-                        continue  # 订阅窗口内已回放的事件
+                    if ev is None: return  # terminal sentinel
+                    if ev.seq <= last: continue  # already replayed within subscribe window
                     last = ev.seq
                     yield _sse(ev)
             finally:
                 job.unsubscribe(q)
 
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="usvc-serve", description="usvc WebUI/桌面端本地 API 服务")
     p.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机）")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="监听端口；0=自动选空闲端口")
@@ -348,23 +244,17 @@ def main(argv: list[str] | None = None) -> int:
 
     token = None if args.no_token else (args.token or os.environ.get("USVC_SERVE_TOKEN"))
 
-    # 先绑定 socket 拿实际端口（--port 0 时），再交给 uvicorn 复用，避免端口竞争
+    # bind first to learn the actual port (--port 0), hand the socket to uvicorn: no race
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.host, args.port))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); sock.bind((args.host, args.port))
     actual_port = sock.getsockname()[1]
 
-    # 启动契约：stdout 第一行，桌面端/客户端解析 {port, token}
-    print(
-        f"USVC_READY {json.dumps({'port': actual_port, 'token': token}, ensure_ascii=False)}",
-        flush=True,
-    )
+    print(f"USVC_READY {json.dumps({'port': actual_port, 'token': token}, ensure_ascii=False)}",
+          flush=True)  # startup contract: stdout line 1, parsed by desktop/client
 
-    app = create_app(token=token)
-    config = uvicorn.Config(app, host=args.host, port=actual_port, log_level="info")
-    server = uvicorn.Server(config)
-    server.config.sockets = [sock]
-    server.run()
+    server = uvicorn.Server(uvicorn.Config(create_app(token=token), host=args.host,
+                                           port=actual_port, log_level="info"))
+    server.config.sockets = [sock]; server.run()
     return 0
 
 
