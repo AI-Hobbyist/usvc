@@ -1,27 +1,15 @@
 """RVC v2 training model: SynthesizerTrnMs768NSFsid + MultiPeriodDiscriminatorV2.
-
-Extracted from RVC-Project/Retrieval-based-Voice-Conversion-WebUI
-(infer/module/models.py + modules.py), with torchaudio/scipy removed.
-
-Numerically-identical shared components are reused from the sovits model:
-    Encoder (attentions.Encoder), EncoderQ (== RVC PosteriorEncoder),
-    ResidualCouplingBlock, DiscriminatorS/P, sequence_mask, get_padding,
-    init_weights, rand_slice_segments_with_pitch, LRELU_SLOPE.
-
-RVC-specific components (algorithms differ from sovits, extracted verbatim):
-    SineGen, SourceModuleHnNSF, ResBlock1/2 (RVC signatures), GeneratorNSF,
-    TextEncoder, RVCModel, MultiPeriodDiscriminatorV2.
-
-Key RVC vs sovits differences:
-  - TextEncoder: emb_phone(Linear 768→h) + emb_pitch(Embedding 256→h) + FFT
-    encoder + proj; forward(phone, pitch, lengths) -> (m, logs, x_mask).
-  - GeneratorNSF: conv_pre/conv_post WITHOUT weight_norm, conv_post bias=False,
-    padding=(k-u)//2, m_source harmonic_num=0.
-  - MPD v2: periods [2,3,5,7,11,17,23,37].
+Extracted verbatim from RVC-Project/Retrieval-based-Voice-Conversion-WebUI
+(infer/module/models.py + modules.py; torchaudio/scipy removed). Shared
+numerically-identical components come from sovits.model (Encoder, EncoderQ,
+ResidualCouplingBlock, DiscriminatorS/P, sequence_mask, get_padding,
+init_weights, rand_slice_segments_with_pitch, LRELU_SLOPE). RVC-specific
+algorithms (differ from so-vits, kept verbatim): SineGen, SourceModuleHnNSF,
+ResBlock1/2 (RVC signatures), GeneratorNSF (conv_pre/conv_post WITHOUT
+weight_norm, conv_post bias=False, padding=(k-u)//2, m_source harmonic_num=0),
+TextEncoder, RVCModel, MultiPeriodDiscriminatorV2 (periods [2,3,5,7,11,17,23,37]).
 """
-from __future__ import annotations
-
-import math
+from math import prod, sqrt
 
 import torch
 import torch.nn.functional as F
@@ -29,471 +17,194 @@ from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-# channels_last 推理辅助统一在 usvc/nn/cl_helper.py（rvc/sovits/vocoder/wavenet 共享）
 from ...nn.cl_helper import conv2d_cl, convT2d_cl
-
-# ---------------------------------------------------------------------------
-# Reused from sovits model (numerically identical components)
-# ---------------------------------------------------------------------------
 from ..sovits.model import (
-    Encoder,               # attentions.Encoder (FFT encoder)
-    EncoderQ,              # == RVC PosteriorEncoder (Conv1d pre + WN + proj)
-    LRELU_SLOPE,
-    ResidualCouplingBlock,  # == RVC flow block (with extra share_parameter arg)
     DiscriminatorP,
     DiscriminatorS,
+    Encoder,
+    EncoderQ,
+    LRELU_SLOPE,
+    ResidualCouplingBlock,
     get_padding,
     init_weights,
-    rand_slice_segments_with_pitch,  # == rand_slice_segments + slice_segments2
+    rand_slice_segments_with_pitch,
     sequence_mask,
 )
 
-__all__ = [
-    "SineGen",
-    "SourceModuleHnNSF",
-    "ResBlock1",
-    "ResBlock2",
-    "GeneratorNSF",
-    "TextEncoder",
-    "RVCModel",
-    "MultiPeriodDiscriminatorV2",
-]
-
-sr2sr = {
-    "32k": 32000,
-    "40k": 40000,
-    "48k": 48000,
-}
+sr2sr = {"32k": 32000, "40k": 40000, "48k": 48000}
 
 
-# ---------------------------------------------------------------------------
-# RVC SineGen / SourceModuleHnNSF (verbatim from RVC models.py)
-# ---------------------------------------------------------------------------
-
-
-class SineGen(torch.nn.Module):
-    """RVC sine generator (harmonic_num harmonics above F0).
-
-    Uses the Triton fused frame-domain kernel (usvc._triton.fused_sinegen),
-    which is bit-equivalent to the original sample-domain path for the RVC
-    config (harmonic_num=0 -> dim=1, rand_ini恒0). This removes the
-    @torch.compiler.disable so the enclosing GeneratorNSF can stay inside a
-    torch.compile CUDA graph.
-    """
-
-    def __init__(
-        self,
-        samp_rate,
-        harmonic_num=0,
-        sine_amp=0.1,
-        noise_std=0.003,
-        voiced_threshold=0,
-        flag_for_pulse=False,
-    ):
-        super(SineGen, self).__init__()
-        self.sine_amp = sine_amp
-        self.noise_std = noise_std
-        self.harmonic_num = harmonic_num
-        self.dim = self.harmonic_num + 1
-        self.sampling_rate = samp_rate
-        self.voiced_threshold = voiced_threshold
-
-    def _f02uv(self, f0):
-        uv = torch.ones_like(f0)
-        uv = uv * (f0 > self.voiced_threshold)
-        if uv.device.type == "privateuseone":  # for DirectML
-            uv = uv.float()
-        return uv
+class SineGen(nn.Module):
+    # RVC sine excitation; Triton fused frame-domain kernel
+    # (usvc._triton.fused_sinegen) is bit-equivalent to the sample-domain path
+    # for the RVC config (harmonic_num=0 -> dim=1, rand_ini恒0) and drops the
+    # old @torch.compiler.disable so GeneratorNSF can stay inside a CUDA graph.
+    def __init__(self, samp_rate, harmonic_num=0, sine_amp=0.1, noise_std=0.003,
+                 voiced_threshold=0, flag_for_pulse=False):
+        super().__init__()
+        self.sine_amp, self.noise_std, self.harmonic_num = sine_amp, noise_std, harmonic_num
+        self.dim = harmonic_num + 1
+        self.sampling_rate, self.voiced_threshold = samp_rate, voiced_threshold
 
     def forward(self, f0, upp):
         from ..._triton.fused_sinegen import fused_sinegen
         with torch.no_grad():
-            # RVC config: harmonic_num=0 -> dim=1, rand_ini恒0 (基频无随机初始相位)。
-            # fused_sinegen (frame-domain) 与原 sample-domain 路径在 dim=1/rand_ini=0
-            # 下 bit 等价 (maxdiff 1e-4, sin 数值精度内)。noise 在此生成传入 kernel，
-            # 保证 fixed seed 可复现；返回值接口与原版一致 (sine_waves, uv, noise)。
             f0_in = f0[:, :, 0] if f0.dim() == 3 else f0
             B, T = f0_in.shape
-            noise = torch.randn(B, T * upp, self.dim,
-                                device=f0_in.device, dtype=torch.float32)
-            sine_waves = fused_sinegen(
-                f0_in, upp, self.dim, self.sampling_rate,
-                self.sine_amp, self.noise_std, rand_ini=None, noise=noise)
-            uv = self._f02uv(f0_in)
-            uv = torch.nn.functional.interpolate(
-                uv.unsqueeze(-1).transpose(2, 1),
-                scale_factor=float(upp), mode="nearest").transpose(2, 1)
-            out_dtype = f0.dtype if f0.dim() == 2 else f0_in.dtype
-            return sine_waves.to(out_dtype), uv, noise
+            # noise 在此生成传入 kernel（fixed seed 可复现）；返回接口与原版一致
+            noise = torch.randn(B, T * upp, self.dim, device=f0_in.device, dtype=torch.float32)
+            sine_waves = fused_sinegen(f0_in, upp, self.dim, self.sampling_rate,
+                                       self.sine_amp, self.noise_std, rand_ini=None, noise=noise)
+            uv = torch.ones_like(f0_in) * (f0_in > self.voiced_threshold)
+            if uv.device.type == "privateuseone":  # DirectML
+                uv = uv.float()
+            uv = F.interpolate(uv.unsqueeze(-1).transpose(2, 1),
+                               scale_factor=float(upp), mode="nearest").transpose(2, 1)
+            return sine_waves.to(f0.dtype if f0.dim() == 2 else f0_in.dtype), uv, noise
 
 
-class SourceModuleHnNSF(torch.nn.Module):
-    """RVC source module for hn-nsf (returns (sine_merge, None, None))."""
-
-    def __init__(
-        self,
-        sampling_rate,
-        harmonic_num=0,
-        sine_amp=0.1,
-        add_noise_std=0.003,
-        voiced_threshod=0,
-        is_half=True,
-    ):
-        super(SourceModuleHnNSF, self).__init__()
-        self.sine_amp = sine_amp
-        self.noise_std = add_noise_std
-        self.is_half = is_half
-        self.l_sin_gen = SineGen(
-            sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshod
-        )
-        # merge source harmonics into a single excitation
-        self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
-        self.l_tanh = torch.nn.Tanh()
+class SourceModuleHnNSF(nn.Module):  # hn-nsf source，返回 (sine_merge, None, None)
+    def __init__(self, sampling_rate, harmonic_num=0, sine_amp=0.1,
+                 add_noise_std=0.003, voiced_threshod=0, is_half=True):
+        super().__init__()
+        self.sine_amp, self.noise_std, self.is_half = sine_amp, add_noise_std, is_half
+        self.l_sin_gen = SineGen(sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshod)
+        self.l_linear = nn.Linear(harmonic_num + 1, 1)  # merge source harmonics into one excitation
+        self.l_tanh = nn.Tanh()
 
     def forward(self, x, upp=1):
-        sine_wavs, uv, _ = self.l_sin_gen(x, upp)
-        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
-        return sine_merge, None, None  # noise, uv
+        sine_wavs, _, _ = self.l_sin_gen(x, upp)
+        return self.l_tanh(self.l_linear(sine_wavs.to(dtype=self.l_linear.weight.dtype))), None, None
 
 
-# ---------------------------------------------------------------------------
-# RVC ResBlock1/2 (RVC signatures: (channels, kernel_size, dilation))
-# ---------------------------------------------------------------------------
+def _wconv(channels, k, d):
+    return weight_norm(Conv1d(channels, channels, k, 1, dilation=d, padding=get_padding(k, d)))
 
 
-class ResBlock1(torch.nn.Module):
+class ResBlock1(nn.Module):  # RVC hifigan resblock 1（dilation 组 + 1-dilation 组）
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock1, self).__init__()
-        self.convs1 = nn.ModuleList(
-            [
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=dilation[0],
-                        padding=get_padding(kernel_size, dilation[0]),
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=dilation[1],
-                        padding=get_padding(kernel_size, dilation[1]),
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=dilation[2],
-                        padding=get_padding(kernel_size, dilation[2]),
-                    )
-                ),
-            ]
-        )
+        super().__init__()
+        self.convs1 = nn.ModuleList([_wconv(channels, kernel_size, d) for d in dilation])
         self.convs1.apply(init_weights)
-        self.convs2 = nn.ModuleList(
-            [
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=1,
-                        padding=get_padding(kernel_size, 1),
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=1,
-                        padding=get_padding(kernel_size, 1),
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=1,
-                        padding=get_padding(kernel_size, 1),
-                    )
-                ),
-            ]
-        )
+        self.convs2 = nn.ModuleList([_wconv(channels, kernel_size, 1) for _ in dilation])
         self.convs2.apply(init_weights)
         self.lrelu_slope = LRELU_SLOPE
 
-    def forward(self, x, x_mask=None):
+    def _fwd(self, x, x_mask, cnv):
+        m, s = (x_mask if x_mask is not None else torch.ones_like(x)), self.lrelu_slope
         for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c1(xt)
-            xt = F.leaky_relu(xt, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c2(xt)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
+            x = cnv(F.leaky_relu(cnv(F.leaky_relu(x, s) * m, c1), s) * m, c2) + x
+        return x * m
+
+    def forward(self, x, x_mask=None):
+        return self._fwd(x, x_mask, lambda t, c: c(t))
 
     def forward_cl(self, x, x_mask=None):
-        """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
-        for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = conv2d_cl(xt, c1)
-            xt = F.leaky_relu(xt, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = conv2d_cl(xt, c2)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
+        return self._fwd(x, x_mask, conv2d_cl)
 
     def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
+        for l in (*self.convs1, *self.convs2):
             remove_weight_norm(l)
 
 
-class ResBlock2(torch.nn.Module):
+class ResBlock2(nn.Module):  # RVC hifigan resblock 2（单 dilation 组）
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
-        super(ResBlock2, self).__init__()
-        self.convs = nn.ModuleList(
-            [
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=dilation[0],
-                        padding=get_padding(kernel_size, dilation[0]),
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels,
-                        channels,
-                        kernel_size,
-                        1,
-                        dilation=dilation[1],
-                        padding=get_padding(kernel_size, dilation[1]),
-                    )
-                ),
-            ]
-        )
+        super().__init__()
+        self.convs = nn.ModuleList([_wconv(channels, kernel_size, d) for d in dilation])
         self.convs.apply(init_weights)
         self.lrelu_slope = LRELU_SLOPE
 
-    def forward_cl(self, x, x_mask=None):
-        """channels_last 版（x: [B,C,1,T] CL，等价于 forward）。"""
+    def _fwd(self, x, x_mask, cnv):
+        m = x_mask if x_mask is not None else torch.ones_like(x)
         for c in self.convs:
-            xt = F.leaky_relu(x, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = conv2d_cl(xt, c)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
+            x = cnv(F.leaky_relu(x, self.lrelu_slope) * m, c) + x
+        return x * m
 
     def forward(self, x, x_mask=None):
-        for c in self.convs:
-            xt = F.leaky_relu(x, self.lrelu_slope)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c(xt)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
+        return self._fwd(x, x_mask, lambda t, c: c(t))
+
+    def forward_cl(self, x, x_mask=None):
+        return self._fwd(x, x_mask, conv2d_cl)
 
     def remove_weight_norm(self):
         for l in self.convs:
             remove_weight_norm(l)
 
 
-# ---------------------------------------------------------------------------
-# RVC GeneratorNSF (verbatim from RVC models.py)
-# ---------------------------------------------------------------------------
-
-
-class GeneratorNSF(torch.nn.Module):
-    def __init__(
-        self,
-        initial_channel,
-        resblock,
-        resblock_kernel_sizes,
-        resblock_dilation_sizes,
-        upsample_rates,
-        upsample_initial_channel,
-        upsample_kernel_sizes,
-        gin_channels,
-        sr,
-        is_half=False,
-    ):
-        super(GeneratorNSF, self).__init__()
+class GeneratorNSF(nn.Module):
+    def __init__(self, initial_channel, resblock, resblock_kernel_sizes,
+                 resblock_dilation_sizes, upsample_rates, upsample_initial_channel,
+                 upsample_kernel_sizes, gin_channels, sr, is_half=False):
+        super().__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=math.prod(upsample_rates))
-        self.m_source = SourceModuleHnNSF(
-            sampling_rate=sr, harmonic_num=0, is_half=is_half
-        )
-        self.noise_convs = nn.ModuleList()
-        self.conv_pre = Conv1d(
-            initial_channel, upsample_initial_channel, 7, 1, padding=3
-        )
+        self.f0_upsamp = nn.Upsample(scale_factor=prod(upsample_rates))
+        self.m_source = SourceModuleHnNSF(sampling_rate=sr, harmonic_num=0, is_half=is_half)
+        self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
         resblock = ResBlock1 if resblock == "1" else ResBlock2
-
-        self.ups = nn.ModuleList()
+        self.noise_convs, self.ups = nn.ModuleList(), nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
-            c_cur = upsample_initial_channel // (2 ** (i + 1))
-            self.ups.append(
-                weight_norm(
-                    ConvTranspose1d(
-                        upsample_initial_channel // (2**i),
-                        upsample_initial_channel // (2 ** (i + 1)),
-                        k,
-                        u,
-                        padding=(k - u) // 2,
-                    )
-                )
-            )
-            if i + 1 < len(upsample_rates):
-                stride_f0 = math.prod(upsample_rates[i + 1 :])
-                self.noise_convs.append(
-                    Conv1d(
-                        1,
-                        c_cur,
-                        kernel_size=stride_f0 * 2,
-                        stride=stride_f0,
-                        padding=stride_f0 // 2,
-                    )
-                )
-            else:
-                self.noise_convs.append(Conv1d(1, c_cur, kernel_size=1))
-
-        self.resblocks = nn.ModuleList()
-        for i in range(len(self.ups)):
-            ch = upsample_initial_channel // (2 ** (i + 1))
-            for j, (k, d) in enumerate(
-                zip(resblock_kernel_sizes, resblock_dilation_sizes)
-            ):
-                self.resblocks.append(resblock(ch, k, d))
-
-        self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
+            c = upsample_initial_channel // 2 ** (i + 1)
+            self.ups.append(weight_norm(ConvTranspose1d(
+                upsample_initial_channel // 2 ** i, c, k, u, padding=(k - u) // 2)))
+            self.noise_convs.append(
+                Conv1d(1, c, s * 2, s, s // 2)
+                if (s := prod(upsample_rates[i + 1:])) and i + 1 < self.num_upsamples
+                else Conv1d(1, c, 1))
+        self.resblocks = nn.ModuleList(
+            resblock(upsample_initial_channel // 2 ** (i + 1), k, d)
+            for i in range(self.num_upsamples)
+            for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes))
+        self.conv_post = Conv1d(upsample_initial_channel // 2 ** self.num_upsamples,
+                                1, 7, 1, padding=3, bias=False)
         self.ups.apply(init_weights)
-
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+        self.upp, self.lrelu_slope = prod(upsample_rates), LRELU_SLOPE
 
-        self.upp = math.prod(upsample_rates)
-        self.lrelu_slope = LRELU_SLOPE
-
-    def forward_cl(self, x, f0, g=None, n_res=None):
-        """channels_last 版 forward（等价于 forward；x: [B,C,T]）。"""
-        # autocast 下统一输入 dtype: rvc 的 x_mask (sequence_mask 输出) 是 fp32,
-        # 污染 z_p/z 链 → dec 输入 fp32 → conv_pre/cond 走 tf32 (比 fp16 慢 2×)。
-        # 显式 cast 到 autocast dtype 让首个 conv 走 fp16 tensor core。
+    def _synth(self, x, f0, g, n_res, cnv, tcnv, pck, rblk, uncl):
+        # autocast 下统一输入 dtype：rvc x_mask(fp32) 污染 z 链 → conv_pre/cond 走 tf32
+        # （比 fp16 慢 2×）；显式 cast 让首个 conv 走 fp16 tensor core
         if torch.is_autocast_enabled():
-            ac_dtype = torch.get_autocast_gpu_dtype()
-            x = x.to(ac_dtype)
+            ac = torch.get_autocast_gpu_dtype()
+            x, f0 = x.to(ac), f0.to(ac)
             if g is not None:
-                g = g.to(ac_dtype)
-            f0 = f0.to(ac_dtype)
-        har_source, noi_source, uv = self.m_source(f0, self.upp)
-        har_source = har_source.transpose(1, 2)
+                g = g.to(ac)
+        har, _, _ = self.m_source(f0, self.upp)
+        har = har.transpose(1, 2)
         if n_res is not None:
             n = int(n_res.item()) if isinstance(n_res, torch.Tensor) else int(n_res)
-            if n * self.upp != har_source.shape[-1]:
-                har_source = F.interpolate(har_source, size=n * self.upp, mode="linear")
+            if n * self.upp != har.shape[-1]:
+                har = F.interpolate(har, size=n * self.upp, mode="linear")
             if n != x.shape[-1]:
                 x = F.interpolate(x, size=n, mode="linear")
-        x4 = x[:, :, None, :].to(memory_format=torch.channels_last)  # [B,C,1,T] CL
-        x = conv2d_cl(x4, self.conv_pre)
+        x, hs = pck(x), pck(har)
+        x = cnv(x, self.conv_pre)
         if g is not None:
-            x = x + conv2d_cl(
-                g[:, :, None, :].to(memory_format=torch.channels_last), self.cond)
-        # NSF source as [B,1,1,L] CL
-        hs4 = har_source[:, :, None, :].to(memory_format=torch.channels_last)
-        for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
-            if i < self.num_upsamples:
-                x = F.leaky_relu(x, self.lrelu_slope)
-                x = convT2d_cl(x, ups)
-                x_source = conv2d_cl(hs4, noise_convs)
-                minl = min(x.size(3), x_source.size(3))
-                x = x[:, :, :, :minl] + x_source[:, :, :, :minl]
-                xs = None
-                l = [i * self.num_kernels + j for j in range(self.num_kernels)]
-                for j, resblock in enumerate(self.resblocks):
-                    if j in l:
-                        if xs is None:
-                            xs = resblock.forward_cl(x)
-                        else:
-                            xs = xs + resblock.forward_cl(x)
-                assert isinstance(xs, torch.Tensor)
-                x = xs / self.num_kernels
-        x = F.leaky_relu(x)
-        x = conv2d_cl(x, self.conv_post)
-        x = torch.tanh(x)
-        return x[:, :, 0, :]  # [B,1,T]（view，无拷贝）
+            x = x + cnv(pck(g), self.cond)
+        for i, (ups, nconv) in enumerate(zip(self.ups, self.noise_convs)):
+            x = F.leaky_relu(x, self.lrelu_slope)
+            x = tcnv(x, ups)
+            s = cnv(hs, nconv)
+            m = min(x.shape[-1], s.shape[-1])
+            x = x[..., :m] + s[..., :m]
+            x = sum(rblk(r, x) for r in
+                    self.resblocks[i * self.num_kernels:(i + 1) * self.num_kernels]) / self.num_kernels
+        return uncl(torch.tanh(cnv(F.leaky_relu(x), self.conv_post)))
 
     def forward(self, x, f0, g=None, n_res=None):
         if getattr(self, "_use_cl", False):
             return self.forward_cl(x, f0, g, n_res)
-        har_source, noi_source, uv = self.m_source(f0, self.upp)
-        har_source = har_source.transpose(1, 2)
-        if n_res is not None:
-            n = int(n_res.item()) if isinstance(n_res, torch.Tensor) else int(n_res)
-            if n * self.upp != har_source.shape[-1]:
-                har_source = F.interpolate(har_source, size=n * self.upp, mode="linear")
-            if n != x.shape[-1]:
-                x = F.interpolate(x, size=n, mode="linear")
-        x = self.conv_pre(x)
-        if g is not None:
-            x = x + self.cond(g)
-        for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
-            if i < self.num_upsamples:
-                x = F.leaky_relu(x, self.lrelu_slope)
-                x = ups(x)
-                x_source = noise_convs(har_source)
-                minl = min(x.size(2), x_source.size(2))
-                x = x[:, :, :minl] + x_source[:, :, :minl]
-                xs = None
-                l = [i * self.num_kernels + j for j in range(self.num_kernels)]
-                for j, resblock in enumerate(self.resblocks):
-                    if j in l:
-                        if xs is None:
-                            xs = resblock(x)
-                        else:
-                            xs += resblock(x)
-                assert isinstance(xs, torch.Tensor)
-                x = xs / self.num_kernels
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-        return x
+        return self._synth(x, f0, g, n_res,
+                           lambda t, c: c(t), lambda t, c: c(t),
+                           lambda t: t, lambda r, t: r(t), lambda t: t)
+
+    def forward_cl(self, x, f0, g=None, n_res=None):
+        # pck: [B,C,T] -> [B,C,1,T] channels_last（view，无拷贝）；uncl 收尾变回 [B,1,T]
+        return self._synth(x, f0, g, n_res,
+                           conv2d_cl, convT2d_cl,
+                           lambda t: t[:, :, None, :].to(memory_format=torch.channels_last),
+                           lambda r, t: r.forward_cl(t), lambda t: t[:, :, 0, :])
 
     def remove_weight_norm(self):
         for l in self.ups:
@@ -502,181 +213,78 @@ class GeneratorNSF(torch.nn.Module):
             l.remove_weight_norm()
 
 
-# ---------------------------------------------------------------------------
-# RVC TextEncoder (verbatim from RVC models.py; uses shared Encoder)
-# ---------------------------------------------------------------------------
-
-
-class TextEncoder(nn.Module):
-    """RVC prior encoder: emb_phone(units) + emb_pitch(token) -> m, logs, x_mask."""
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        hidden_channels,
-        filter_channels,
-        n_heads,
-        n_layers,
-        kernel_size,
-        p_dropout,
-        f0=True,
-    ):
-        super(TextEncoder, self).__init__()
-        self.out_channels = out_channels
-        self.hidden_channels = hidden_channels
-        self.filter_channels = filter_channels
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.kernel_size = kernel_size
-        self.p_dropout = float(p_dropout)
+class TextEncoder(nn.Module):  # RVC prior: emb_phone + emb_pitch -> FFT -> m, logs, x_mask
+    def __init__(self, in_channels, out_channels, hidden_channels, filter_channels,
+                 n_heads, n_layers, kernel_size, p_dropout, f0=True):
+        super().__init__()
+        self.out_channels, self.hidden_channels = out_channels, hidden_channels
+        self.filter_channels, self.n_heads, self.n_layers = filter_channels, n_heads, n_layers
+        self.kernel_size, self.p_dropout = kernel_size, float(p_dropout)
         self.emb_phone = nn.Linear(in_channels, hidden_channels)
         self.lrelu = nn.LeakyReLU(0.1, inplace=True)
         if f0 == True:
-            self.emb_pitch = nn.Embedding(256, hidden_channels)  # pitch 256
-        self.encoder = Encoder(
-            hidden_channels,
-            filter_channels,
-            n_heads,
-            n_layers,
-            kernel_size,
-            float(p_dropout),
-            window_size=10,  # RVC default (so-vits uses 4); affects rel-pos emb shape
-        )
+            self.emb_pitch = nn.Embedding(256, hidden_channels)  # pitch token 1-255
+        self.encoder = Encoder(hidden_channels, filter_channels, n_heads,
+                               n_layers, kernel_size, float(p_dropout),
+                               window_size=10)  # RVC default (so-vits uses 4); rel-pos emb shape
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(
-        self,
-        phone,
-        pitch,
-        lengths,
-        skip_head=None,
-        vol_emb: torch.Tensor | None = None,
-    ):
+    def forward(self, phone, pitch, lengths, skip_head=None, vol_emb=None):
         if pitch is None:
             x = self.emb_phone(phone)
         else:
             x = self.emb_phone(phone) + self.emb_pitch(pitch)
         if vol_emb is not None:
-            # [b, t, h] volume embedding (vol_embedding mode; same slot as
-            # so-vits emb_vol, added pre-encoder)
-            x = x + vol_emb
-        x = x * math.sqrt(self.hidden_channels)  # [b, t, h]
-        x = self.lrelu(x)
-        x = torch.transpose(x, 1, -1)  # [b, h, t]
+            x = x + vol_emb  # [b,t,h] vol_embedding 模式（与 so-vits emb_vol 同槽位，pre-encoder）
+        x = self.lrelu(x * sqrt(self.hidden_channels))  # [b,t,h]
+        x = torch.transpose(x, 1, -1)  # [b,h,t]
         x_mask = torch.unsqueeze(sequence_mask(lengths, x.size(2)), 1).to(x.dtype)
         x = self.encoder(x * x_mask, x_mask)
         if skip_head is not None:
-            head = (
-                int(skip_head.item())
-                if isinstance(skip_head, torch.Tensor)
-                else int(skip_head)
-            )
-            x = x[:, :, head:]
-            x_mask = x_mask[:, :, head:]
-        stats = self.proj(x) * x_mask
-        m, logs = torch.split(stats, self.out_channels, dim=1)
+            head = int(skip_head.item()) if isinstance(skip_head, torch.Tensor) else int(skip_head)
+            x, x_mask = x[:, :, head:], x_mask[:, :, head:]
+        m, logs = torch.split(self.proj(x) * x_mask, self.out_channels, dim=1)
         return m, logs, x_mask
 
 
-# ---------------------------------------------------------------------------
-# RVCModel = SynthesizerTrnMs768NSFsid (RVC v2, usvc training interface)
-# ---------------------------------------------------------------------------
-
-
 class RVCModel(nn.Module):
-    """RVC v2 generator (SynthesizerTrnMs768NSFsid) with usvc dict interface.
-
-    Defaults from RVC configs/v2/48k.json:
-        spec_channels=1025 (filter_length//2+1), segment_size=20,
-        inter_channels=192, hidden_channels=192, filter_channels=768,
-        n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, resblock=1,
-        resblock_kernel_sizes=[3,7,11], resblock_dilation_sizes=[[1,3,5]x3],
-        upsample_rates=[10,10,2,2], upsample_initial_channel=512,
-        upsample_kernel_sizes=[16,16,4,4], gin_channels=256, sr=48k.
-    """
-
-    def __init__(
-        self,
-        n_units=768,
-        spec_channels=1025,
-        segment_size=20,
-        inter_channels=192,
-        hidden_channels=192,
-        filter_channels=768,
-        n_heads=2,
-        n_layers=6,
-        kernel_size=3,
-        p_dropout=0.1,
-        resblock="1",
-        resblock_kernel_sizes=(3, 7, 11),
-        resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        upsample_rates=(12, 10, 2, 2),
-        upsample_initial_channel=512,
-        upsample_kernel_sizes=(24, 20, 4, 4),
-        spk_embed_dim=1,
-        gin_channels=256,
-        sr=48000,
-        is_half=False,
-        vol_embedding=False,
-        **kwargs,
-    ):
+    """RVC v2 generator (SynthesizerTrnMs768NSFsid), usvc 训练接口。默认值来自
+    RVC configs/v2/48k.json（spec_channels=1025, segment_size=20, inter/hidden 192,
+    filter 768, n_heads 2, n_layers 6, resblock 1, kernels [3,7,11], dil [[1,3,5]×3],
+    up [12,10,2,2]/[24,20,4,4], gin 256, sr 48k）。"""
+    def __init__(self, n_units=768, spec_channels=1025, segment_size=20,
+                 inter_channels=192, hidden_channels=192, filter_channels=768,
+                 n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, resblock="1",
+                 resblock_kernel_sizes=(3, 7, 11),
+                 resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
+                 upsample_rates=(12, 10, 2, 2), upsample_initial_channel=512,
+                 upsample_kernel_sizes=(24, 20, 4, 4), spk_embed_dim=1,
+                 gin_channels=256, sr=48000, is_half=False, vol_embedding=False, **kwargs):
         super().__init__()
         if isinstance(sr, str):
             sr = sr2sr[sr]
-        self.spec_channels = spec_channels
-        self.inter_channels = inter_channels
-        self.hidden_channels = hidden_channels
-        self.filter_channels = filter_channels
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.kernel_size = kernel_size
-        self.p_dropout = float(p_dropout)
+        self.spec_channels, self.inter_channels = spec_channels, inter_channels
+        self.hidden_channels, self.filter_channels = hidden_channels, filter_channels
+        self.n_heads, self.n_layers = n_heads, n_layers
+        self.kernel_size, self.p_dropout = kernel_size, float(p_dropout)
         self.resblock = resblock
         self.resblock_kernel_sizes = list(resblock_kernel_sizes)
         self.resblock_dilation_sizes = [list(d) for d in resblock_dilation_sizes]
         self.upsample_rates = list(upsample_rates)
         self.upsample_initial_channel = upsample_initial_channel
         self.upsample_kernel_sizes = list(upsample_kernel_sizes)
-        self.segment_size = segment_size
-        self.gin_channels = gin_channels
-        self.spk_embed_dim = spk_embed_dim
-
-        self.enc_p = TextEncoder(
-            n_units,
-            inter_channels,
-            hidden_channels,
-            filter_channels,
-            n_heads,
-            n_layers,
-            kernel_size,
-            float(p_dropout),
-        )
-        self.dec = GeneratorNSF(
-            inter_channels,
-            resblock,
-            self.resblock_kernel_sizes,
-            self.resblock_dilation_sizes,
-            self.upsample_rates,
-            upsample_initial_channel,
-            self.upsample_kernel_sizes,
-            gin_channels=gin_channels,
-            sr=sr,
-            is_half=is_half,
-        )
-        self.enc_q = EncoderQ(
-            spec_channels,
-            inter_channels,
-            hidden_channels,
-            5,
-            1,
-            16,
-            gin_channels=gin_channels,
-        )
-        self.flow = ResidualCouplingBlock(
-            inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels
-        )
-        self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
+        self.segment_size, self.gin_channels, self.spk_embed_dim = segment_size, gin_channels, spk_embed_dim
+        self.enc_p = TextEncoder(n_units, inter_channels, hidden_channels, filter_channels,
+                                 n_heads, n_layers, kernel_size, float(p_dropout))
+        self.dec = GeneratorNSF(inter_channels, resblock, self.resblock_kernel_sizes,
+                                self.resblock_dilation_sizes, self.upsample_rates,
+                                upsample_initial_channel, self.upsample_kernel_sizes,
+                                gin_channels=gin_channels, sr=sr, is_half=is_half)
+        self.enc_q = EncoderQ(spec_channels, inter_channels, hidden_channels, 5, 1, 16,
+                              gin_channels=gin_channels)
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 3,
+                                          gin_channels=gin_channels)
+        self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
         self.vol_embedding = vol_embedding
         if vol_embedding:
             self.emb_vol = nn.Linear(1, hidden_channels)
@@ -687,114 +295,42 @@ class RVCModel(nn.Module):
         if hasattr(self, "enc_q"):
             self.enc_q.remove_weight_norm()
 
-    def forward(
-        self,
-        units: torch.Tensor,       # [B, T, n_units] content features (768d)
-        pitch_token: torch.Tensor,  # [B, T] quantized f0 tokens (1-255)
-        pitchf: torch.Tensor,       # [B, T] continuous f0 for NSF (Hz)
-        spec: torch.Tensor,         # [B, spec_channels, T_spec] target spec
-        wave: torch.Tensor | None = None,   # [B, 1, L] real wave (unused; API parity)
-        spk_id: torch.Tensor | None = None,  # [B] speaker id
-        frame_len: torch.Tensor | None = None,  # [B] units frame lengths
-        vol: torch.Tensor | None = None,  # [B, T] volume (only if vol_embedding)
-    ) -> dict:
-        """Training forward. Returns dict for loss computation.
-
-        Returns:
-            wave_gen: [B, 1, segment_size * prod(upsample_rates)]
-            z_p: flow output [B, inter, T_spec]
-            m_p/logs_p: prior stats [B, inter, T_spec]
-            m_q/logs_q: posterior stats [B, inter, T_spec]
-            z_mask: [B, 1, T_spec] posterior mask
-            ids_slice: [B] frame slice indices
-        """
+    def forward(self, units, pitch_token, pitchf, spec, wave=None, spk_id=None,
+                frame_len=None, vol=None) -> dict:
+        # 训练 forward；返回 dict 供 loss（wave_gen/z_p/m_p/logs_p/m_q/logs_q/
+        # z_mask/ids_slice/phone_lengths）。wave 未用（API parity）
         if spk_id is None:
             spk_id = torch.zeros(units.shape[0], dtype=torch.long, device=units.device)
-        if spk_id.dim() == 1:
-            spk_id = spk_id.unsqueeze(-1)  # RVC convention [B, 1]
-        # emb_g([B, 1]) -> [B, 1, gin]; transpose -> [B, gin, 1]
-        g = self.emb_g(spk_id).transpose(1, 2).contiguous()
-
-        phone_lengths = (
-            frame_len
-            if frame_len is not None
-            else torch.full(
-                (units.shape[0],), units.shape[1], device=units.device, dtype=torch.long
-            )
-        )
-        # RVC aligns spec length to units length (same as sovits)
-        spec_lengths = phone_lengths
-
-        vol_emb = (
-            self.emb_vol(vol[:, :, None])  # [B, T, 1] -> [B, T, h]
-            if vol is not None and self.vol_embedding
-            else None
-        )
+        g = self.emb_g(spk_id.unsqueeze(-1) if spk_id.dim() == 1 else spk_id) \
+            .transpose(1, 2).contiguous()  # [B,1] -> [B,1,gin] -> [B,gin,1]
+        phone_lengths = frame_len if frame_len is not None else torch.full(
+            (units.shape[0],), units.shape[1], device=units.device, dtype=torch.long)
+        vol_emb = self.emb_vol(vol[:, :, None]) if (vol is not None and self.vol_embedding) else None
         m_p, logs_p, x_mask = self.enc_p(units, pitch_token, phone_lengths, vol_emb=vol_emb)
-        z, m_q, logs_q, y_mask = self.enc_q(spec, spec_lengths, g=g)
+        z, m_q, logs_q, y_mask = self.enc_q(spec, phone_lengths, g=g)  # RVC: spec 对齐 units 长度
         z_p = self.flow(z, y_mask, g=g)
         z_slice, pitchf_slice, ids_slice = rand_slice_segments_with_pitch(
-            z, pitchf, spec_lengths, self.segment_size
-        )
-        o = self.dec(z_slice, pitchf_slice, g=g)
+            z, pitchf, phone_lengths, self.segment_size)
+        return {"wave_gen": self.dec(z_slice, pitchf_slice, g=g), "z_p": z_p,
+                "m_p": m_p, "logs_p": logs_p, "m_q": m_q, "logs_q": logs_q,
+                "z_mask": y_mask, "ids_slice": ids_slice, "phone_lengths": phone_lengths}
 
-        return {
-            "wave_gen": o,
-            "z_p": z_p,
-            "m_p": m_p,
-            "logs_p": logs_p,
-            "m_q": m_q,
-            "logs_q": logs_q,
-            "z_mask": y_mask,
-            "ids_slice": ids_slice,
-            "phone_lengths": phone_lengths,
-        }
-
-    def infer(
-        self,
-        phone,
-        phone_lengths,
-        pitch,
-        nsff0,
-        sid,
-        skip_head=None,
-        return_length=None,
-        return_length2=None,
-        vol: torch.Tensor | None = None,
-    ):
-        """RVC SynthesizerTrnMs256NSFsid.infer (verbatim from RVC models.py).
-
-        Args:
-            phone: [B, T, n_units] content features.
-            phone_lengths: [B] or [1] frame lengths.
-            pitch: [B, T] quantized f0 tokens (1-255).
-            nsff0: [B, T] continuous f0 for the NSF source (Hz).
-            sid: [B] speaker id (RVC convention; 1D).
-
-        Returns:
-            (o, x_mask, (z, z_p, m_p, logs_p)): wav [B, 1, L] + intermediates.
-        """
+    def infer(self, phone, phone_lengths, pitch, nsff0, sid, skip_head=None,
+              return_length=None, return_length2=None, vol=None):
+        # RVC SynthesizerTrnMs256NSFsid.infer verbatim（流式 skip_head 分支）
         g = self.emb_g(sid).unsqueeze(-1)
-        vol_emb = (
-            self.emb_vol(vol[:, :, None])  # [B, T, 1] -> [B, T, h]
-            if vol is not None and self.vol_embedding
-            else None
-        )
+        vol_emb = self.emb_vol(vol[:, :, None]) if (vol is not None and self.vol_embedding) else None
         if skip_head is not None and return_length is not None:
             head = int(skip_head.item()) if isinstance(skip_head, torch.Tensor) else int(skip_head)
-            length = (
-                int(return_length.item())
-                if isinstance(return_length, torch.Tensor)
-                else int(return_length)
-            )
+            length = int(return_length.item()) if isinstance(return_length, torch.Tensor) else int(return_length)
             flow_head = max(head - 24, 0)
             dec_head = head - flow_head
             m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head, vol_emb=vol_emb)
             z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
-            z = z[:, :, dec_head : dec_head + length]
-            x_mask = x_mask[:, :, dec_head : dec_head + length]
-            nsff0 = nsff0[:, head : head + length]
+            z = z[:, :, dec_head:dec_head + length]
+            x_mask = x_mask[:, :, dec_head:dec_head + length]
+            nsff0 = nsff0[:, head:head + length]
         else:
             m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, vol_emb=vol_emb)
             z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
@@ -804,56 +340,31 @@ class RVCModel(nn.Module):
 
     @staticmethod
     def f0_to_coarse(f0, f0_min=50.0, f0_max=1100.0):
-        """RVC f0 quantization (infer/rtrvc.py get_f0_post, verbatim).
-
-        f0: [B, T] Hz -> [B, T] long tokens in [1, 255].
-        """
-        # Always run in fp32: autocast fp16 log/clamp can produce out-of-range
-        # indices that overflow the 256-entry f0 embedding table.
+        # RVC f0 量化（infer/rtrvc.py get_f0_post verbatim）。与 so-vits 公式数学
+        # 等价但非 bit 等价（边界 token 不同），须保持独立：tests/test_mlx_ops_dedup.py
+        # 守卫两者发散。恒走 fp32：autocast fp16 log/clamp 可越界溢出 256 词表
         with torch.autocast("cuda", enabled=False):
             f0 = f0.float()
             f0_mel_min = 1127 * torch.log(torch.tensor(1 + f0_min / 700))
             f0_mel_max = 1127 * torch.log(torch.tensor(1 + f0_max / 700))
             f0_mel = 1127 * torch.log(1 + f0 / 700)
-            f0_mel = torch.where(
-                f0_mel > 0,
-                (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
-                f0_mel,
-            )
-            f0_mel = f0_mel.clamp(min=1, max=255)
-            f0_coarse = torch.round(f0_mel).long()
-        return f0_coarse
+            f0_mel = torch.where(f0_mel > 0,
+                                 (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1, f0_mel)
+            return torch.round(f0_mel.clamp(min=1, max=255)).long()
 
 
-# ---------------------------------------------------------------------------
-# RVC MultiPeriodDiscriminatorV2 (periods + DiscriminatorS; reuses shared S/P)
-# ---------------------------------------------------------------------------
-
-
-class MultiPeriodDiscriminatorV2(torch.nn.Module):
-    """RVC v2 MPD: DiscriminatorS + DiscriminatorP(2,3,5,7,11,17,23,37)."""
-
+class MultiPeriodDiscriminatorV2(nn.Module):  # RVC v2 MPD: S + P(2,3,5,7,11,17,23,37)
     def __init__(self, use_spectral_norm=False):
-        super(MultiPeriodDiscriminatorV2, self).__init__()
-        periods = [2, 3, 5, 7, 11, 17, 23, 37]
-
-        discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
-        discs = discs + [
-            DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods
-        ]
-        self.discriminators = nn.ModuleList(discs)
+        super().__init__()
+        self.discriminators = nn.ModuleList(
+            [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
+            + [DiscriminatorP(i, use_spectral_norm=use_spectral_norm)
+               for i in (2, 3, 5, 7, 11, 17, 23, 37)])
 
     def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            y_d_gs.append(y_d_g)
-            fmap_rs.append(fmap_r)
-            fmap_gs.append(fmap_g)
-
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+        rs, gs, fr, fg = [], [], [], []
+        for d in self.discriminators:
+            yr, fmr = d(y)
+            yg, fmg = d(y_hat)
+            rs.append(yr); gs.append(yg); fr.append(fmr); fg.append(fmg)
+        return rs, gs, fr, fg

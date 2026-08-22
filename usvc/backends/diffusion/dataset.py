@@ -1,28 +1,16 @@
-"""diffusion dataset: reads preprocessed features for DDPM training.
+"""diffusion dataset: preprocessed mel/f0/volume/units (+pitch aug) for DDPM.
 
-Same data pattern as ddsp6 (mel/f0/volume/units/spk). Pitch aug optional
-(precomputed aug_mel/aug_shift, 50%; Diffusion-SVC default OFF at spec
-level, enabled via train_cfg use_pitch_aug).
-Shared implementation lives in usvc/backends/_dataset.py (MelUnitsDataset).
+Same data pattern as ddsp6；共享实现 usvc/backends/_dataset.py (MelUnitsDataset)。
+Pitch aug 默认开（预计算 aug_mel/aug_shift，50%；Diffusion-SVC spec 层默认 OFF，
+由 train_cfg use_pitch_aug 启用）。
 """
 from __future__ import annotations
 
 from .._dataset import MelUnitsDataset
 
-__all__ = ["DiffusionDataset"]
-
 
 class DiffusionDataset(MelUnitsDataset):
-    """Dataset for diffusion backend (Diffusion-SVC style)."""
-
-    def __init__(
-        self,
-        dataset_dir: str,
-        split: str,
-        feature_hashes: dict,
-        max_frames: int = 172,
-        augment: bool = True,
-        encoder_kind: str = "contentvec",
-    ):
+    def __init__(self, dataset_dir, split, feature_hashes, max_frames=172,
+                 augment=True, encoder_kind="contentvec"):
         super().__init__(dataset_dir, split, feature_hashes, max_frames, augment,
                          encoder_kind, pitch_aug=True)
