@@ -1,22 +1,8 @@
-"""MLX 推理引擎(torch InferenceEngine 的 mlx 委托目标)。
+"""MLX 推理引擎 (torch InferenceEngine 的 mlx 委托目标)。
 
-当 ``USVC_BACKEND=mlx`` 或 ``InferenceEngine(impl='mlx')`` 时,
-``usvc.infer.engine.InferenceEngine`` 把 ``convert()`` 委托给本类。
-
-设计:torch 路径**零改动**。本类独立组合已验证的 mlx 组件:
-  - 特征:ContentVec(units)+ Mel + F0(RMVPE/FCPE)
-  - backend:rvc/sovits(wav-domain)/ diffusion/ddsp6/reflow/rift_dit(mel-domain)
-  - vocoder:NSF-HiFiGAN(mel-domain backends 用)
-
-复用 torch 版 InferenceEngine 的 numpy 侧后处理(LUFS / RMS 匹配 / 分块拼接),
-这些与 backend 无关。
-
-当前覆盖(按实现进度):
-  - rvc(wav-domain):RVCModel 完整链路(enc_p + flow + dec)
-  - sovits(wav-domain):Generator + flow + TextEncoder
-  - mel-domain:需 vocoder,待 backend model.sample 集成
-
-特征检索(index/cluster)、浅扩散增强器暂走 torch fallback。
+``USVC_BACKEND=mlx`` 或 ``InferenceEngine(impl='mlx')`` 时委托到本类, torch 路径零改动。
+复用 torch 版 numpy 侧后处理 (LUFS/RMS/分块拼接), 特征与 model forward 用 mlx。
+当前覆盖: rvc/sovits (wav-domain) 完整链路; mel-domain 待 backend.sample 集成。
 """
 from __future__ import annotations
 
@@ -25,33 +11,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-__all__ = ["MlxInferenceEngine", "is_mlx_backend_ready"]
-
-
-def is_mlx_backend_ready(backend_name: str) -> bool:
-    """该 backend 是否已有 mlx 实现(含完整推理链路)。
-
-    wav-domain(rvc/sovits)优先就绪(免 vocoder)。mel-domain 需 vocoder +
-    backend model.sample 集成,逐步开放。
-    """
-    # rvc/sovits 的 Generator + 特征提取已就绪,完整 RVCModel pipeline 待
-    # mlx_engine.convert 端到端验证后开放。保守起见暂全 False,由 convert
-    # 内部按 backend 分支处理(失败则提示用 torch)。
-    return False
+__all__ = ["MlxInferenceEngine"]
 
 
 class MlxInferenceEngine:
-    """MLX 推理引擎。
-
-    由 ``InferenceEngine`` 在 impl=mlx 时构造。接口对齐 torch 版的
-    ``convert()``(子集),返回 float32 numpy wav。
-
-    Args:
-        config_path: backend config yaml。
-        ckpt_path: 模型 checkpoint(.ckpt/.pth,torch pickle)。
-        vocoder_dir: mel-domain backends 的 NSF-HiFiGAN 目录。
-        device: mlx 设备('gpu' | 'cpu')。
-    """
+    """MLX 推理引擎, 接口对齐 torch 版 convert() (子集), 返回 float32 numpy wav。"""
 
     def __init__(
         self,
@@ -63,13 +27,11 @@ class MlxInferenceEngine:
     ):
         if device == "gpu":
             mx.set_default_device(mx.gpu)
-            # M4 16GB:iOS 风格限制会 OOM,改用 macOS 合理上限。
-            # wired memory 允许 GPU 常驻大量权重;cache 控制中间结果。
-            # 0 = 不限制(用系统默认管理),但设 wired 上限避免独占。
+            # wired 上限避免独占; cache 控制中间结果峰值
             try:
-                mx.set_memory_limit(0)      # 不设 active 上限
-                mx.set_cache_limit(512 * 1024 * 1024)  # 512MB 计算缓存
-                mx.set_wired_limit(4 * 1024 * 1024 * 1024)  # 4GB wired
+                mx.set_memory_limit(0)
+                mx.set_cache_limit(512 * 1024 * 1024)
+                mx.set_wired_limit(4 * 1024 * 1024 * 1024)
             except Exception:
                 pass  # 旧版 mlx 或 CPU 无效
         else:
@@ -97,11 +59,7 @@ class MlxInferenceEngine:
             self._compile_models()
 
     def _compile_models(self):
-        """编译 model forward(mx.compile 图融合)。
-
-        对 backend model 和 vocoder 的核心计算路径编译。compile 后首次调用
-        会触发图构建(预热),后续调用复用编译图,显著降低峰值内存和加速。
-        """
+        """编译 model/vocoder forward (mx.compile 图融合)。compile 后首次调用预热, 后续复用图。"""
         import functools
         m = getattr(self, "model", None)
         if m is not None:
@@ -130,11 +88,7 @@ class MlxInferenceEngine:
                 pass
 
     def _build_pipeline(self):
-        """构建 mlx backend 模型 + 可选 vocoder。
-
-        特征提取(units/f0/rms/uv)由 ``_extract_feats_numpy`` 按需调用
-        ``InferFeatures``(torch 特征管线,backend 无关),此处不预加载。
-        """
+        """backend 模型分发; 特征提取由 _extract_feats_numpy 按需调用 (torch 管线, backend 无关)。"""
         # backend 模型分发
         if self.backend_name == "rvc":
             self._build_rvc()
@@ -149,12 +103,7 @@ class MlxInferenceEngine:
             )
 
     def _build_rvc(self):
-        """RVC wav-domain pipeline:enc_p + flow + dec(GeneratorNSF)。
-
-        特征提取(units/f0/rms/uv)复用 torch 版 feats 管线(返回 numpy),
-        model.infer 用 mlx。混合策略:特征管线已验证且 backend 无关,
-        mlx 只接管最重的 model forward。
-        """
+        """RVC wav-domain: enc_p + flow + dec; 特征管线复用 torch (返回 numpy), mlx 只接管 model forward。"""
         from ..nn.mlx.backends.rvc import RVCModel
         opts = self.cfg.backend_opts
         kw = dict(
@@ -173,12 +122,10 @@ class MlxInferenceEngine:
         try:
             self.model = RVCModel.from_ckpt(self.ckpt_path, config=kw)
         except Exception:
-            # ckpt 不可用或格式不匹配,用空权重(结构可 forward,数值无意义)
-            self.model = RVCModel(**kw)
+            self.model = RVCModel(**kw)  # ckpt 不可用/格式不匹配: 空权重 (结构可 forward, 数值无意义)
         self.model.eval()
 
     def _build_sovits(self):
-        """sovits wav-domain pipeline:SoVITSModel(enc_p + flow + dec)。"""
         from ..nn.mlx.backends.sovits import SoVITSModel
         try:
             self.model = SoVITSModel.from_ckpt(self.ckpt_path)
@@ -190,7 +137,7 @@ class MlxInferenceEngine:
         self.model.eval()
 
     def _build_mel_domain(self):
-        """mel-domain backends:backend.sample(units,f0,vol) -> mel -> vocoder -> wav。"""
+        """mel-domain: backend.sample -> mel -> vocoder -> wav。"""
         if self.vocoder_dir is None:
             from ..hub import ensure_dir
             self.vocoder_dir = ensure_dir("nsf_hifigan")
@@ -226,47 +173,21 @@ class MlxInferenceEngine:
     # ------------------------------------------------------------------
 
     def _max_chunk_frames(self) -> int:
-        """每块最大帧数(wav-domain 更小:O(T) wav 分配;mel-domain 可大)。
-
-        经验值:wav-domain(GAN vocoder)在 ~5s 内峰值可控;
-        mel-domain(扩散/flow)中间 mel 小,可到 ~15s。
-        """
+        """每块最大帧数 (wav-domain O(T) 更小; mel-domain 可大)。USVC_MLX_TILE_SEC* 可覆盖。"""
         if self.backend_name in ("rvc", "sovits"):
-            # wav-domain O(T): 0.5s tile 平衡速度(47ms/block)与内存(542MB)。
-            # 更小可降内存但分块开销增大。可用 USVC_MLX_TILE_SEC 覆盖。
             import os
             tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC", "0.5"))
             return int(tile_sec * self.sr / self.hop)
-        # mel-domain:vocoder O(T) 内存大,用 USVC_MLX_TILE_SEC_MEL 控制(默认 3s)。
-        # 实测 vocoder:0.6s=670MB, 1.7s=1744MB。扩散分块开销大,默认 3s 平衡。
         import os
         tile_sec = float(os.environ.get("USVC_MLX_TILE_SEC_MEL", "3.0"))
         return int(tile_sec * self.sr / self.hop)
-
-    def _chunk_indices(self, T: int, chunk: int, overlap: int = 0):
-        """生成 (start, end) 分块索引,可选重叠(用于交叉淡化)。"""
-        if T <= chunk:
-            return [(0, T)]
-        idx = []
-        start = 0
-        while start < T:
-            end = min(start + chunk, T)
-            idx.append((start, end))
-            if end >= T:
-                break
-            start = end - overlap
-        return idx
 
     # ------------------------------------------------------------------
     # convert(接口对齐 torch InferenceEngine)
     # ------------------------------------------------------------------
 
     def convert(self, input_wav, spk: int = 0, trans: int = 0, **kwargs) -> np.ndarray:
-        """转换单个 wav → float32 numpy wav。
-
-        混合策略:特征提取(units/f0/rms/uv)复用 torch 版 feats 管线
-        (backend 无关,返回 numpy),model forward 用 mlx。
-        """
+        """转换单个 wav -> float32 numpy wav。特征复用 torch 管线 (返回 numpy), model forward 用 mlx。"""
         if self.backend_name == "rvc":
             return self._convert_rvc(input_wav, spk, trans, **kwargs)
         if self.backend_name == "sovits":
@@ -278,9 +199,7 @@ class MlxInferenceEngine:
         )
 
     def _extract_feats_numpy(self, input_wav, f0_method="rmvpe"):
-        """特征提取:优先 mlx GPU(快 2.3x,无 torch 进程开销),
-        回退 torch InferFeatures(若 mlx 特征器不可用)。
-        """
+        """特征提取: 优先 mlx GPU (快 2.3x), 失败回退 torch InferFeatures。"""
         # 尝试 mlx 特征提取(GPU,无 torch)
         try:
             if not hasattr(self, "_mlx_feats"):
@@ -327,7 +246,6 @@ class MlxInferenceEngine:
             return units, f0, rms
         except Exception:
             pass  # 回退 torch
-        # torch 回退:InferFeatures(backend 无关特征管线)
         from ..backends import get_backend
         from .features import InferFeatures
         opts = self.cfg.backend_opts
@@ -347,7 +265,7 @@ class MlxInferenceEngine:
         return units, f0, rms
 
     def _convert_sovits(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """sovits wav-domain:feats -> [cluster] -> SoVITSModel.infer -> [enhance] -> wav。"""
+        """sovits wav-domain: feats -> [cluster] -> SoVITSModel.infer -> [enhance] -> wav。"""
         import mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
@@ -382,18 +300,14 @@ class MlxInferenceEngine:
         return wav
 
     def _convert_mel_domain(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """mel-domain:feats -> mel sample -> vocoder -> wav。
-
-        ddsp6:分块 sample+vocoder(DDSP 谱路径不适合全 mel)。
-        diffusion/reflow_vae:全 mel sample + vocoder 0.5s 分块(峰值最优)。
-        """
+        """mel-domain: ddsp6 分块 sample+vocoder; diffusion/reflow_vae 全 mel sample + vocoder 0.5s 分块。"""
         import mlx.core as mx
         if self.backend_name == "ddsp6":
             return self._convert_mel_domain_chunked(input_wav, spk, trans, **kwargs)
         return self._convert_mel_domain_full_sample(input_wav, spk, trans, **kwargs)
 
     def _convert_mel_domain_chunked(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """分块 sample+vocoder(ddsp6):每块独立 sample,小 tile 控峰值。"""
+        """分块 sample+vocoder (ddsp6): 每块独立 sample, 小 tile 控峰值。"""
         import mlx.core as mx, os
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
@@ -416,7 +330,7 @@ class MlxInferenceEngine:
         return np.concatenate(wav_parts)
 
     def _convert_mel_domain_full_sample(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """全 mel sample + vocoder 0.5s 分块(diffusion/reflow_vae:峰值最优)。"""
+        """全 mel sample + vocoder 0.5s 分块 (diffusion/reflow_vae: 峰值最优)。"""
         import os, mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
@@ -441,7 +355,7 @@ class MlxInferenceEngine:
         return np.concatenate(wav_parts)
 
     def _run_mel_backend_sample(self, units, f0, vol, spk, **kwargs):
-        """调 backend.sample -> mel(由具体 backend 分发)。"""
+        """backend.sample -> mel (按 backend 分发)。"""
         be = self.backend_name
         if be == "diffusion":
             return self.model.sample(units, f0, vol, spk_id=mx.array([spk]),
@@ -464,15 +378,7 @@ class MlxInferenceEngine:
                 infer_step=int(kwargs.get("steps", 10)))
 
     def _convert_rvc(self, input_wav, spk: int, trans: int, **kwargs) -> np.ndarray:
-        """RVC 端到端:feats -> [index/cluster/protect] -> 固定块 infer -> [rms_mix] -> wav。
-
-        高级功能(kwargs):
-          index_path/index_ratio: RVC 特征检索
-          cluster_path/cluster_ratio: so-vits 聚类
-          protect: 清音帧源特征混回(默认 0.5,>=0.5 禁用)
-          rms_mix_rate: 输出 RMS 包络匹配源(默认 0.0=不改)
-          noice_scale: RVC infer 噪声尺度(默认 0.66666,传给 model.infer)
-        """
+        """RVC 端到端: feats -> [index/cluster/protect] -> 固定块 infer -> [rms_mix] -> wav。"""
         import os, mlx.core as mx
         f0_method = kwargs.get("f0_extractor", kwargs.get("f0_method", "rmvpe"))
         units_np, f0_np, rms_np = self._extract_feats_numpy(input_wav, f0_method)
@@ -545,10 +451,7 @@ class MlxInferenceEngine:
         return wav_out
 
     def _enhance_shallow(self, wav_np, units_np, f0_np, rms_np, spk, k_step=100, **kwargs):
-        """浅扩散增强:wav -> mel -> diffusion.sample(gt_spec, k_step<1000) -> vocoder -> wav。
-
-        需加载 diffusion/reflow 增强器(由 _load_enhancer 初始化)。
-        """
+        """浅扩散增强: wav -> mel -> diffusion.sample(gt_spec) -> vocoder -> wav。"""
         import mlx.core as mx
         if not hasattr(self, "enhancer_model"):
             raise ValueError("shallow_diffusion 需先加载增强器(见 _load_enhancer)")
@@ -572,7 +475,7 @@ class MlxInferenceEngine:
         return wav_out
 
     def _load_enhancer(self, enhancer_ckpt, enhancer_type="diffusion"):
-        """加载浅扩散增强器模型(diffusion 或 reflow_shallow)。"""
+        """加载浅扩散增强器 (diffusion / reflow_shallow); 确保 vocoder 已加载。"""
         import mlx.core as mx
         if enhancer_type == "diffusion":
             from ..nn.mlx.backends.diffusion import DiffusionModel
@@ -588,7 +491,7 @@ class MlxInferenceEngine:
             self._ensure_vocoder()
 
     def _ensure_vocoder(self):
-        """惰性加载 NSF-HiFiGAN vocoder(mel-domain / 增强器共用)。"""
+        """惰性加载 NSF-HiFiGAN vocoder (mel-domain / 增强器共用)。"""
         if hasattr(self, "vocoder"):
             return
         from pathlib import Path
@@ -599,7 +502,7 @@ class MlxInferenceEngine:
         self.vocoder.generator.eval()
 
     def _wav_to_mel(self, wav_np):
-        """wav [L] -> mel [T, M](与扩散训练的 mel 配置一致)。"""
+        """wav [L] -> mel [T, M] (与扩散训练的 mel 配置一致)。"""
         from ..nn.mlx.mel import MelExtractor
         from .._common import FeatureConfigLike
         if not hasattr(self, "_mel_ext"):
@@ -612,8 +515,7 @@ class MlxInferenceEngine:
         return np.array(self._mel_ext.extract(wav_np.astype(np.float32)))
 
     def _rvc_upsample_total(self) -> int:
-        """RVC GeneratorNSF 总上采样率(帧->样本)。"""
-        # rvc v2 48k: upsample_rates = [12,10,2,2] -> 480
+        """RVC GeneratorNSF 总上采样率 (帧 -> 样本); rvc v2 48k: [12,10,2,2] -> 480。"""
         opts = self.cfg.backend_opts
         rates = opts.get("upsample_rates", [12, 10, 2, 2])
         n = 1
