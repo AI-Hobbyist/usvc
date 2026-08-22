@@ -51,3 +51,6 @@ AGENTS.md
 data
 # Frontend repo (independent git repo, not tracked here)
 webui/
+
+# density-pass anchor harness: local-only, baselines are deterministically regenerable (seeded record.py)
+tests/anchors/
