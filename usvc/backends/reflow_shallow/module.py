@@ -1,7 +1,7 @@
 """ReflowShallowModule — LightningModule for the reflow_shallow backend (v3).
 
-Mel-conditioned reflow: training condition = degrade(clean_mel) +
-units/f0/vol embeddings; inference condition = sovits/rvc mel.
+Training condition = degrade(clean_mel) + units/f0/vol embeddings; inference
+condition = sovits/rvc mel.
 """
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ __all__ = ["ReflowShallowModule"]
 
 
 class ReflowShallowModule(BaseSVCModule):
-    """LightningModule wrapping ReflowShallowModel (v2)."""
-
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
         opts = cfg.backend_opts
@@ -28,12 +26,10 @@ class ReflowShallowModule(BaseSVCModule):
             n_spk=int(opts.get("num_speaker", opts.get("n_spk", 1))),
             n_hidden=int(opts.get("n_hidden", 256)),
         )
-        # t_start lower bound for training-time sampling.  0.0 = uniform.
-        self.t_start = float(opts.get("t_start", 0.0))
-        # inference t_start for validation sample
-        self.infer_t_start = float(opts.get("infer_t_start", 0.5))
-        # torch.compile velocity_fn（LYNXNet2 纯 conv 可编译）。实测 32→25ms/step (1.27×)。
-        # reflow_shallow 模型小、SM 仅 58% launch-bound，compile 减少发射开销收益明显。
+        self.t_start = float(opts.get("t_start", 0.0))  # training t_start lower bound (0.0 = uniform)
+        self.infer_t_start = float(opts.get("infer_t_start", 0.5))  # validation ODE start
+        # torch.compile velocity_fn（LYNXNet2 纯 conv 可编译）。实测 32→25ms/step (1.27×)；
+        # 模型小、SM 仅 58% launch-bound，compile 减少发射开销收益明显。
         if opts.get("compile_velocity", False):
             try:
                 self.model.reflow_model.velocity_fn = torch.compile(
@@ -48,23 +44,15 @@ class ReflowShallowModule(BaseSVCModule):
         mel = batch.mel  # [B, T, M] clean target
         if mel is None:
             raise RuntimeError("reflow_shallow requires mel in the batch")
-        units = batch.units  # [B, T, D]
-        f0 = batch.f0  # [B, T]
-        rms = batch.rms  # [B, T] or None
-        spk = batch.spk_id  # [B] or None
-        loss, sub = self.model.forward_loss(
-            units, f0, rms, mel, spk_id=spk, t_start=self.t_start,
-            frame_len=batch.frame_len,
-        )
+        loss, sub = self.model.forward_loss(batch.units, batch.f0, batch.rms, mel,
+                                            spk_id=batch.spk_id, t_start=self.t_start,
+                                            frame_len=batch.frame_len)
         return loss, sub
 
     def sample(self, batch):
         """Shallow-diffuse the batch mel (validation)."""
-        mel = batch.mel
-        if mel is None:
+        if batch.mel is None:
             return None
-        return self.model.sample(
-            batch.units, batch.f0, batch.rms, mel,
-            t_start=self.infer_t_start, infer_step=10,
-            spk_id=batch.spk_id,
-        )
+        return self.model.sample(batch.units, batch.f0, batch.rms, batch.mel,
+                                 t_start=self.infer_t_start, infer_step=10,
+                                 spk_id=batch.spk_id)
