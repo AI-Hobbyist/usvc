@@ -1,20 +1,15 @@
-import torch
-import torch.utils.data
-import numpy as np
-import torch.nn.functional as F
-from ._resample import Resample
-
 import os
 
-# Cap torch's LRU audio cache to avoid unbounded memory growth during batch
-# mel extraction (fcpe re-reads wav windows heavily). Module-level on purpose:
-# must be set before the first DataLoader iteration picks it up.
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# Cap torch's LRU audio cache to avoid unbounded memory growth during batch mel
+# extraction (fcpe re-reads wav windows heavily). Must run before first DataLoader use.
 os.environ.setdefault("LRU_CACHE_CAPACITY", "3")
 
-
-# Use librosa directly (core dep). The original try/except fallback to
-# mel_fn_librosa is removed — librosa is always available in usvc.
-from librosa.filters import mel as librosa_mel_fn
+from librosa.filters import mel as librosa_mel_fn  # core dep (original try/except fallback removed)
+from ._resample import Resample
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
@@ -26,475 +21,69 @@ class HannWindow(torch.nn.Module):
         super().__init__()
         self.register_buffer('window', torch.hann_window(win_size), persistent=False)
 
-    def forward(self):
-        return self.window
+    def forward(self): return self.window
 
 
 class MelModule(torch.nn.Module):
-    """Mel extractor
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-    """
-
-    def __init__(self,
-                 sr: [int, float],
-                 n_mels: int,
-                 n_fft: int,
-                 win_size: int,
-                 hop_length: int,
-                 fmin: float = None,
-                 fmax: float = None,
-                 clip_val: float = 1e-5,
-                 out_stft: bool = False,
-                 ):
+    """Mel extractor: nvSTFT center=False manual pad -> magnitude -> librosa mel basis."""
+    def __init__(self, sr, n_mels, n_fft, win_size, hop_length, fmin=None, fmax=None, clip_val=1e-5, out_stft=False):
         super().__init__()
-        if fmin is None:
-            fmin = 0
-        if fmax is None:
-            fmax = sr / 2
-        self.target_sr = sr
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.win_size = win_size
-        self.hop_length = hop_length
-        self.fmin = fmin
-        self.fmax = fmax
-        self.clip_val = clip_val
-        # self.mel_basis = {}
-        self.register_buffer(
-            'mel_basis',
-            torch.tensor(librosa_mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)).float(),
-            persistent=False
-        )
+        self.target_sr, self.n_mels, self.n_fft, self.win_size, self.hop_length = sr, n_mels, n_fft, win_size, hop_length
+        self.fmin, self.fmax, self.clip_val, self.out_stft = 0 if fmin is None else fmin, sr / 2 if fmax is None else fmax, clip_val, out_stft
+        self.register_buffer('mel_basis', torch.tensor(librosa_mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=self.fmin, fmax=self.fmax)).float(), persistent=False)
         self.hann_window = torch.nn.ModuleDict()
-        self.out_stft = out_stft
 
     @torch.no_grad()
-    def __call__(self,
-                 y: torch.Tensor,  # (B, T, 1)
-                 key_shift: [int, float] = 0,
-                 speed: [int, float] = 1,
-                 center: bool = False,
-                 no_cache_window: bool = False
-                 ) -> torch.Tensor:  # (B, T, n_mels)
-        """Get mel spectrogram
-
-        Args:
-            y (torch.Tensor): Input waveform, shape=(B, T, 1).
-            key_shift (int, optional): Key shift. Defaults to 0.
-            speed (int, optional): Variable speed enhancement factor. Defaults to 1.
-            center (bool, optional): center for torch.stft. Defaults to False.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        n_fft = self.n_fft
-        win_size = self.win_size
-        hop_length = self.hop_length
-        clip_val = self.clip_val
-
+    def __call__(self, y, key_shift=0, speed=1, center=False, no_cache_window=False):  # y (B,T,1) -> (B,T,n_mels)
         factor = 2 ** (key_shift / 12)
-        n_fft_new = int(np.round(n_fft * factor))
-        win_size_new = int(np.round(win_size * factor))
-        hop_length_new = int(np.round(hop_length * speed))
-
+        n_fft_new, win_size_new, hop_length_new = int(np.round(self.n_fft * factor)), int(np.round(self.win_size * factor)), int(np.round(self.hop_length * speed))
         y = y.squeeze(-1)
-
-        if torch.min(y) < -1.:
-            pass  # benign float drift past [-1,1]; original print suppressed
-        if torch.max(y) > 1.:
-            pass  # benign float drift past [-1,1]; original print suppressed
-
-        key_shift_key = str(key_shift)
+        key = str(key_shift)
         if not no_cache_window:
-            if key_shift_key in self.hann_window:
-                hann_window = self.hann_window[key_shift_key]
-            else:
-                hann_window = HannWindow(win_size_new).to(self.mel_basis.device)
-                self.hann_window[key_shift_key] = hann_window
-            hann_window_tensor = hann_window()
+            if key not in self.hann_window:
+                self.hann_window[key] = HannWindow(win_size_new).to(self.mel_basis.device)
+            hann_window_tensor = self.hann_window[key]()
         else:
             hann_window_tensor = torch.hann_window(win_size_new).to(self.mel_basis.device)
-
         pad_left = (win_size_new - hop_length_new) // 2
         pad_right = max((win_size_new - hop_length_new + 1) // 2, win_size_new - y.size(-1) - pad_left)
-        if pad_right < y.size(-1):
-            mode = 'reflect'
-        else:
-            mode = 'constant'
-        y = torch.nn.functional.pad(y.unsqueeze(1), (pad_left, pad_right), mode=mode)
-        y = y.squeeze(1)
-
-        spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new,
-                          window=hann_window_tensor,
-                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
+        y = torch.nn.functional.pad(y.unsqueeze(1), (pad_left, pad_right), mode='reflect' if pad_right < y.size(-1) else 'constant').squeeze(1)
+        spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new, window=hann_window_tensor, center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
         spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
         if key_shift != 0:
-            size = n_fft // 2 + 1
-            resize = spec.size(1)
-            if resize < size:
-                spec = F.pad(spec, (0, 0, 0, size - resize))
-            spec = spec[:, :size, :] * win_size / win_size_new
-        if self.out_stft:
-            spec = spec[:, :512, :]
-        else:
-            spec = torch.matmul(self.mel_basis, spec)
-        spec = dynamic_range_compression_torch(spec, clip_val=clip_val)
-        spec = spec.transpose(-1, -2)
-        return spec  # (B, T, n_mels)
+            size = self.n_fft // 2 + 1
+            if spec.size(1) < size: spec = F.pad(spec, (0, 0, 0, size - spec.size(1)))
+            spec = spec[:, :size, :] * self.win_size / win_size_new
+        spec = spec[:, :512, :] if self.out_stft else torch.matmul(self.mel_basis, spec)  # stft-out hard cap 512 (original)
+        return dynamic_range_compression_torch(spec, clip_val=self.clip_val).transpose(-1, -2)
 
 
 class Wav2MelModule(torch.nn.Module):
-    """
-    Wav to mel converter
-    NOTE: This class of code is reserved for training only, please use Wav2MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-        device (str, optional): Device. Defaults to 'cpu'.
-    """
-
-    def __init__(self,
-                 sr: [int, float],
-                 n_mels: int,
-                 n_fft: int,
-                 win_size: int,
-                 hop_length: int,
-                 fmin: float = None,
-                 fmax: float = None,
-                 clip_val: float = 1e-5,
-                 mel_type="default",
-                 ):
+    def __init__(self, sr, n_mels, n_fft, win_size, hop_length, fmin=None, fmax=None, clip_val=1e-5, mel_type="default"):
         super().__init__()
-        # catch None
-        if fmin is None:
-            fmin = 0
-        if fmax is None:
-            fmax = sr / 2
-        # init
-        self.sampling_rate = sr
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.win_size = win_size
-        self.hop_size = hop_length
-        self.fmin = fmin
-        self.fmax = fmax
-        self.clip_val = clip_val
-        # self.device = device
-        self.register_buffer(
-            'tensor_device_marker',
-            torch.tensor(1.0).float(),
-            persistent=False
-        )
+        self.sampling_rate, self.n_mels, self.n_fft, self.win_size, self.hop_size = sr, n_mels, n_fft, win_size, hop_length
+        self.fmin, self.fmax, self.clip_val, self.mel_type = 0 if fmin is None else fmin, sr / 2 if fmax is None else fmax, clip_val, mel_type
+        self.register_buffer('tensor_device_marker', torch.tensor(1.0).float(), persistent=False)
         self.resample_kernel = torch.nn.ModuleDict()
-        if mel_type == "default":
-            self.mel_extractor = MelModule(sr, n_mels, n_fft, win_size, hop_length, fmin, fmax, clip_val,
-                                           out_stft=False)
-        elif mel_type == "stft":
-            self.mel_extractor = MelModule(sr, n_mels, n_fft, win_size, hop_length, fmin, fmax, clip_val,
-                                           out_stft=True)
-        self.mel_type = mel_type
+        self.mel_extractor = MelModule(sr, n_mels, n_fft, win_size, hop_length, self.fmin, self.fmax, clip_val, out_stft=mel_type == "stft")
 
-    def device(self):
-        """Get device"""
-        return self.tensor_device_marker.device
+    def device(self): return self.tensor_device_marker.device
 
     @torch.no_grad()
-    def __call__(self,
-                 audio: torch.Tensor,  # (B, T, 1)
-                 sample_rate: [int, float],
-                 keyshift: [int, float] = 0,
-                 no_cache_window: bool = False
-                 ) -> torch.Tensor:  # (B, T, n_mels)
-        """
-        Get mel spectrogram
-
-        Args:
-            audio (torch.Tensor): Input waveform, shape=(B, T, 1).
-            sample_rate (int): Sampling rate.
-            keyshift (int, optional): Key shift. Defaults to 0.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        # resample
+    def __call__(self, audio, sample_rate, keyshift=0, no_cache_window=False):  # audio (B,T,1) -> mel (B,T,n_mels) @16k grid
         if sample_rate == self.sampling_rate:
             audio_res = audio
         else:
             key_str = str(sample_rate)
             if key_str not in self.resample_kernel:
-                if len(self.resample_kernel) > 8:
-                    self.resample_kernel.clear()
-                self.resample_kernel[key_str] = Resample(
-                    sample_rate,
-                    self.sampling_rate,
-                    lowpass_filter_width=128
-                ).to(self.tensor_device_marker.device)
+                if len(self.resample_kernel) > 8: self.resample_kernel.clear()
+                self.resample_kernel[key_str] = Resample(sample_rate, self.sampling_rate, lowpass_filter_width=128).to(self.tensor_device_marker.device)
             audio_res = self.resample_kernel[key_str](audio.squeeze(-1)).unsqueeze(-1)
-
-        # extract
         mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
-        # n_frames MUST be derived from the *resampled* length (16k domain), not
-        # the original input length: mel is computed on audio_res at hop_size
-        # (160) frames. Using audio.shape[1] for a non-16k input (e.g. 44.1k)
-        # inflates n_frames ~2.76x and the tail gets filled with a constant
-        # repeat of the last mel frame, corrupting the global (non-causal)
-        # attention f0 output. When sample_rate==sampling_rate, audio_res IS
-        # audio so this is equivalent to the old formula.
+        # n_frames MUST come from the *resampled* (16k) length: a 44.1k input would
+        # inflate n_frames ~2.76x and the tail-constant fill corrupts the global
+        # (non-causal) attention f0 output. Equivalent when sample_rate==sampling_rate.
         n_frames = int(audio_res.shape[1] // self.hop_size) + 1
-        if n_frames > int(mel.shape[1]):
-            mel = torch.cat((mel, mel[:, -1:, :]), 1)
-        if n_frames < int(mel.shape[1]):
-            mel = mel[:, :n_frames, :]
-
-        return mel  # (B, T, n_mels)
-
-
-class MelExtractor:
-    """Mel extractor
-    NOTE: This class of code is reserved for training only, please use MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-    """
-
-    def __init__(self,
-                 sr: [int, float],
-                 n_mels: int,
-                 n_fft: int,
-                 win_size: int,
-                 hop_length: int,
-                 fmin: float = None,
-                 fmax: float = None,
-                 clip_val: float = 1e-5,
-                 out_stft: bool = False,
-                 ):
-        if fmin is None:
-            fmin = 0
-        if fmax is None:
-            fmax = sr / 2
-        self.target_sr = sr
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.win_size = win_size
-        self.hop_length = hop_length
-        self.fmin = fmin
-        self.fmax = fmax
-        self.clip_val = clip_val
-        self.mel_basis = {}
-        self.hann_window = {}
-        self.out_stft = out_stft
-
-    @torch.no_grad()
-    def __call__(self,
-                 y: torch.Tensor,  # (B, T, 1)
-                 key_shift: [int, float] = 0,
-                 speed: [int, float] = 1,
-                 center: bool = False,
-                 no_cache_window: bool = False
-                 ) -> torch.Tensor:  # (B, T, n_mels)
-        """Get mel spectrogram
-
-        Args:
-            y (torch.Tensor): Input waveform, shape=(B, T, 1).
-            key_shift (int, optional): Key shift. Defaults to 0.
-            speed (int, optional): Variable speed enhancement factor. Defaults to 1.
-            center (bool, optional): center for torch.stft. Defaults to False.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        sampling_rate = self.target_sr
-        n_mels = self.n_mels
-        n_fft = self.n_fft
-        win_size = self.win_size
-        hop_length = self.hop_length
-        fmin = self.fmin
-        fmax = self.fmax
-        clip_val = self.clip_val
-
-        factor = 2 ** (key_shift / 12)
-        n_fft_new = int(np.round(n_fft * factor))
-        win_size_new = int(np.round(win_size * factor))
-        hop_length_new = int(np.round(hop_length * speed))
-        if not no_cache_window:
-            mel_basis = self.mel_basis
-            hann_window = self.hann_window
-        else:
-            mel_basis = {}
-            hann_window = {}
-
-        y = y.squeeze(-1)
-
-        if torch.min(y) < -1.:
-            print('min value is ', torch.min(y))
-        if torch.max(y) > 1.:
-            print('max value is ', torch.max(y))
-
-        mel_basis_key = str(fmax) + '_' + str(y.device)
-        if (mel_basis_key not in mel_basis) and (not self.out_stft):
-            mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
-            mel_basis[mel_basis_key] = torch.from_numpy(mel).float().to(y.device)
-
-        key_shift_key = str(key_shift) + '_' + str(y.device)
-        if key_shift_key not in hann_window:
-            hann_window[key_shift_key] = torch.hann_window(win_size_new).to(y.device)
-
-        pad_left = (win_size_new - hop_length_new) // 2
-        pad_right = max((win_size_new - hop_length_new + 1) // 2, win_size_new - y.size(-1) - pad_left)
-        if pad_right < y.size(-1):
-            mode = 'reflect'
-        else:
-            mode = 'constant'
-        y = torch.nn.functional.pad(y.unsqueeze(1), (pad_left, pad_right), mode=mode)
-        y = y.squeeze(1)
-
-        spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new,
-                          window=hann_window[key_shift_key],
-                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
-        spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
-        if key_shift != 0:
-            size = n_fft // 2 + 1
-            resize = spec.size(1)
-            if resize < size:
-                spec = F.pad(spec, (0, 0, 0, size - resize))
-            spec = spec[:, :size, :] * win_size / win_size_new
-        if self.out_stft:
-            spec = spec[:, :512, :]
-        else:
-            spec = torch.matmul(mel_basis[mel_basis_key], spec)
-        spec = dynamic_range_compression_torch(spec, clip_val=clip_val)
-        spec = spec.transpose(-1, -2)
-        return spec  # (B, T, n_mels)
-
-
-# init nv_mel_extractor cache
-# will remove this when we have a better solution
-# mel_extractor = MelExtractor(16000, 128, 1024, 1024, 160, 0, 8000)
-
-
-class Wav2Mel:
-    """
-    Wav to mel converter
-    NOTE: This class of code is reserved for training only, please use Wav2MelModule for inference
-
-    Args:
-        sr (int): Sampling rate. Defaults to 16000.
-        n_mels (int): Number of mel bins. Defaults to 128.
-        n_fft (int): FFT size. Defaults to 1024.
-        win_size (int): Window size. Defaults to 1024.
-        hop_length (int): Hop length. Defaults to 160.
-        fmin (float, optional): Minimum frequency. Defaults to 0.
-        fmax (float, optional): Maximum frequency. Defaults to sr/2.
-        clip_val (float, optional): Clipping value. Defaults to 1e-5.
-        device (str, optional): Device. Defaults to 'cpu'.
-    """
-
-    def __init__(self,
-                 sr: [int, float],
-                 n_mels: int,
-                 n_fft: int,
-                 win_size: int,
-                 hop_length: int,
-                 fmin: float = None,
-                 fmax: float = None,
-                 clip_val: float = 1e-5,
-                 device='cpu',
-                 mel_type="default",
-                 ):
-        # catch None
-        if fmin is None:
-            fmin = 0
-        if fmax is None:
-            fmax = sr / 2
-        # init
-        self.sampling_rate = sr
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.win_size = win_size
-        self.hop_size = hop_length
-        self.fmin = fmin
-        self.fmax = fmax
-        self.clip_val = clip_val
-        self.device = device
-        self.resample_kernel = {}
-        if mel_type == "default":
-            self.mel_extractor = MelExtractor(sr, n_mels, n_fft, win_size, hop_length, fmin, fmax, clip_val,
-                                              out_stft=False)
-        elif mel_type == "stft":
-            self.mel_extractor = MelExtractor(sr, n_mels, n_fft, win_size, hop_length, fmin, fmax, clip_val,
-                                              out_stft=True)
-        self.mel_type = mel_type
-
-    def device(self):
-        """Get device"""
-        return self.device
-
-    @torch.no_grad()
-    def __call__(self,
-                 audio: torch.Tensor,  # (B, T, 1)
-                 sample_rate: [int, float],
-                 keyshift: [int, float] = 0,
-                 no_cache_window: bool = False
-                 ) -> torch.Tensor:  # (B, T, n_mels)
-        """
-        Get mel spectrogram
-
-        Args:
-            audio (torch.Tensor): Input waveform, shape=(B, T, 1).
-            sample_rate (int): Sampling rate.
-            keyshift (int, optional): Key shift. Defaults to 0.
-            no_cache_window (bool, optional): If True will clear cache. Defaults to False.
-        return:
-            spec (torch.Tensor): Mel spectrogram, shape=(B, T, n_mels).
-        """
-
-        # resample
-        if sample_rate == self.sampling_rate:
-            audio_res = audio
-        else:
-            key_str = str(sample_rate)
-            if key_str not in self.resample_kernel:
-                self.resample_kernel[key_str] = Resample(
-                    sample_rate,
-                    self.sampling_rate,
-                    lowpass_filter_width=128
-                ).to(self.device)
-            audio_res = self.resample_kernel[key_str](audio.squeeze(-1)).unsqueeze(-1)
-
-        # extract
-        mel = self.mel_extractor(audio_res, keyshift, no_cache_window=no_cache_window)
-        # See Wav2MelModule: derive n_frames from the resampled (16k) length.
-        n_frames = int(audio_res.shape[1] // self.hop_size) + 1
-        if n_frames > int(mel.shape[1]):
-            mel = torch.cat((mel, mel[:, -1:, :]), 1)
-        if n_frames < int(mel.shape[1]):
-            mel = mel[:, :n_frames, :]
-
-        return mel  # (B, T, n_mels)
-
+        if n_frames > int(mel.shape[1]): mel = torch.cat((mel, mel[:, -1:, :]), 1)
+        if n_frames < int(mel.shape[1]): mel = mel[:, :n_frames, :]
+        return mel

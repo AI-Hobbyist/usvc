@@ -1,89 +1,48 @@
-import sys
 import numpy as np
 import librosa
 import torch
-from functools import reduce
 from .constants import *
-from torch.nn.modules.module import _addindent
-
 
 
 def to_local_average_cents(salience, center=None, thred=0.03):
-    """
-    find the weighted average cents near the argmax bin
-    """
-
-    if not hasattr(to_local_average_cents, 'cents_mapping'):
-        # the bin number-to-cents mapping
-        to_local_average_cents.cents_mapping = (
-                20 * np.arange(N_CLASS) + CONST)
-
-    if salience.ndim == 1:
-        if center is None:
-            center = int(np.argmax(salience))
-        start = max(0, center - 4)
-        end = min(len(salience), center + 5)
-        salience = salience[start:end]
-        product_sum = np.sum(
-            salience * to_local_average_cents.cents_mapping[start:end])
-        weight_sum = np.sum(salience)
-        return product_sum / weight_sum if np.max(salience) > thred else 0
+    if not hasattr(to_local_average_cents, 'cents_mapping'):  # bin-number -> cents mapping (function-attr cache)
+        to_local_average_cents.cents_mapping = 20 * np.arange(N_CLASS) + CONST
     if salience.ndim == 2:
-        return np.array([to_local_average_cents(salience[i, :], None, thred) for i in
-                         range(salience.shape[0])])
+        return np.array([to_local_average_cents(salience[i], None, thred) for i in range(salience.shape[0])])
+    if center is None: center = int(np.argmax(salience))
+    start, end = max(0, center - 4), min(len(salience), center + 5)
+    salience = salience[start:end]
+    return np.sum(salience * to_local_average_cents.cents_mapping[start:end]) / np.sum(salience) if np.max(salience) > thred else 0
 
-    raise Exception("label should be either 1d or 2d ndarray")
-    
+
 def to_viterbi_cents(salience, thred=0.03):
-    # Create viterbi transition matrix
-    if not hasattr(to_viterbi_cents, 'transition'):
+    if not hasattr(to_viterbi_cents, 'transition'):  # viterbi transition matrix (function-attr cache)
         xx, yy = np.meshgrid(range(N_CLASS), range(N_CLASS))
         transition = np.maximum(30 - abs(xx - yy), 0)
-        transition = transition / transition.sum(axis=1, keepdims=True)
-        to_viterbi_cents.transition = transition
-
-    # Convert to probability
-    prob = salience.T
-    prob = prob / prob.sum(axis=0)    
-
-    # Perform viterbi decoding
+        to_viterbi_cents.transition = transition / transition.sum(axis=1, keepdims=True)
+    prob = salience.T / salience.T.sum(axis=0)
     path = librosa.sequence.viterbi(prob, to_viterbi_cents.transition).astype(np.int64)
+    return np.array([to_local_average_cents(salience[i], path[i], thred) for i in range(len(path))])
 
-    return np.array([to_local_average_cents(salience[i, :], path[i], thred) for i in
-                     range(len(path))])
 
 def to_local_average_f0(hidden, center=None, thred=0.03):
-    idx = torch.arange(N_CLASS, device=hidden.device)[None, None, :]  # [B=1, T=1, N]
-    idx_cents = idx * 20 + CONST  # [B=1, N]
-    if center is None:
-        center = torch.argmax(hidden, dim=2, keepdim=True)  # [B, T, 1]
-    start = torch.clip(center - 4, min=0)  # [B, T, 1]
-    end = torch.clip(center + 5, max=N_CLASS)  # [B, T, 1]
-    idx_mask = (idx >= start) & (idx < end)  # [B, T, N]
-    weights = hidden * idx_mask  # [B, T, N]
-    product_sum = torch.sum(weights * idx_cents, dim=2)  # [B, T]
-    weight_sum = torch.sum(weights, dim=2)  # [B, T]
-    cents = product_sum / (weight_sum + (weight_sum == 0))  # avoid dividing by zero, [B, T]
-    f0 = 10 * 2 ** (cents / 1200)
-    uv = hidden.max(dim=2)[0] < thred  # [B, T]
-    f0 = f0 * ~uv
-    return f0.squeeze(0).cpu().numpy()
+    # weighted average of the 9 cents bins around the argmax (idx*20+CONST)
+    idx_cents = torch.arange(N_CLASS, device=hidden.device)[None, None, :] * 20 + CONST
+    if center is None: center = torch.argmax(hidden, dim=2, keepdim=True)
+    idx = torch.arange(N_CLASS, device=hidden.device)[None, None, :]
+    idx_mask = (idx >= torch.clip(center - 4, min=0)) & (idx < torch.clip(center + 5, max=N_CLASS))
+    w = hidden * idx_mask
+    product_sum, weight_sum = torch.sum(w * idx_cents, dim=2), torch.sum(w, dim=2)
+    f0 = 10 * 2 ** (product_sum / (weight_sum + (weight_sum == 0)) / 1200)  # /0 guarded, then uv-masked
+    return (f0 * (hidden.max(dim=2)[0] >= thred)).squeeze(0).cpu().numpy()
+
 
 def to_viterbi_f0(hidden, thred=0.03):
-    # Create viterbi transition matrix
     if not hasattr(to_viterbi_cents, 'transition'):
         xx, yy = np.meshgrid(range(N_CLASS), range(N_CLASS))
         transition = np.maximum(30 - abs(xx - yy), 0)
-        transition = transition / transition.sum(axis=1, keepdims=True)
-        to_viterbi_cents.transition = transition
-    
-    # Convert to probability
-    prob = hidden.squeeze(0).cpu().numpy()
-    prob = prob.T
-    prob = prob / prob.sum(axis=0) 
-    
-    # Perform viterbi decoding
+        to_viterbi_cents.transition = transition / transition.sum(axis=1, keepdims=True)
+    prob = hidden.squeeze(0).cpu().numpy().T
+    prob = prob / prob.sum(axis=0)
     path = librosa.sequence.viterbi(prob, to_viterbi_cents.transition).astype(np.int64)
-    center = torch.from_numpy(path).unsqueeze(0).unsqueeze(-1).to(hidden.device)
-    
-    return to_local_average_f0(hidden, center=center, thred=thred)
+    return to_local_average_f0(hidden, torch.from_numpy(path).unsqueeze(0).unsqueeze(-1).to(hidden.device), thred)
