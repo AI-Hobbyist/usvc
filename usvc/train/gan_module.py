@@ -52,26 +52,15 @@ class BaseGANModule(LightningModule):
         # (matches so-vits-svc/RVC original loops: net_g once, net_d twice).
         out = self.forward_generator(batch)
 
-        # --- Discriminator step (D fwd#1 on detached wave_gen) ---
+        # --- D fwd#1 on detached wave_gen ---
         loss_d, sub_d = self.discriminator_loss(batch, out)
-        opt_d.zero_grad()
-        self.manual_backward(loss_d)
-        if self.cfg.grad_clip is not None:
-            # Lightning's clip_gradients is incompatible with AMP + fused
-            # optimizers (plugin unscales internally); use torch-native clip.
-            for group in opt_d.param_groups:
-                torch.nn.utils.clip_grad_norm_(group["params"], self.cfg.grad_clip)
+        opt_d.zero_grad(); self.manual_backward(loss_d)
+        self._clip(opt_d)  # torch-native clip: lightning AMP-unscale incompatible with fused AdamW
         opt_d.step()
-
-        # --- Generator step (D fwd#2 on wave_gen with grad, reuses `out`) ---
-        # NOTE: must run AFTER opt_d.step() (autograd version check).
+        # --- G loss's D fwd#2 (wave_gen with grad, reuses `out`); MUST be after opt_d.step() ---
         loss_g, sub_g = self.generator_loss(batch, out)
-        opt_g.zero_grad()
-        self.manual_backward(loss_g)
-        if self.cfg.grad_clip is not None:
-            for group in opt_g.param_groups:
-                torch.nn.utils.clip_grad_norm_(group["params"], self.cfg.grad_clip)
-        opt_g.step()
+        opt_g.zero_grad(); self.manual_backward(loss_g)
+        self._clip(opt_g); opt_g.step()
 
         bs = self._bs(batch)
         self.log("train/loss_g", loss_g, prog_bar=True, batch_size=bs)
@@ -79,40 +68,25 @@ class BaseGANModule(LightningModule):
         for name, val in {**sub_g, **sub_d}.items():
             self.log(f"train/{name}", val, batch_size=bs)
 
-    def validation_step(self, batch: SVCBatch, batch_idx: int):
-        if not self.trainer.is_global_zero:
-            return
-        # GAN backends override this for wav-based validation
-        pass
+    def _clip(self, opt):
+        if self.cfg.grad_clip is not None:
+            for group in opt.param_groups:
+                torch.nn.utils.clip_grad_norm_(group["params"], self.cfg.grad_clip)
+
+    def validation_step(self, batch, batch_idx):
+        pass  # GAN backends override for wav-based validation
 
     def configure_optimizers(self):
         from .optimizer import build_optimizer_gan
-
         (opt_g, opt_d), scheds = build_optimizer_gan(
-            self.generator.parameters(),
-            self.discriminator.parameters(),
-            self.cfg.optimizer,
-            self.cfg.schedule,
-            self.cfg.max_steps,
-        )
-        if scheds:
-            return [opt_g, opt_d], scheds
-        return [opt_g, opt_d]
+            self.generator.parameters(), self.discriminator.parameters(),
+            self.cfg.optimizer, self.cfg.schedule, self.cfg.max_steps)
+        return [opt_g, opt_d] if not scheds else ([opt_g, opt_d], scheds)
 
-    # ---- Subclass hooks ----
-
-    def forward_generator(self, batch: SVCBatch):
-        raise NotImplementedError
-
-    def generator_loss(self, batch: SVCBatch, out=None) -> tuple[torch.Tensor, dict[str, float]]:
-        raise NotImplementedError
-
-    def discriminator_loss(self, batch: SVCBatch, out=None) -> tuple[torch.Tensor, dict[str, float]]:
-        raise NotImplementedError
-
-    def sample(self, batch: SVCBatch):
-        raise NotImplementedError
+    def forward_generator(self, batch): raise NotImplementedError
+    def generator_loss(self, batch, out=None): raise NotImplementedError
+    def discriminator_loss(self, batch, out=None): raise NotImplementedError
+    def sample(self, batch): raise NotImplementedError
 
     @staticmethod
-    def _bs(batch: SVCBatch) -> int:
-        return batch.units.shape[0]
+    def _bs(batch): return batch.units.shape[0]

@@ -1,38 +1,15 @@
-"""ScheduleFree optimizer mode-switching callback.
-
-AdamWScheduleFree requires train()/eval() calls to switch between
-full-param (train) and averaged-param (eval) modes. This callback
-handles the switching automatically.
-"""
-from __future__ import annotations
-
+"""ScheduleFree optimizer train/eval mode switching (AdamWScheduleFree needs full-param train() / averaged-param eval())."""
 import lightning.pytorch as pl
 
 
 class ScheduleFreeModeCallback(pl.Callback):
-    """Switch ScheduleFree optimizer between train/eval modes."""
-
-    def on_train_epoch_start(self, trainer, pl_module):
+    def _sf(self, trainer, pl_module, mode):
         opt = pl_module.optimizers()
-        if hasattr(opt, "train"):
-            opt.train()
+        if hasattr(opt, mode):
+            getattr(opt, mode)()
 
-    def on_validation_start(self, trainer, pl_module):
-        opt = pl_module.optimizers()
-        if hasattr(opt, "eval"):
-            opt.eval()
-
-    def on_validation_end(self, trainer, pl_module):
-        opt = pl_module.optimizers()
-        if hasattr(opt, "train"):
-            opt.train()
-
-    def on_test_start(self, trainer, pl_module):
-        opt = pl_module.optimizers()
-        if hasattr(opt, "eval"):
-            opt.eval()
-
-    def on_test_end(self, trainer, pl_module):
-        opt = pl_module.optimizers()
-        if hasattr(opt, "train"):
-            opt.train()
+    def on_train_epoch_start(self, trainer, pl_module): self._sf(trainer, pl_module, "train")
+    def on_validation_start(self, trainer, pl_module): self._sf(trainer, pl_module, "eval")
+    def on_validation_end(self, trainer, pl_module): self._sf(trainer, pl_module, "train")
+    def on_test_start(self, trainer, pl_module): self._sf(trainer, pl_module, "eval")
+    def on_test_end(self, trainer, pl_module): self._sf(trainer, pl_module, "train")
