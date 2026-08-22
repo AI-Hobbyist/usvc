@@ -1,27 +1,10 @@
-"""MLX 版 ddsp6 backend(mel-domain Rectified Flow + DDSP)。
+"""MLX 版 ddsp6 backend(mel-domain Rectified Flow + DDSP),镜像 backends/ddsp6/model.py。
 
-镜像 ``usvc/backends/ddsp6/model.py`` 的推理最小集:
-  - LYNXNet2 / LYNXNet:reflow velocity network(6.3 / 6.1-6.2)
-  - RectifiedFlow:sample_euler / sample_rk4 ODE 采样
-  - Unit2Control:units/f0/volume → DDSP 频谱 filter 参数
-  - CombSubSuperFast:DDSP 频谱路径(harmonic+noise 激励经复 STFT 滤波 → ISTFT)
-  - ConformerNaiveEncoder:Unit2Control 条件 encoder(6.3 linear blocks,SDPA)
-  - DDSP6Model:sample(units, f0, volume) → [B, T, out_dims] mel
-
-与 torch 版的差异(见 MLX 映射手册 / MLX_PITFALLS.md):
-  - MLX Conv1d 输入 NLC [B, T, C],torch 是 NCL —— 权重加载时由 _convert
-    转置 (O,C,K)→(O,K,C),forward 里不再需要 Transpose 层(用 no-op 占位
-    保持 state_dict 键位对齐)
-  - ``nn.ModuleList`` → 普通 list
-  - ``nn.GELU`` 用类(approx='none'),函数版 ``nn.gelu`` 不接受 approx
-  - ``torch.fmod(x, 1.0)`` → ``x - mx.trunc(x)``(% 是 floor-mod,负数语义不同)
-  - ``torch.sinc`` → ``mx.where(x==0, 1, sin(pi*x)/(pi*x))``
-  - ``torch.stft/istft(center=True, return_complex)`` → 本模块手写
-    ``_stft_center_complex`` / ``_istft_center_complex``(mx.fft.rfft/irfft,
-    帧网格 + window envelop 归一化逐位对齐 torch)
-  - weight_norm(Unit2Control stack/stack2/dense_out)在 from_ckpt 时由
-    ``_convert.load_torch_ckpt_to_mlx`` 合并,运行时是普通 Conv/Linear
-  - PReLU 用 ``nn.PReLU(num_parameters=inner)``
+与 torch 版差异(MLX 映射手册):输入 NLC(conv 权重加载时由 _convert 转置,
+forward 不需要 Transpose 层 —— 保留 _Noop 占位对齐 ckpt 键位);nn.ModuleList→list;
+torch.fmod(x,1)→x-mx.trunc(x)(% 是 floor-mod,负数语义不同);torch.sinc→
+mx.where(x==0,1,sin(pi x)/(pi x));center=True stft/istft 手写(_ops.*,帧网格+
+window envelop 归一化逐位对齐 torch);weight_norm(Unit2Control)在 from_ckpt 合并。
 """
 from __future__ import annotations
 
@@ -43,26 +26,11 @@ from .._ops import (
     istft_center_complex as _istft_center_complex,
 )
 
-__all__ = [
-    "SwiGLU",
-    "SinusoidalPosEmb",
-    "LYNXNet2",
-    "LYNXNet",
-    "ConformerNaiveEncoder",
-    "Unit2Control",
-    "CombSubSuperFast",
-    "RectifiedFlow",
-    "DDSP6Model",
-]
+__all__ = ["SwiGLU", "SinusoidalPosEmb", "LYNXNet2", "LYNXNet", "ConformerNaiveEncoder",
+           "Unit2Control", "CombSubSuperFast", "RectifiedFlow", "DDSP6Model"]
 
-
-# ---------------------------------------------------------------------------
-# 基础算子
-# ---------------------------------------------------------------------------
 
 class SwiGLU(nn.Module):
-    """SwiGLU:out, gate = split(x, 2, -1);out * silu(gate)。"""
-
     def __call__(self, x):
         out, gate = mx.split(x, 2, axis=-1)
         return out * nn.silu(gate)
@@ -73,119 +41,89 @@ class SinusoidalPosEmb(nn.Module):
         super().__init__()
         self.dim = dim
 
-    def __call__(self, x):
-        # x: [B] -> [B, dim] (float32 计算,与 torch 一致)
+    def __call__(self, x):  # [B] -> [B, dim],fp32 与 torch 一致
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        freqs = mx.exp(mx.arange(half_dim) * -emb)  # [half_dim]
+        freqs = mx.exp(mx.arange(half_dim) * -(math.log(10000) / (half_dim - 1)))
         emb = x[:, None].astype(mx.float32) * freqs[None, :]
         return mx.concatenate([mx.sin(emb), mx.cos(emb)], axis=-1)
 
 
-
 class _Seq(list):
-    """可调用的普通 list(替代 mlx nn.Sequential)。
-
-    MLX ``nn.Sequential`` 把子模块注册在 ``.layers`` 下,state_dict 键变成
-    ``net.layers.0.weight``,与 torch ckpt 的 ``net.0.weight`` 错位。用普通
-    list(MLX nn.Module 自动按索引注册子模块)保持键位一致。
-    """
+    """普通 list 替代 nn.Sequential:后者把子模块注册到 .layers 下,state_dict
+    键 net.layers.0 与 torch ckpt 的 net.0 错位;list 按索引注册保持键位一致。"""
 
     def __init__(self, *items):
         super().__init__(items)
 
     def __call__(self, x):
-        for m in self:
-            x = m(x)
+        for m in self: x = m(x)
         return x
 
 
 class _Noop(nn.Module):
-    """占位模块:对应 torch 的 Transpose((1,2))。
-
-    MLX Conv1d 是 NLC,无需转置;但 torch 的 nn.Sequential 里 Transpose
-    占用了 net.1 / net.3 等索引,去掉会让 state_dict 键位错位,from_ckpt
-    无法直接 load。保留为 no-op 以对齐键位。
-    """
+    """占位 torch Transpose((1,2)):NLC 布局无需转置,但保留索引以对齐 ckpt 键位。"""
 
     def __call__(self, x):
         return x
 
 
-# ---------------------------------------------------------------------------
-# LYNXNet2 (reflow/lynxnet2.py, DDSP-SVC-6.3 velocity network)
-# ---------------------------------------------------------------------------
+def _glu_net(dim, inner, k, drop, conv=False, act=None, in_norm=True):
+    """depthwise-gated 块:conv=False=6.3 双 SwiGLU 版,True=6.1/6.2 PReLU 版;
+    _Noop 即 torch Transpose 占位,位置与 torch Sequential 逐位一致。"""
+    nop = _Noop
+    if conv:
+        net = [nn.LayerNorm(dim) if in_norm else nn.Identity(), nop(),
+               nn.Conv1d(dim, inner * 2, 1), SwiGLU(),
+               nn.Conv1d(inner, inner, k, padding=k // 2, groups=inner),
+               act, nn.Conv1d(inner, dim, 1), nop(), nn.Dropout(drop)]
+    else:
+        net = [nn.LayerNorm(dim) if in_norm else nn.Identity(), nop(),
+               nn.Conv1d(dim, dim, k, padding=k // 2, groups=dim), nop(),
+               nn.Linear(dim, inner * 2), SwiGLU(),
+               nn.Linear(inner, inner * 2), SwiGLU(),
+               nn.Linear(inner, dim), nn.Dropout(drop)]
+    return _Seq(*net)
+
 
 class LYNXNet2Block(nn.Module):
     def __init__(self, dim: int, expansion_factor: float, kernel_size: int = 31, dropout: float = 0.0):
         super().__init__()
-        inner_dim = int(dim * expansion_factor)
-        self.net = _Seq(
-            nn.LayerNorm(dim),
-            _Noop(),  # torch Transpose((1,2))
-            nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim),
-            _Noop(),  # torch Transpose((1,2))
-            nn.Linear(dim, inner_dim * 2),
-            SwiGLU(),
-            nn.Linear(inner_dim, inner_dim * 2),
-            SwiGLU(),
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout),
-        )
+        self.net = _glu_net(dim, int(dim * expansion_factor), kernel_size, dropout, in_norm=True)
 
-    def __call__(self, x):
-        return x + self.net(x)
+    def __call__(self, x): return x + self.net(x)
 
 
 class LYNXNet2(nn.Module):
-    """LYNXNet2(Linear Gated Depthwise Separable Convolution Network V2,6.3)。
-
-    forward(spec [B,1,M,T] 或 [B,M,T], diffusion_step [B], cond [B,M,T])
-    → [B,1,M,T] 或 [B,M,T](use_4_dim 保持输入维度)。
-    """
+    """lynxnet2.py 6.3 velocity network: spec [B,1,M,T]/[B,M,T], step [B], cond [B,M,T]。"""
 
     def __init__(self, in_dims: int, dim_cond: int, n_layers: int = 6,
                  n_chans: int = 512, n_dilates: int = 1, dropout: float = 0.0):
         super().__init__()
         self.input_projection = nn.Linear(in_dims, n_chans)
         self.conditioner_projection = nn.Linear(dim_cond, n_chans)
-        self.diffusion_embedding = _Seq(
-            SinusoidalPosEmb(n_chans),
-            nn.Linear(n_chans, n_chans * 4),
-            nn.GELU(),
-            nn.Linear(n_chans * 4, n_chans),
-        )
+        self.diffusion_embedding = _Seq(SinusoidalPosEmb(n_chans), nn.Linear(n_chans, n_chans * 4),
+                              nn.GELU(), nn.Linear(n_chans * 4, n_chans))
         self.residual_layers = [
             LYNXNet2Block(n_chans, n_dilates, kernel_size=31, dropout=dropout)
             for _ in range(n_layers)
         ]
         self.norm = nn.LayerNorm(n_chans)
         self.output_projection = nn.Linear(n_chans, in_dims)
-        # torch nn.init.zeros_(output_projection.weight)
-        self.output_projection.weight = mx.zeros_like(self.output_projection.weight)
+        self.output_projection.weight = mx.zeros_like(self.output_projection.weight)  # torch nn.init.zeros_
 
     def __call__(self, spec, diffusion_step, cond):
-        x = spec
-        use_4_dim = False
-        if x.ndim == 4:
-            x = x[:, 0]  # [B, 1, M, T] -> [B, M, T]
-            use_4_dim = True
-        x = self.input_projection(x.transpose(0, 2, 1))  # [B, T, M] -> [B, T, n_chans]
-        x = x + self.conditioner_projection(cond.transpose(0, 2, 1))  # [B, T, dim_cond]
-        # diffusion_step [B] (或 [B,1]) -> [B, 1, n_chans]
+        t4 = spec.ndim == 4
+        x = spec[:, 0] if t4 else spec  # [B,1,M,T] -> [B,M,T]
+        x = self.input_projection(x.transpose(0, 2, 1)) + \
+            self.conditioner_projection(cond.transpose(0, 2, 1))
         if diffusion_step.ndim == 2:
             diffusion_step = diffusion_step.reshape(-1)
         x = x + self.diffusion_embedding(diffusion_step)[:, None, :]
         for layer in self.residual_layers:
             x = layer(x)
-        x = self.norm(x)
-        x = self.output_projection(x).transpose(0, 2, 1)  # [B, T, in_dims] -> [B, in_dims, T]
-        return x[:, None] if use_4_dim else x
+        x = self.output_projection(self.norm(x)).transpose(0, 2, 1)  # [B,in_dims,T]
+        return x[:, None] if t4 else x
 
-
-# ---------------------------------------------------------------------------
-# LYNXNet (reflow/lynxnet.py, DDSP-SVC-6.1/6.2 velocity network)
-# ---------------------------------------------------------------------------
 
 class LYNXConvModule(nn.Module):
     @staticmethod
@@ -205,21 +143,9 @@ class LYNXConvModule(nn.Module):
             act = nn.ReLU()
         else:
             raise ValueError(f"{activation} is not a valid activation")
-        padding = self.calc_same_padding(kernel_size)
-        self.net = _Seq(
-            nn.LayerNorm(dim),
-            _Noop(),  # torch Transpose((1,2))
-            nn.Conv1d(dim, inner_dim * 2, 1),
-            SwiGLU(),
-            nn.Conv1d(inner_dim, inner_dim, kernel_size, padding=padding[0], groups=inner_dim),
-            act,
-            nn.Conv1d(inner_dim, dim, 1),
-            _Noop(),  # torch Transpose((1,2))
-            nn.Dropout(dropout),
-        )
+        self.net = _glu_net(dim, inner_dim, kernel_size, dropout, conv=True, act=act)
 
-    def __call__(self, x):
-        return self.net(x)
+    def __call__(self, x): return self.net(x)
 
 
 class LYNXNetResidualLayer(nn.Module):
@@ -234,28 +160,21 @@ class LYNXNetResidualLayer(nn.Module):
             in_norm=in_norm, activation=activation, dropout=dropout,
         )
 
-    def __call__(self, x, conditioner, diffusion_step):
-        # x / conditioner: NLC [B, T, dim];diffusion_step: [B, 1, dim]
-        res_x = x
-        x = x + self.diffusion_projection(diffusion_step) + self.conditioner_projection(conditioner)
-        x = self.convmodule(x)
-        return x + res_x
+    def __call__(self, x, conditioner, diffusion_step):  # x/cond NLC;step [B,1,dim]
+        return self.convmodule(x + self.diffusion_projection(diffusion_step)
+                               + self.conditioner_projection(conditioner)) + x
 
 
 class LYNXNet(nn.Module):
-    """LYNXNet(Linear Gated Depthwise Separable Convolution Network,6.1/6.2)。"""
+    """lynxnet.py 6.1/6.2 velocity network。"""
 
     def __init__(self, in_dims: int, dim_cond: int, n_feats: int = 1, n_layers: int = 6,
                  n_chans: int = 512, n_dilates: int = 2, in_norm: bool = False,
                  activation: str = "PReLU", dropout: float = 0.0):
         super().__init__()
         self.input_projection = nn.Conv1d(in_dims * n_feats, n_chans, 1)
-        self.diffusion_embedding = _Seq(
-            SinusoidalPosEmb(n_chans),
-            nn.Linear(n_chans, n_chans * 4),
-            nn.GELU(),
-            nn.Linear(n_chans * 4, n_chans),
-        )
+        self.diffusion_embedding = _Seq(SinusoidalPosEmb(n_chans), nn.Linear(n_chans, n_chans * 4),
+                              nn.GELU(), nn.Linear(n_chans * 4, n_chans))
         self.residual_layers = [
             LYNXNetResidualLayer(
                 dim_cond=dim_cond, dim=n_chans, expansion_factor=n_dilates,
@@ -268,27 +187,18 @@ class LYNXNet(nn.Module):
         self.output_projection.weight = mx.zeros_like(self.output_projection.weight)
 
     def __call__(self, spec, diffusion_step, cond):
-        x = spec
-        use_4_dim = False
-        if x.ndim == 4:
-            x = x[:, 0]
-            use_4_dim = True
-        # NCL -> NLC(torch 的 input_projection 吃 NCL,mlx 吃 NLC)
-        x = nn.gelu(self.input_projection(x.transpose(0, 2, 1)))  # [B, T, n_chans]
+        t4 = spec.ndim == 4
+        x = spec[:, 0] if t4 else spec
+        x = nn.gelu(self.input_projection(x.transpose(0, 2, 1)))  # NCL -> NLC
         if diffusion_step.ndim == 2:
             diffusion_step = diffusion_step.reshape(-1)
-        step = self.diffusion_embedding(diffusion_step)[:, None, :]  # [B, 1, n_chans]
-        cond_t = cond.transpose(0, 2, 1)  # [B, T, dim_cond]
+        step = self.diffusion_embedding(diffusion_step)[:, None, :]  # [B,1,n_chans]
+        cond_t = cond.transpose(0, 2, 1)
         for layer in self.residual_layers:
             x = layer(x, cond_t, step)
-        x = self.norm(x)
-        x = self.output_projection(x).transpose(0, 2, 1)  # [B, in_dims, T]
-        return x[:, None] if use_4_dim else x
+        x = self.output_projection(self.norm(x)).transpose(0, 2, 1)
+        return x[:, None] if t4 else x
 
-
-# ---------------------------------------------------------------------------
-# ConformerNaiveEncoder (ddsp/model_conformer_naive.py;6.3 linear blocks)
-# ---------------------------------------------------------------------------
 
 class ConformerConvModule(nn.Module):
     def __init__(self, dim: int, expansion_factor=None, kernel_size: int = 31,
@@ -300,73 +210,43 @@ class ConformerConvModule(nn.Module):
         if expansion_factor is None:
             expansion_factor = 2 if conv_block == "conv1d" else 1
         inner_dim = dim * expansion_factor
-
-        norm = nn.LayerNorm(dim) if use_norm else nn.Identity()
-        if conv_model_type == "mode1":
-            if conv_block == "linear":
-                # 6.3: depthwise Conv1d + Linear/SwiGLU 块
-                self.net = _Seq(
-                    norm,
-                    _Noop(),  # Transpose
-                    nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim),
-                    _Noop(),  # Transpose
-                    nn.Linear(dim, inner_dim * 2),
-                    SwiGLU(),
-                    nn.Linear(inner_dim, inner_dim * 2),
-                    SwiGLU(),
-                    nn.Linear(inner_dim, dim),
-                    nn.Dropout(dropout),
-                )
-            else:
-                # 6.1/6.2: depthwise Conv1d + PReLU 块
-                padding = kernel_size // 2
-                self.net = _Seq(
-                    norm,
-                    _Noop(),  # Transpose
-                    nn.Conv1d(dim, inner_dim * 2, 1),
-                    SwiGLU(),
-                    nn.Conv1d(inner_dim, inner_dim, kernel_size, padding=padding, groups=inner_dim),
-                    nn.PReLU(inner_dim),
-                    nn.Conv1d(inner_dim, dim, 1),
-                    _Noop(),  # Transpose
-                    nn.Dropout(dropout),
-                )
-        else:
+        if conv_model_type != "mode1":
             raise ValueError(f"{conv_model_type} is not a valid conv_model_type")
+        if conv_block == "linear":
+            self.net = _glu_net(dim, inner_dim, kernel_size, dropout, in_norm=use_norm)
+        else:
+            act = nn.PReLU(inner_dim)
+            self.net = _glu_net(dim, inner_dim, kernel_size, dropout,
+                                conv=True, act=act, in_norm=use_norm)
 
     def __call__(self, x):
         return self.net(x)
 
 
 class _TransformerEncoderLayer(nn.Module):
-    """torch nn.TransformerEncoderLayer(post-LN, norm_first=False) 的 MLX 版。
-
-    用 ``mx.fast.scaled_dot_product_attention`` 替代 fused MHA。
-    推理(conv_only=True)时不会被构造;保留给 use_attention=True 配置。
-    """
+    """torch nn.TransformerEncoderLayer(post-LN,norm_first=False);用
+    mx.fast.scaled_dot_product_attention 替代 fused MHA。推理(conv_only=True)
+    不会构造,保留给 use_attention=True 配置。"""
 
     def __init__(self, d_model: int, nhead: int = 8, dim_feedforward=None,
                  dropout: float = 0.1):
         super().__init__()
-        dim_feedforward = dim_feedforward or d_model * 4
         self.self_attn = _MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear1 = nn.Linear(d_model, dim_feedforward or d_model * 4)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear2 = nn.Linear(dim_feedforward or d_model * 4, d_model)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
     def __call__(self, x, mask=None):
-        # post-LN(norm_first=False)
         x = self.norm1(x + self.dropout1(self.self_attn(x, mask)))
-        x = self.norm2(x + self.dropout2(self.linear2(self.dropout(nn.gelu(self.linear1(x))))))
-        return x
+        return self.norm2(x + self.dropout2(self.linear2(self.dropout(nn.gelu(self.linear1(x))))))
 
 
 class _MultiheadAttention(nn.Module):
-    """MHA(in_proj_weight 布局与 torch 一致:[3d, d] q/k/v 堆叠)。"""
+    """MHA,in_proj_weight 布局与 torch 一致([3d, d] q/k/v 堆叠)。"""
 
     def __init__(self, d_model: int, nhead: int = 8, dropout: float = 0.1):
         super().__init__()
@@ -391,8 +271,7 @@ class _MultiheadAttention(nn.Module):
         if mask is not None:
             sdpa_mask = mask[:, None, None, :]  # [B, 1, 1, T]
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=sdpa_mask)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, D)
-        return self.out_proj(out)
+        return self.out_proj(out.transpose(0, 2, 1, 3).reshape(B, T, D))
 
 
 class CFNEncoderLayer(nn.Module):
@@ -403,6 +282,7 @@ class CFNEncoderLayer(nn.Module):
         self.conformer = ConformerConvModule(
             dim_model, use_norm=use_norm, dropout=conv_dropout, conv_block=conv_block,
         )
+        self.attn = None
         if not conv_only:
             self.attn = _TransformerEncoderLayer(
                 d_model=dim_model, nhead=num_heads,
@@ -410,13 +290,12 @@ class CFNEncoderLayer(nn.Module):
             )
             self.norm = nn.LayerNorm(dim_model)
         else:
-            self.attn = None
+            self.norm = None
 
     def __call__(self, x, mask=None):
         if self.attn is not None:
             x = x + self.attn(self.norm(x), mask)
-        x = x + self.conformer(x)
-        return x
+        return x + self.conformer(x)
 
 
 class ConformerNaiveEncoder(nn.Module):
@@ -432,25 +311,19 @@ class ConformerNaiveEncoder(nn.Module):
         ]
 
     def __call__(self, x, mask=None):
-        for layer in self.encoder_layers:
-            x = layer(x, mask)
+        for layer in self.encoder_layers: x = layer(x, mask)
         return x
 
 
-# ---------------------------------------------------------------------------
-# Unit2Control (ddsp/unit2control.py)
-# ---------------------------------------------------------------------------
-
 def _split_to_dict(tensor, tensor_splits):
-    """Split last dim by sizes -> dict(torch.split sizes 语义)。"""
+    """Split last dim by sizes → dict(torch split 语义)。"""
     sizes = list(tensor_splits.values())
     idx = []
     acc = 0
     for s in sizes[:-1]:
         acc += s
         idx.append(acc)
-    parts = mx.split(tensor, idx, axis=-1)
-    return dict(zip(tensor_splits.keys(), parts))
+    return dict(zip(tensor_splits.keys(), mx.split(tensor, idx, axis=-1)))
 
 
 class Unit2Control(nn.Module):
@@ -464,70 +337,44 @@ class Unit2Control(nn.Module):
         self.phase_embed = nn.Linear(1, dim_model)
         self.volume_embed = nn.Linear(1, dim_model)
         self.n_spk = n_spk
-        if n_spk is not None and n_spk > 1:
-            self.spk_embed = nn.Embedding(n_spk, dim_model)
-        if use_pitch_aug:
-            self.aug_shift_embed = nn.Linear(1, dim_model, bias=False)
-        else:
-            self.aug_shift_embed = None
-        self.stack = _Seq(
-            nn.Conv1d(input_channel, 512, 3, 1, 1),
-            nn.PReLU(512),
-            nn.Conv1d(512, dim_model, 3, 1, 1),
-        )
-        self.stack2 = _Seq(
-            nn.Conv1d(2 * block_size, 512, 3, 1, 1),
-            nn.PReLU(512),
-            nn.Conv1d(512, dim_model, 3, 1, 1),
-        )
+        self.spk_embed = nn.Embedding(n_spk, dim_model) if n_spk is not None and n_spk > 1 else None
+        self.aug_shift_embed = nn.Linear(1, dim_model, bias=False) if use_pitch_aug else None
+        self.stack = _Seq(nn.Conv1d(input_channel, 512, 3, 1, 1), nn.PReLU(512),
+                          nn.Conv1d(512, dim_model, 3, 1, 1))
+        self.stack2 = _Seq(nn.Conv1d(2 * block_size, 512, 3, 1, 1), nn.PReLU(512),
+                           nn.Conv1d(512, dim_model, 3, 1, 1))
         self.decoder = ConformerNaiveEncoder(
             num_layers=num_layers, num_heads=8, dim_model=dim_model,
             use_norm=use_norm, conv_only=not use_attention,
             conv_dropout=0, atten_dropout=0.1, conv_block=conv_block,
         )
         self.norm = nn.LayerNorm(dim_model)
-        self.n_out = sum(output_splits.values())
-        self.dense_out = nn.Linear(dim_model, self.n_out)
+        self.dense_out = nn.Linear(dim_model, sum(output_splits.values()))
 
     def __call__(self, units, source, noise, volume, spk_id=None,
-                 spk_mix_dict=None, aug_shift=None):
-        # 全部 NLC [B, T, C];torch 的 transpose(1,2) 在 mlx 不需要
-        exciter = mx.concatenate([source, noise], axis=-1)  # [B, T, 2*block]
-        x = self.stack(units) + self.stack2(exciter)        # [B, T, dim_model]
-        x = x + self.volume_embed(volume)                    # volume [B, T, 1]
-        if self.n_spk is not None and self.n_spk > 1:
+                 spk_mix_dict=None, aug_shift=None):  # 全 NLC [B,T,C]
+        exciter = mx.concatenate([source, noise], axis=-1)  # [B,T,2*block]
+        x = self.stack(units) + self.stack2(exciter) + self.volume_embed(volume)
+        if self.spk_embed is not None:
             if spk_mix_dict is not None:
                 for k, v in spk_mix_dict.items():
                     x = x + v * self.spk_embed(mx.array([[k]]))[:, 0:1, :]
             elif spk_id is not None:
                 x = x + self.spk_embed(spk_id)[:, None, :]
         if self.aug_shift_embed is not None and aug_shift is not None:
-            # aug_shift 可能为 [B]/[B,1]/[B,1,1],统一为 [B,1](torch 语义)
+            # aug_shift [B]/[B,1]/[B,1,1] 统一 [B,1](torch 语义)
             x = x + self.aug_shift_embed(aug_shift.reshape(-1, 1) / 5)[:, None, :]
-        x = self.decoder(x)
-        x = self.norm(x)
-        e = self.dense_out(x)
-        controls = _split_to_dict(e, self.output_splits)
-        return controls, x
+        e = self.dense_out(self.norm(self.decoder(x)))
+        return _split_to_dict(e, self.output_splits), x
 
 
-# ---------------------------------------------------------------------------
-# DDSP 频谱路径:复杂 STFT / ISTFT(center=True, window envelop 归一化)
-# ---------------------------------------------------------------------------
-
-def _sinc(x):
-    """torch.sinc:sin(pi*x)/(pi*x),sinc(0)=1。"""
+def _sinc(x):  # torch.sinc:sinc(0)=1
     return mx.where(x == 0, mx.ones_like(x), mx.sin(mx.pi * x) / (mx.pi * x))
 
 
-def _fmod1(x):
-    """torch.fmod(x, 1.0) 等价(x - trunc(x);% 是 floor-mod,负数不同)。"""
+def _fmod1(x):  # torch.fmod(x,1.0);% 是 floor-mod,负数语义不同
     return x - mx.trunc(x)
 
-
-# ---------------------------------------------------------------------------
-# CombSubSuperFast (ddsp/vocoder.py) —— DDSP 频谱路径
-# ---------------------------------------------------------------------------
 
 class CombSubSuperFast(nn.Module):
     def __init__(self, sampling_rate: int, block_size: int, win_length: int,
@@ -540,12 +387,9 @@ class CombSubSuperFast(nn.Module):
         self.block_size = block_size
         self.win_length = win_length
         self.window = hann_window(win_length)
-        split_map = {
-            "harmonic_magnitude": win_length // 2 + 1,
-            "harmonic_phase": win_length // 2 + 1,
-            "noise_magnitude": win_length // 2 + 1,
-            "noise_phase": win_length // 2 + 1,
-        }
+        split_map = {k: win_length // 2 + 1 for k in
+                     ("harmonic_magnitude", "harmonic_phase",
+                      "noise_magnitude", "noise_phase")}
         self.unit2ctrl = Unit2Control(
             n_unit, block_size, n_spk, split_map,
             num_layers=num_layers, dim_model=dim_model,
@@ -553,16 +397,14 @@ class CombSubSuperFast(nn.Module):
             use_pitch_aug=use_pitch_aug, conv_block=conv_block,
         )
 
-    def fast_source_gen(self, f0_frames):
-        # f0_frames [B, T, 1] -> combtooth [B, T*block_size]
+    def fast_source_gen(self, f0_frames):  # [B,T,1] -> combtooth [B, T*block]
         n = mx.arange(self.block_size)
-        s0 = f0_frames / self.sampling_rate  # [B, T, 1]
-        ds0 = s0[:, 1:, :] - s0[:, :-1, :]
-        ds0 = mx.pad(ds0, [(0, 0), (0, 1), (0, 0)])  # F.pad(..., (0,0,0,1)) 尾部补 0
-        rad = s0 * (n + 1) + 0.5 * ds0 * n * (n + 1) / self.block_size  # [B, T, block]
+        s0 = f0_frames / self.sampling_rate
+        ds0 = mx.pad(s0[:, 1:, :] - s0[:, :-1, :], [(0, 0), (0, 1), (0, 0)])  # 尾部补 0
+        rad = s0 * (n + 1) + 0.5 * ds0 * n * (n + 1) / self.block_size
         s0 = s0 + ds0 * n / self.block_size
-        rad2 = _fmod1(rad[..., -1:] + 0.5) - 0.5  # [B, T, 1]
-        rad_acc = _fmod1(mx.cumsum(rad2, axis=1))  # [B, T, 1]
+        rad2 = _fmod1(rad[..., -1:] + 0.5) - 0.5
+        rad_acc = _fmod1(mx.cumsum(rad2, axis=1))
         rad = rad + mx.pad(rad_acc[:, :-1, :], [(0, 0), (1, 0), (0, 0)])
         rad = rad - mx.round(rad)
         combtooth = _sinc(rad / (s0 + 1e-5))
@@ -571,14 +413,12 @@ class CombSubSuperFast(nn.Module):
     def __call__(self, units_frames, f0_frames, volume_frames, spk_id=None,
                  spk_mix_dict=None, aug_shift=None, initial_phase=None,
                  infer=True, **kwargs):
-        # combtooth 激励 + 噪声激励
         combtooth = self.fast_source_gen(f0_frames)  # [B, T*block]
         B = combtooth.shape[0]
         combtooth_frames = combtooth.reshape(B, f0_frames.shape[1], self.block_size)
         noise = mx.random.normal(combtooth.shape)
         noise_frames = noise.reshape(B, f0_frames.shape[1], self.block_size)
 
-        # 参数预测
         ctrls, hidden = self.unit2ctrl(
             units_frames, combtooth_frames, noise_frames, volume_frames,
             spk_id=spk_id, spk_mix_dict=spk_mix_dict, aug_shift=aug_shift,
@@ -601,10 +441,6 @@ class CombSubSuperFast(nn.Module):
         return signal, hidden
 
 
-# ---------------------------------------------------------------------------
-# RectifiedFlow (reflow/reflow.py) —— 推理采样
-# ---------------------------------------------------------------------------
-
 class RectifiedFlow(nn.Module):
     def __init__(self, velocity_fn, out_dims: int = 128,
                  spec_min: float = -12, spec_max: float = 2):
@@ -621,47 +457,39 @@ class RectifiedFlow(nn.Module):
         return _ode_rk4(self.velocity_fn, x, t, dt, cond)
 
     def reflow_loss(self, x_1, t, cond, loss_type="l2_lognorm", mask=None):
-        """Flow-matching 训练 loss;layout [B,1,M,T] 见 _ops.reflow_loss."""
         return _reflow_loss(self.velocity_fn, x_1, t, cond, loss_type, mask,
-                            layout="b1mt")
+                            layout="b1mt")  # [B,1,M,T] 布局见 _ops.reflow_loss
 
     def __call__(self, condition, gt_spec=None, infer: bool = True,
                  infer_step: int = 10, method: str = "euler",
                  t_start: float = 0.0, use_tqdm: bool = True, mask=None):
-        cond = condition.transpose(0, 2, 1)  # [B, T, M] -> [B, M, T]
+        cond = condition.transpose(0, 2, 1)  # [B,T,M] -> [B,M,T]
         b = condition.shape[0]
-        if t_start < 0.0:
-            t_start = 0.0
+        t_start = max(t_start, 0.0)
 
         if not infer:
-            # 训练:norm gt_spec → x_1 [B,1,M,T],采样 t,算 reflow loss
-            x_1 = self.norm_spec(gt_spec).transpose(0, 2, 1)[:, None, :, :]
-            t = t_start + (1.0 - t_start) * mx.random.uniform(shape=(b,))
-            t = mx.clip(t, 1e-7, 1 - 1e-7)
+            x_1 = self.norm_spec(gt_spec).transpose(0, 2, 1)[:, None]  # [B,1,M,T]
+            t = mx.clip(t_start + (1.0 - t_start) * mx.random.uniform(shape=(b,)), 1e-7, 1 - 1e-7)
             return self.reflow_loss(x_1, t, cond=cond, mask=mask)
 
-        shape = (b, 1, self.out_dims, cond.shape[2])  # [B, 1, M, T]
-
+        shape = (b, 1, self.out_dims, cond.shape[2])  # [B,1,M,T]
         if gt_spec is None:
             x = mx.random.normal(shape)
             t = mx.zeros((b,))
             dt = 1.0 / infer_step
         else:
-            norm_spec = self.norm_spec(gt_spec).transpose(0, 2, 1)[:, None, :, :]
+            norm_spec = self.norm_spec(gt_spec).transpose(0, 2, 1)[:, None]
             x = t_start * norm_spec + (1 - t_start) * mx.random.normal(shape)
             t = mx.full((b,), t_start)
             dt = (1.0 - t_start) / infer_step
 
+        step = {"euler": self.sample_euler, "rk4": self.sample_rk4}.get(method)
+        if step is None:
+            raise NotImplementedError(method)
         for _ in range(infer_step):
-            if method == "euler":
-                x, t = self.sample_euler(x, t, dt, cond)
-            elif method == "rk4":
-                x, t = self.sample_rk4(x, t, dt, cond)
-            else:
-                raise NotImplementedError(method)
+            x, t = step(x, t, dt, cond)
 
-        x = x.squeeze(1).transpose(0, 2, 1)  # [B, 1, M, T] -> [B, T, M]
-        x = mx.clip(x, -1.0, 1.0)
+        x = mx.clip(x.squeeze(1).transpose(0, 2, 1), -1.0, 1.0)  # [B,1,M,T]->[B,T,M]
         return self.denorm_spec(x)
 
     def norm_spec(self, x):
@@ -671,26 +499,13 @@ class RectifiedFlow(nn.Module):
         return _denorm_spec(x, self.spec_min, self.spec_max)
 
 
-# ---------------------------------------------------------------------------
-# DDSP6Model —— usvc-facing 组合模型(推理 sample)
-# ---------------------------------------------------------------------------
-
 def _default_mel_cfg(out_dims: int, win_length: int):
-    return {
-        "n_fft": win_length,
-        "win_length": win_length,
-        "n_mels": out_dims,
-        "fmin": 40.0,
-        "fmax": 16000.0,
-        "center": False,
-    }
+    return {"n_fft": win_length, "win_length": win_length, "n_mels": out_dims,
+            "fmin": 40.0, "fmax": 16000.0, "center": False}
 
 
 class DDSP6Model(nn.Module):
-    """MLX 版 DDSP6Model(sample 接口,推理)。
-
-    属性名与 torch 版一致(ddsp_model / reflow_model),from_ckpt 直接加载。
-    """
+    """属性名与 torch 版一致(ddsp_model/reflow_model),from_ckpt 直接加载。"""
 
     def __init__(self, n_units: int = 768, n_spk=1, win_length: int = 2048,
                  sampling_rate: int = 44100, block_size: int = 512,
@@ -706,11 +521,9 @@ class DDSP6Model(nn.Module):
         self.block_size = block_size
         self.win_length = win_length
         if velocity_net == "LYNXNet2":
-            velocity_cls = LYNXNet2
-            conv_block = "linear"
+            velocity_cls, conv_block = LYNXNet2, "linear"
         elif velocity_net == "LYNXNet":
-            velocity_cls = LYNXNet
-            conv_block = "conv1d"
+            velocity_cls, conv_block = LYNXNet, "conv1d"
         else:
             raise ValueError(f"unknown velocity_net {velocity_net!r} (expected 'LYNXNet' or 'LYNXNet2')")
 
@@ -718,8 +531,7 @@ class DDSP6Model(nn.Module):
             sampling_rate, block_size, win_length, n_units, n_spk,
             n_aux_layers if n_aux_layers is not None else 3,
             n_aux_chans if n_aux_chans is not None else 256,
-            use_norm, use_attention, use_pitch_aug,
-            conv_block=conv_block,
+            use_norm, use_attention, use_pitch_aug, conv_block=conv_block,
         )
         self.reflow_model = RectifiedFlow(
             velocity_cls(in_dims=out_dims, dim_cond=out_dims,
@@ -727,8 +539,6 @@ class DDSP6Model(nn.Module):
             out_dims=out_dims,
         )
         self.mel_extractor = mel_extractor
-
-    # -- mel 提取 ----------------------------------------------------------
 
     def _ensure_mel_extractor(self):
         if self.mel_extractor is None:
@@ -743,120 +553,78 @@ class DDSP6Model(nn.Module):
 
             self.mel_extractor = MelExtractor(
                 _FC(_default_mel_cfg(self.out_dims, self.win_length)),
-                sr=self.sampling_rate,
-                hop=self.block_size,
+                sr=self.sampling_rate, hop=self.block_size,
             )
         return self.mel_extractor
 
-    # -- 训练 ---------------------------------------------------------------
-
-    def forward(self, units, f0, volume, spk_id, gt_spec, aug_shift=None,
-                frame_len=None, lambda_ddsp=1.0, t_start=None):
-        """训练 forward(镜像 torch DDSP6Model.forward):DDSP + reflow loss。
-
-        Returns:
-            (total_loss, {"ddsp_loss": float, "reflow_loss": float})
-        """
+    def _fit(self, f0, volume, t_start):
         if f0.ndim == 2:
             f0 = f0[:, :, None]
         if volume.ndim == 2:
             volume = volume[:, :, None]
-        if t_start is None:
-            t_start = self.t_start
+        return f0, volume, self.t_start if t_start is None else t_start
 
-        # DDSP 合成(可微 STFT/ISTFT 谱路径)
-        ddsp_wav, _hidden = self.ddsp_model(
-            units, f0, volume, spk_id=spk_id, aug_shift=aug_shift, infer=True,
-        )
-        mel_extractor = self._ensure_mel_extractor()
-        # mlx MelExtractor 逐条提取(纯 mlx 算子,梯度可回传)
-        ddsp_mel = mx.stack(
-            [mel_extractor.extract(ddsp_wav[i]) for i in range(ddsp_wav.shape[0])]
-        )  # [B, T, M]
+    def _ddsp_mel(self, units, f0, volume, spk_id, aug_shift):
+        wav, _ = self.ddsp_model(units, f0, volume, spk_id=spk_id, aug_shift=aug_shift,
+                                 infer=True)
+        ext = self._ensure_mel_extractor()
+        return mx.stack([ext.extract(wav[i]) for i in range(wav.shape[0])])  # [B,T,M]
+
+    def forward(self, units, f0, volume, spk_id, gt_spec, aug_shift=None,
+                frame_len=None, lambda_ddsp=1.0, t_start=None):
+        """训练 forward:DDSP 合成 mel + reflow loss → (loss, {ddsp/reflow float})。"""
+        f0, volume, t_start = self._fit(f0, volume, t_start)
+        ddsp_mel = self._ddsp_mel(units, f0, volume, spk_id, aug_shift)
         ddsp_loss = mx.mean(mx.square(ddsp_mel - gt_spec))
 
         if t_start < 1.0:
             from ....train.mlx.objective import lens_to_mask
-            _mask = None
-            if frame_len is not None:
-                _mask = lens_to_mask(frame_len, length=gt_spec.shape[1])
+            mask = lens_to_mask(frame_len, length=gt_spec.shape[1]) if frame_len is not None else None
             reflow_loss = self.reflow_model(
-                ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False,
-                mask=_mask,
+                ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False, mask=mask,
             )
         else:
             reflow_loss = 0.0
         total = lambda_ddsp * ddsp_loss + reflow_loss
-        return total, {
-            "ddsp_loss": float(ddsp_loss.item()),
-            "reflow_loss": float(reflow_loss.item()),
-        }
-
-    # -- 推理 ---------------------------------------------------------------
+        return total, {"ddsp_loss": float(ddsp_loss.item()),
+                       "reflow_loss": float(reflow_loss.item())}
 
     def sample(self, units, f0, volume, spk_id=None, aug_shift=None,
                infer_step: int = 10, method: str = "euler",
                t_start: float | None = None, use_tqdm: bool = False):
-        """Inference:DDSP 合成 -> reflow 精修。
-
-        units [B, T, n_unit];f0 / volume [B, T] 或 [B, T, 1]。
-        返回 denormalized mel [B, T, out_dims]。
-        """
-        if f0.ndim == 2:
-            f0 = f0[:, :, None]
-        if volume.ndim == 2:
-            volume = volume[:, :, None]
-        if t_start is None:
-            t_start = self.t_start
-
-        ddsp_wav, _hidden = self.ddsp_model(
-            units, f0, volume, spk_id=spk_id, aug_shift=aug_shift, infer=True,
-        )
-        mel_extractor = self._ensure_mel_extractor()
-        # mlx MelExtractor.extract 吃 1D,逐行提取
-        ddsp_mel = mx.stack(
-            [mel_extractor.extract(ddsp_wav[i]) for i in range(ddsp_wav.shape[0])]
-        )  # [B, T, M]
-        mel = self.reflow_model(
+        """推理:DDSP 合成 → reflow 精修 → [B,T,out_dims] mel。"""
+        f0, volume, t_start = self._fit(f0, volume, t_start)
+        ddsp_mel = self._ddsp_mel(units, f0, volume, spk_id, aug_shift)
+        return self.reflow_model(
             ddsp_mel, gt_spec=ddsp_mel, infer=True,
             infer_step=infer_step, method=method, t_start=t_start, use_tqdm=use_tqdm,
         )
-        return mel
-
-    # -- ckpt 加载 ----------------------------------------------------------
 
     @classmethod
     def from_ckpt(cls, ckpt_path: str | Path, *, config: dict | None = None,
                   dtype=None, strict: bool = False) -> "DDSP6Model":
-        """从 torch ckpt 加载(ddsp_model.* + reflow_model.* 前缀)。
-
-        config 提供构造参数;None 时从权重 shape 反推(见 _infer_config)。
-        """
+        """从 torch ckpt 加载(ddsp_model.* + reflow_model.* 前缀);config None 时
+        从权重 shape 反推(见 _infer_config)。"""
         from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype)
-        cfg = config if config is not None else cls._infer_config(sd)
-        obj = cls(**cfg)
-        # 剥 lightning model. 前缀(训练 ckpt 保存为 model.ddsp_model.*;
-        # 探测条件保留原样,剥离动作收敛到 strip_prefix)
+        obj = cls(**config) if config is not None else cls(**cls._infer_config(sd))
         if any(k.startswith("model.") for k in sd):
-            sd = strip_prefix(sd, "model.")
+            sd = strip_prefix(sd, "model.")  # 训练 ckpt 的 lightning 前缀
         obj.load_weights(list(sd.items()), strict=strict)
         obj.eval()
         return obj
 
     @staticmethod
     def _infer_config(sd: dict) -> dict:
-        """从 mlx state_dict shape 反推 DDSP6Model 构造参数。"""
         shape = lambda k: sd[k].shape if k in sd else None  # noqa: E731
-        # ---- ddsp_model ----
         stack0 = shape("ddsp_model.unit2ctrl.stack.0.weight")  # mlx (O,K,C)
         if stack0 is None:
             raise ValueError("cannot infer ddsp6 config: missing stack.0.weight")
         n_unit = stack0[2]
         stack2_0 = shape("ddsp_model.unit2ctrl.stack2.0.weight")
         block_size = stack2_0[2] // 2 if stack2_0 else 512
-        dense_out = shape("ddsp_model.unit2ctrl.dense_out.weight")  # (n_out, dim)
+        dense_out = shape("ddsp_model.unit2ctrl.dense_out.weight")
         if dense_out is None:
             raise ValueError("cannot infer ddsp6 config: missing dense_out.weight")
         n_out, dim_model = dense_out[0], dense_out[1]
@@ -866,13 +634,9 @@ class DDSP6Model(nn.Module):
             for k in sd
             if k.startswith("ddsp_model.unit2ctrl.decoder.encoder_layers.")
         })
-        # ---- reflow_model ----
         in_proj = shape("reflow_model.velocity_fn.input_projection.weight")
         if in_proj is None:
             raise ValueError("cannot infer ddsp6 config: missing velocity_fn.input_projection.weight")
-        # input_projection:Linear torch (n_chans, in_dims) 或
-        # Conv1d mlx (n_chans, K, in_dims)。in_dims 在最后(Linear)或
-        # Conv1d 的第 3 维。
         if len(in_proj) == 2:  # LYNXNet2 Linear (n_chans, in_dims)
             n_chans, out_dims = in_proj[0], in_proj[1]
             velocity_net = "LYNXNet2"
