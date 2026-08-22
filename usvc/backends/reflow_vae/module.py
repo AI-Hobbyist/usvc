@@ -1,4 +1,10 @@
-"""reflow_vae LightningModule (Reflow-VAE-SVC: Bi_RectifiedFlow + VAE)."""
+"""reflow_vae LightningModule (Reflow-VAE-SVC: Bi_RectifiedFlow + VAE).
+
+backend_opts (defaults match configs/reflow-vae-lynxnet.yaml): back_bone
+'lynxnet' (NaiveV2Diff) | 'wavenet'; n_layers 6, n_chans 512, n_hidden 256;
+use_attention True, use_pitch_aug True, out_dims 128, n_units 768,
+num_speaker 1.
+"""
 from __future__ import annotations
 
 import torch
@@ -12,19 +18,9 @@ __all__ = ["ReflowVAEModule"]
 
 
 class ReflowVAEModule(BaseSVCModule):
-    """LightningModule for reflow_vae backend (Bi_RectifiedFlow + VAE).
-
-    backend_opts (defaults match configs/reflow-vae-lynxnet.yaml):
-      back_bone: 'lynxnet' (NaiveV2Diff) | 'wavenet'
-      n_layers: 6, n_chans: 512, n_hidden: 256
-      use_attention: True, use_pitch_aug: True
-      out_dims: 128, n_units: 768, num_speaker: 1
-    """
-
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
         opts = cfg.backend_opts
-
         self.model = ReflowVAEModel(
             n_units=opts.get("n_units", 768),
             n_spk=opts.get("num_speaker", 1),
@@ -42,7 +38,6 @@ class ReflowVAEModule(BaseSVCModule):
         )
 
     def forward_loss(self, batch: SVCBatch):
-        """Bi_RectifiedFlow reflow loss (l2_lognorm)."""
         units, f0, volume, spk_id, gt_spec, aug_shift = self._unpack(batch)
         loss, sub = self.model(
             units, f0, volume, spk_id, gt_spec, aug_shift=aug_shift,
@@ -51,15 +46,10 @@ class ReflowVAEModule(BaseSVCModule):
         return loss, sub
 
     def sample(self, batch: SVCBatch, steps: int | None = None):
-        """Generate mel for validation via VAE latent + ODE sampling.
-
-        steps: ODE integration steps (default 10).
-        """
         units, f0, volume, spk_id, _, aug_shift = self._unpack(batch)
         with torch.no_grad():
-            mel_gen = self.model.sample(
+            return self.model.sample(
                 units, f0, volume, spk_id, aug_shift=aug_shift,
                 frame_len=batch.frame_len,
                 infer_step=steps if steps is not None else 10,
             )
-        return mel_gen

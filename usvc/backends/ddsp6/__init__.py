@@ -1,11 +1,8 @@
-"""ddsp6 backend feature spec (DSP-002 §3.2).
+"""ddsp6 backend feature spec (DSP-002 §3.2), from DDSP-SVC-6.3 defaults (LYNXNet2).
 
-Distilled from DDSP-SVC-6.3 defaults (velocity_net LYNXNet2). Version-aware:
-  - version 6.1: units default to contentvec (non-tta2x, hop 320),
-    velocity_net LYNXNet, dims per 6.1 configs/reflow.yaml
-  - version 6.2: units default to contentvec_tta2x, velocity_net LYNXNet
-  - version 6.3: units default to contentvec_tta2x, velocity_net LYNXNet2
-Same mel/f0/rms as rift_dit; user can switch to hubertsoft.
+Version-aware: 6.1 units default to contentvec (non-tta2x, hop 320) + LYNXNet;
+6.2 units default to contentvec_tta2x + LYNXNet; 6.3 -> LYNXNet2. Same
+mel/f0/rms as rift_dit; user can switch to hubertsoft.
 """
 from __future__ import annotations
 
@@ -30,8 +27,7 @@ class DDSP6Backend(Backend):
         f0 = resolve_f0_config(train_cfg, default_uv_policy="interp")
         version = str(train_cfg.get("version", "6.3"))
         units_kind = train_cfg.get("units_kind")
-        # 6.1's default encoder is contentvec768l12 (no tta2x, hop 320).
-        if version == "6.1" and units_kind is None:
+        if version == "6.1" and units_kind is None:  # 6.1's default encoder: contentvec768l12 (hop 320)
             units_kind = "contentvec"
         if units_kind == "hubertsoft":
             units = hubertsoft_units(train_cfg.get("units_ckpt"))
@@ -44,10 +40,7 @@ class DDSP6Backend(Backend):
         # keyshift; dataset applies them 50% of the time during training.
         if train_cfg.get("use_pitch_aug"):
             spec = FeatureSpec(
-                mel=base.mel,
-                f0=f0,
-                rms=base.rms,
-                units=units,
+                mel=base.mel, f0=f0, rms=base.rms, units=units,
                 aug_shift=FeatureConfig("aug_shift", {"range": [-5.0, 5.0]}),
                 aug_mel=FeatureConfig("aug_mel", dict(base.mel.params)),
             )
@@ -61,12 +54,8 @@ class DDSP6Backend(Backend):
         spec = self.feature_spec({})
         encoder_kind = spec.units.params.get("kind", "contentvec_tta2x")
         return DDSPDataset(
-            dataset_dir=dataset_dir,
-            split=split,
-            feature_hashes=feature_hashes,
-            max_frames=172,
-            augment=(split == "train"),
-            encoder_kind=encoder_kind,
+            dataset_dir=dataset_dir, split=split, feature_hashes=feature_hashes,
+            max_frames=172, augment=(split == "train"), encoder_kind=encoder_kind,
         )
 
     def build_module(self, train_cfg):

@@ -1,9 +1,9 @@
 """ddsp6 dataset: mel(128), f0, volume(=rms), units(contentvec), spk_id, aug_shift.
 
 Reads preprocessed .pt features. Pitch augmentation (offline aug_mel/aug_vol)
-is optional; when present, used 50% of the time (DDSP-SVC default ON).
-Shared implementation lives in usvc/backends/_dataset.py (MelUnitsDataset);
-this file pins the ddsp6 parameter defaults (2s @ 44.1k/512, tta2x encoder).
+is optional; when present, used 50% of the time (DDSP-SVC default ON). Shared
+implementation lives in usvc/backends/_dataset.py (MelUnitsDataset); this file
+pins the ddsp6 parameter defaults (2s @ 44.1k/512, tta2x encoder).
 """
 from __future__ import annotations
 
@@ -13,13 +13,6 @@ __all__ = ["DDSPDataset"]
 
 
 class DDSPDataset(MelUnitsDataset):
-    """Dataset for ddsp6 backend (DDSP-SVC style).
-
-    Reads mel/{hash}/{spk}/{fn}.pt, f0/, rms/ (as volume), units/.
-    Force-aligns all features to mel's frame count. Optional pitch
-    augmentation reads aug_mel/aug_vol if present.
-    """
-
     def __init__(
         self,
         dataset_dir: str,
