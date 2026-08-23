@@ -489,9 +489,10 @@ class Generator(torch.nn.Module):
         self.num_kernels = len(h["resblock_kernel_sizes"]); self.num_upsamples = len(h["upsample_rates"])
         self.f0_upsamp = torch.nn.Upsample(scale_factor=math.prod(h["upsample_rates"]))
         self.m_source = SourceModuleHnNSF(sampling_rate=h["sampling_rate"], harmonic_num=8)
+        self.noise_convs = nn.ModuleList()  # 注册序先于 conv_pre:clip_grad_norm_ 归约序依赖 named_parameters 序
         self.conv_pre = weight_norm(Conv1d(h["inter_channels"], h["upsample_initial_channel"], 7, 1, padding=3))
         resblock = ResBlock1 if h["resblock"] == "1" else ResBlock2
-        self.ups = nn.ModuleList(); self.noise_convs = nn.ModuleList()
+        self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(h["upsample_rates"], h["upsample_kernel_sizes"])):
             self.ups.append(weight_norm(ConvTranspose1d(h["upsample_initial_channel"] // (2 ** i),
                                                        h["upsample_initial_channel"] // (2 ** (i + 1)),

@@ -140,9 +140,10 @@ class GeneratorNSF(nn.Module):
         self.num_upsamples = len(upsample_rates)
         self.f0_upsamp = nn.Upsample(scale_factor=prod(upsample_rates))
         self.m_source = SourceModuleHnNSF(sampling_rate=sr, harmonic_num=0, is_half=is_half)
+        self.noise_convs = nn.ModuleList()  # 注册序先于 conv_pre:同 sovits,保 clip 归约序
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
         resblock = ResBlock1 if resblock == "1" else ResBlock2
-        self.noise_convs, self.ups = nn.ModuleList(), nn.ModuleList()
+        self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             c = upsample_initial_channel // 2 ** (i + 1)
             self.ups.append(weight_norm(ConvTranspose1d(
