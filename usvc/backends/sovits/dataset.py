@@ -36,6 +36,7 @@ def interp_unvoiced_f0(f0):
 
 
 class SoVITSDataset(BaseDirDataset):
+    strict_speakers = True
     def __init__(self, dataset_dir, split, feature_hashes, max_frames=790, augment=True, encoder_kind="hubertsoft"):
         super().__init__(dataset_dir, split, feature_hashes, max_frames, augment, encoder_kind)
         self._units_dir = self.dataset_dir / "units" / encoder_kind / feature_hashes.get("units", "")
@@ -76,4 +77,4 @@ class SoVITSDataset(BaseDirDataset):
         if wav is not None: wav = align_wav(wav, mf * self.meta.hop)
         if spec is not None: spec = align_spec_to_frames(spec, mf)  # 强制 spec 帧数 = units 帧数
         return {"units": units, "f0": f0, "uv": uv, "mel": spec, "wav": wav, "rms": rms,
-                "spk_id": self.spk2idx.get(spk, 0)}
+                "spk_id": self.spk2idx[spk]}

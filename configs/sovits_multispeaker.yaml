@@ -1,0 +1,81 @@
+# ============================================================
+# usvc 训练配置: so-vits-svc (VITS + NSF-HiFiGAN, GAN 训练)
+# ============================================================
+# 对应原项目: so-vits-svc 4.1 (github.com/svc-develop-team/so-vits-svc)
+# 原项目配置: configs/config.json (GAN 主模型)
+# 注意: so-vits 还有浅扩散 (diffusion.yaml), 用本目录 diffusion.yaml 配置
+#
+# 与 usvc 其他后端不同, GAN 训练是 G/D 双优化器交替,
+# 损失 = gan + feature_match + c_mel*mel_L1 + c_kl*KL (+ lf0), 与原项目逐字一致
+# ============================================================
+
+backend: sovits
+spk:
+  歌手甲: 0
+  歌手乙: 1
+dataset_dir: data/multi       # 必填: 预处理后的数据集目录 (含 meta.json)
+exp_dir: experiments/sovits_multi        # 输出目录
+
+# ---- 训练超参 ----
+batch_size: 48                     # [可调] 原项目默认 6 (保守); A10G 24GB 可开 48 (完整GAN 11.1GB)
+max_frames: 64                     # [可调] 训练片段长度(帧), 需 > segment_size
+num_workers: 2                     # [可调] dataloader worker (8+ 会 SIGTERM, 2 稳定)
+max_steps: 500000                  # [可调] 总训练步数
+val_interval: 2000                 # [可调] 验证间隔(步)
+save_interval: 2000               # [可调] checkpoint 保存间隔(步)
+limit_val_batches: 0               # 跳过验证 (GAN validation 慢; 开启设 1.0)
+# Checkpoint 策略: 保留完整 checkpoint (权重+优化器), 可从任意 checkpoint 完美 resume
+keep_last_n: 5                    # 保留最近 N 个 checkpoint + last (-1 = 全保留)
+precision: bf16-mixed              # [可调] bf16 AMP (GAN 已验证近无损)
+
+# ---- 优化器 (GAN: G/D 双优化器, 用相同配置) ----
+optimizer:
+  type: adamw                      # [可调] adamw (原项目默认)
+  lr: 0.0002                       # [可调] 原项目默认 2e-4
+  betas: [0.8, 0.99]               # [可调] 原项目默认 (0.8, 0.99)
+  weight_decay: 0.0                # [可调] 原项目默认 0
+grad_clip: null                    # [可调] GAN 通常不裁剪 (原项目无)
+
+# ---- 模型架构 (对应原项目 SynthesizerTrn, config.json model 段) ----
+backend_opts:
+  # 维度参数
+  spec_channels: 1025              # [可调] n_fft//2+1 (2048→1025), 通常不改
+  inter_channels: 192              # [可调] latent 维度 (原项目 192)
+  hidden_channels: 192             # [可调] 隐藏维度 (原项目 192)
+  filter_channels: 768             # [可调] filter 维度 (原项目 768)
+  n_heads: 2                       # [可调] 注意力头数 (原项目 2)
+  n_layers_dec: 6                  # [可调] decoder 层数 (原项目 6)
+  n_layers_enc: 6                  # [可调] encoder 层数 (原项目 6)
+  n_sdp_layers0: 6                 # [可调] SDP 前段层数 (原项目 6)
+  n_sdp_layers: 6                  # [可调] SDP 层数 (原项目 6)
+
+  # 说话人/编码器
+  num_speaker: 2                   # [可调] 说话人数 (多说话人改此值)
+  n_units: 768                     # contentvec768 维度 (so-vits 4.1 官方推荐)
+                                   #       用 hubertsoft 4.0 数据需设 256
+  gin_channels: 768                # [可调] speaker embed 维度 (匹配 n_units)
+  units_kind: contentvec           # contentvec (4.1 推荐) | hubertsoft (4.0 兼容)
+  vol_embedding: true              # [可调] 响度嵌入 (4.1 默认开, 匹配输入响度)
+  segment_size: 20                 # [可调] 训练片段(帧), 原项目 segment_size=10240samples/512=20
+                                   #       必须 < max_frames; A10G 24GB 可开 32 (见 bench)
+  use_spectral_norm: false         # [可调] 判别器是否用 spectral norm (原项目默认 false)
+
+  # so-vits 特有 (原项目 config.json 字段)
+  use_automatic_f0_prediction: true  # [可调] 是否启用 f0 预测头 (lf0 loss)
+
+  # mel 提取参数 (原项目 config_template.json data 段, 通常不改)
+  filter_length: 2048              # n_fft (原项目 1024? 见注)
+  n_mel_channels: 80               # mel bins (原项目 80)
+  sampling_rate: 44100             # 采样率
+  hop_length: 512                  # hop (原项目 512)
+  win_length: 2048                 # 窗长
+  mel_fmin: 0.0                    # mel 最低频
+  mel_fmax: 22050.0                # mel 最高频 (sr/2)
+
+  # 损失系数 (原项目 c_mel/c_kl, 已验证与原项目一致)
+  c_mel: 45.0                      # [可调] mel loss 权重 (原项目 45)
+  c_kl: 1.0                        # [可调] KL loss 权重 (原项目 1)
+
+# 特征覆盖 (默认 contentvec, 切 hubertsoft 需取消注释):
+# units_kind: hubertsoft          # 用 4.0 hubertsoft (需同时 n_units: 256, gin_channels: 256)
+# f0_extractor: fcpe               # [可调] rmvpe(默认) | fcpe (更快)

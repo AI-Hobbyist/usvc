@@ -40,7 +40,7 @@ class TrainConfig:
                  optimizer=None, schedule=None, grad_clip=1.0, precision="bf16-mixed",
                  max_epochs=None, max_steps=500_000, val_interval=2000, save_interval=2000,
                  limit_val_batches=None, resume=None, pretrained=None, keep_last_n=5,
-                 backend_opts=None, feature_hashes=None):
+                 backend_opts=None, feature_hashes=None, spk=None):
         self.backend, self.dataset_dir, self.exp_dir, self.val_dir = backend, dataset_dir, exp_dir, val_dir
         self.batch_size, self.max_frames, self.num_workers, self.augment = batch_size, max_frames, num_workers, augment
         self.optimizer = optimizer if optimizer is not None else OptimizerConfig()
@@ -51,6 +51,7 @@ class TrainConfig:
         self.keep_last_n = keep_last_n
         self.backend_opts = backend_opts if backend_opts is not None else {}
         self.feature_hashes = feature_hashes if feature_hashes is not None else {}
+        self.spk = spk
 
     # Throughput-optimal defaults per backend (empirically tuned on A10G 24GB).
     # flow/diffusion: AMP bf16 safe (<0.03% divergence). GAN: TF32-only + large batch.
@@ -82,7 +83,7 @@ class TrainConfig:
 
     @classmethod
     def from_yaml(cls, path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             d = yaml.safe_load(f)
         bo = dict(d.get("backend_opts", {}) or {})
         for k in cls._FEATURE_OVERRIDE_KEYS:
@@ -94,4 +95,4 @@ class TrainConfig:
                    ScheduleConfig.from_dict(d.get("schedule")), d.get("grad_clip", 1.0),
                    d.get("precision", "bf16-mixed"), d.get("max_epochs"), d.get("max_steps", 500_000),
                    d.get("val_interval", 2000), d.get("save_interval", 2000), d.get("limit_val_batches"),
-                   d.get("resume"), d.get("pretrained"), d.get("keep_last_n", 5), bo)
+                   d.get("resume"), d.get("pretrained"), d.get("keep_last_n", 5), bo, spk=d.get("spk"))

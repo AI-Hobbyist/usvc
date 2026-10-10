@@ -43,6 +43,9 @@ def run_training(cfg: TrainConfig, resume=None, device=None):
 
     # Resolve feature hashes from dataset meta (units nested per encoder kind) — see _resolvers for match semantics
     meta = load_meta(cfg.dataset_dir)
+    from ..speakers import TARGET_BACKENDS, resolve_training_speakers, bind_dataset_speakers
+    if cfg.backend in TARGET_BACKENDS:
+        resolve_training_speakers(cfg, meta)
     want_spec = backend.feature_spec(dict(cfg.backend_opts or {}))
     units_kind = want_spec.units.params.get("kind", "contentvec") if want_spec.units else None
     cfg.feature_hashes = resolve_feature_hashes(meta, want_spec, units_kind)
@@ -50,6 +53,8 @@ def run_training(cfg: TrainConfig, resume=None, device=None):
     def _ds(dir, split):
         ds = backend.build_dataset(dir, split, cfg.feature_hashes)
         ds.max_frames = cfg.max_frames  # override backend default with config
+        if cfg.backend in TARGET_BACKENDS:
+            bind_dataset_speakers(ds, cfg.spk, training=split == "train")
         # keep dataset encoder_kind in sync with config overrides (build_dataset sees feature_spec({}), no train config)
         want_units_kind = want_spec.units.params.get("kind") if want_spec.units else None
         if want_units_kind and hasattr(ds, "encoder_kind") and ds.encoder_kind != want_units_kind:

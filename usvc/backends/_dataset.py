@@ -58,7 +58,15 @@ class BaseDirDataset(BaseSVCDataset):
         self.meta = load_meta(str(dataset_dir))
         self.spk2idx = {s: i for i, s in enumerate(self.meta.speakers)}
 
-        if self.meta.splits:
+        if getattr(self, "strict_speakers", False):
+            from ..speakers import dataset_keys, validate_mapping
+            if len(self.spk2idx) != len(self.meta.speakers):
+                raise ValueError("duplicate dataset speaker names")
+            validate_mapping(self.spk2idx)
+            if any(a.speaker not in self.spk2idx for a in self.meta.audios):
+                raise ValueError("unknown dataset speaker")
+            self.keys = dataset_keys(self.meta, split)
+        elif self.meta.splits:
             split_files = set(self.meta.splits.get(split, []))
             self.keys = [
                 (a.speaker, a.file_name)
@@ -124,7 +132,7 @@ class MelUnitsDataset(BaseDirDataset):
             "f0": f0,
             "rms": rms,
             "units": units,
-            "spk_id": self.spk2idx.get(spk, 0),
+            "spk_id": self.spk2idx[spk] if getattr(self, "strict_speakers", False) else self.spk2idx.get(spk, 0),
         }
 
     def _augment(self, item: dict) -> dict:

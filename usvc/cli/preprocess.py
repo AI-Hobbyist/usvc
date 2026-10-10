@@ -52,6 +52,7 @@ def _resolve_specs(args) -> list[FeatureSpec]:
 def _cmd_init(args) -> None:
     dataset_dir = Path(args.dataset_dir)
     sr, hop = args.sr, args.hop
+    previous = load_meta(dataset_dir) if (dataset_dir / "meta.json").exists() else None
     discovered = prepare_audio_dir(args.src, dataset_dir, sr=sr, extensions=tuple(args.ext))
 
     from ..data.meta import AudioEntry
@@ -59,6 +60,10 @@ def _cmd_init(args) -> None:
 
     meta = init_dataset_meta(dataset_dir, sr=sr, hop=hop, f0_min=float(args.f0_min), f0_max=float(args.f0_max))
     meta.speakers = sorted({spk for spk, _ in discovered})
+    if previous is not None:
+        if set(previous.speakers) != set(meta.speakers):
+            raise ValueError("speaker set changed; refusing to replace fixed dataset identities")
+        meta.speakers = previous.speakers
     meta.audios = []
     for spk, file_name in discovered:
         n = len(load_audio(dataset_dir / "audio" / spk / file_name, sr=sr))

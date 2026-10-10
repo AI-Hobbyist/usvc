@@ -13,6 +13,7 @@ __all__ = ["DDSPDataset"]
 
 
 class DDSPDataset(MelUnitsDataset):
+    strict_speakers = True
     def __init__(
         self,
         dataset_dir: str,
