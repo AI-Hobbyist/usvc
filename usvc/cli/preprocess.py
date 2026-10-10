@@ -112,7 +112,7 @@ def main(argv=None) -> int:
     raw = {}
     if getattr(args, "train_cfg", None):
         import yaml
-        with open(args.train_cfg) as f: raw = yaml.safe_load(f) or {}
+        with open(args.train_cfg, encoding="utf-8") as f: raw = yaml.safe_load(f) or {}
         backend_opts = dict(raw.get("backend_opts", {}) or {})
         for k in ("units_kind", "units_ckpt", "f0_extractor", "rmvpe_ckpt", "uv_policy", "n_mels",
                   "fmin", "fmax", "rvc_version", "version", "use_pitch_aug"):

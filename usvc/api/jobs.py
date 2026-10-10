@@ -41,7 +41,7 @@ class JobError(Exception):
 
 #: infer param -> usvc-infer CLI value flag (None = omit, CLI default applies)
 _INFER_VALUE_FLAGS = {
-    "vocoder_dir": "--vocoder-dir", "spk": "--spk", "trans": "--trans", "steps": "--steps",
+    "vocoder_dir": "--vocoder-dir", "spk": "--spk", "speaker": "--speaker", "trans": "--trans", "steps": "--steps",
     "resample_sr": "--resample-sr", "noice_scale": "--noice-scale",
     "formant_shift": "--formant-shift", "vocal_register_shift": "--vocal-register-shift",
     "f0_method": "--f0-method", "device": "--device", "index_path": "--index-path",
@@ -70,6 +70,8 @@ def _train_argv(params):
 
 
 def _infer_argv(params):
+    if params.get("spk") is not None and params.get("speaker") is not None:
+        raise JobError("spk and speaker are mutually exclusive")
     missing = [k for k in ("input", "config", "ckpt") if not params.get(k)]
     if missing: raise JobError(f"infer job requires params: {', '.join(missing)}")
     argv = [sys.executable, "-m", "usvc.cli.infer", str(params["input"]),
@@ -160,6 +162,8 @@ class JobScheduler:  # registration, subprocess exec with streamed logs, GPU mut
     async def submit(self, kind, params=None) -> Job:
         if kind not in KINDS: raise JobError(f"unknown job kind: {kind!r}; available: {sorted(KINDS)}")
         if kind == "infer":
+            if (params or {}).get("spk") is not None and (params or {}).get("speaker") is not None:
+                raise JobError("spk and speaker are mutually exclusive")
             missing = [k for k in ("input", "config", "ckpt") if not (params or {}).get(k)]
             if missing: raise JobError(f"infer job requires params: {', '.join(missing)}")
         if kind == "train" and not (params or {}).get("config"):

@@ -84,7 +84,15 @@ class TrainConfig:
     @classmethod
     def from_yaml(cls, path):
         with open(path, encoding="utf-8") as f:
-            d = yaml.safe_load(f)
+            source = f.read()
+        d = yaml.safe_load(source)
+        if d.get("backend") in ("ddsp6", "sovits") and d.get("spk") is not None:
+            node = yaml.compose(source)
+            for key, value in node.value:
+                if key.value == "spk" and isinstance(value, yaml.MappingNode):
+                    names = [name.value for name, _ in value.value if isinstance(name, yaml.ScalarNode)]
+                    if len(set(names)) != len(names):
+                        raise ValueError("duplicate speaker names in YAML spk mapping")
         bo = dict(d.get("backend_opts", {}) or {})
         for k in cls._FEATURE_OVERRIDE_KEYS:
             if k in d and k not in bo:

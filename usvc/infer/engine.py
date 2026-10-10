@@ -125,6 +125,11 @@ class InferenceEngine:
                  reflow_ckpt=None, reflow_config=None, t_start=0.6,
                  compile_graph=False, dec_cl=True, vocoder_cl=True, impl=None):
         from .._device import resolve_impl
+        self.cfg = TrainConfig.from_yaml(config_path)
+        self.backend_name = self.cfg.backend
+        if self.backend_name in ("ddsp6", "sovits"):
+            from ..speakers import load_model_speakers
+            self.speaker_mapping, self.speaker_capacity = load_model_speakers(self.cfg, ckpt_path)
         if resolve_impl(impl) == "mlx":  # 委托 MlxInferenceEngine, torch 路径零改动
             from .mlx_engine import MlxInferenceEngine
             self._mlx_delegate = MlxInferenceEngine(
@@ -134,8 +139,6 @@ class InferenceEngine:
             self.impl = "mlx"
             return
         self.impl = "torch"
-        self.cfg = TrainConfig.from_yaml(config_path)
-        self.backend_name = self.cfg.backend
         if self.backend_name not in MEL_DOMAIN + WAV_DOMAIN:
             raise ValueError(f"unknown backend: {self.backend_name}")
         self.device, self.half, self.ckpt_path = device, half, str(ckpt_path)
@@ -299,13 +302,25 @@ class InferenceEngine:
                                    f"{real_missing[:8]}")
 
     def _enhance_units(self, units, index_path=None, index_ratio=0.0,
-                       cluster_path=None, cluster_ratio=0.0):
+                       cluster_path=None, cluster_ratio=0.0, spk=None):
+        mapping = getattr(self, "speaker_mapping", None)
+        name = next((n for n, i in (mapping or {}).items() if i == spk), None)
         if index_path and index_ratio > 0:
             data = torch.load(index_path, map_location="cpu", weights_only=False)
+            if self.backend_name == "sovits" and isinstance(data, dict) and data.get("spk_id") is not None:
+                if name is None or data["spk_id"] != name:
+                    raise ValueError("retrieval index belongs to a different speaker")
             vectors = data["vectors"] if isinstance(data, dict) and "vectors" in data else data
+            if vectors.ndim != 2 or vectors.shape[1] != units.shape[-1]:
+                raise ValueError("retrieval feature dimension mismatch")
             units = retrieve(vectors.to(self.device), units, ratio=index_ratio)
         if cluster_path and cluster_ratio > 0:
             data = torch.load(cluster_path, map_location="cpu", weights_only=False)
+            if self.backend_name == "sovits" and isinstance(data, dict) and "cluster_centers_" not in data:
+                if name is not None and name in data:
+                    data = data[name]
+                elif name is not None or getattr(self, "speaker_capacity", 1) > 1 or "kind" in data:
+                    raise ValueError("cluster payload has no resource for the target speaker")
             if isinstance(data, dict) and "cluster_centers_" in data:
                 centers = data["cluster_centers_"]
             elif isinstance(data, dict) and len(data) == 1 and isinstance(
@@ -313,11 +328,13 @@ class InferenceEngine:
                 centers = next(iter(data.values()))["cluster_centers_"]  # {spk: {...}}
             else:
                 centers = data
+            if centers.ndim != 2 or centers.shape[1] != units.shape[-1]:
+                raise ValueError("cluster feature dimension mismatch")
             units = apply_cluster(centers.to(self.device), units, ratio=cluster_ratio)
         return units
 
     @torch.no_grad()
-    def convert(self, input_wav, spk=0, trans=0, index_path=None, index_ratio=0.0,
+    def convert(self, input_wav, spk=None, trans=0, index_path=None, index_ratio=0.0,
                 cluster_path=None, cluster_ratio=0.0, steps=None,
                 shallow_diffusion=False, k_step=100, diffusion_method="ddim",
                 diffusion_speedup=10, t_start=None, reflow_steps=20,
@@ -328,11 +345,18 @@ class InferenceEngine:
         """wav -> float32 wav @ backend sr. 长音频按静音分块 (RMS 阈值), 超块强制切
         最低能量帧 + 短交叉淡化; 各参数语义见 cli/infer.py --help."""
         import numpy as np
+        if self.backend_name in ("ddsp6", "sovits"):
+            from ..speakers import resolve_speaker
+            spk = resolve_speaker(spk, self.speaker_mapping, self.speaker_capacity)
+        elif spk is None:
+            spk = 0
         if self.impl == "mlx":
             return self._mlx_delegate.convert(input_wav, spk=spk, trans=trans)
         if shallow_diffusion and self._shallow_enhancer is None:
             raise ValueError("shallow_diffusion=True requires diffusion_ckpt+diffusion_config "
                              "or reflow_ckpt+reflow_config at engine construction (sovits/rvc)")
+        if shallow_diffusion and self.reflow_enhancer is not None:
+            self._resolve_enhancer_speaker(spk)
         _t_start = self.t_start if t_start is None else float(t_start)
         original_loudness: float | None = None
         if target_loudness is not None:
@@ -353,7 +377,7 @@ class InferenceEngine:
             f0 = f0 * (2.0 ** (trans / 12))
         units_src = units
         units = self._enhance_units(units, index_path, index_ratio,
-                                    cluster_path, cluster_ratio)
+                                    cluster_path, cluster_ratio, spk=spk)
         # protect < 0.5: 清音帧把增强前特征混回 (rms>1e-4 判 voiced; RVC f0 插值后恒>0)
         if protect < 0.5 and rms is not None and units is not units_src:
             units = self._protect_units(units, units_src, rms, protect)
@@ -392,6 +416,19 @@ class InferenceEngine:
         pitchff = torch.where(rms > 1e-4, torch.full_like(rms, protect),
                               torch.ones_like(rms)).unsqueeze(-1)  # voiced=protect, 清音=1
         return units * pitchff + units_src * (1 - pitchff)
+
+    def _resolve_enhancer_speaker(self, spk):
+        enhancer = self.reflow_enhancer
+        main_capacity = getattr(self, "speaker_capacity", self.cfg.backend_opts.get("num_speaker", 1))
+        capacity = getattr(enhancer, "speaker_capacity", 1)
+        if main_capacity == capacity == 1:
+            return 0
+        mapping = getattr(self, "speaker_mapping", None)
+        name = next((n for n, i in (mapping or {}).items() if i == spk), None)
+        from ..speakers import resolve_speaker
+        if name is None or getattr(enhancer, "speaker_mapping", None) is None:
+            raise ValueError("multi-speaker enhancer requires verified matching speaker names")
+        return resolve_speaker(name, enhancer.speaker_mapping, capacity)
 
     def _find_silence_boundaries(self, rms, T, max_chunk_frames, crossfade_frames):
         """静音切分: 贪心累积到 max_frames, 超过则切最近静音中心; 无静音则切
@@ -515,7 +552,8 @@ class InferenceEngine:
             units_in = _resample_units(units, enh_frames)
             rms_in = _resample_f0(rms, enh_frames) if rms_in is not None else None
         if self.reflow_enhancer is not None:
-            enh_out = self.reflow_enhancer.enhance(units_in, f0_in, rms_in, spk, wav_in,
+            enhancer_spk = self._resolve_enhancer_speaker(spk)
+            enh_out = self.reflow_enhancer.enhance(units_in, f0_in, rms_in, enhancer_spk, wav_in,
                                                    t_start=t_start, infer_step=reflow_steps)
         else:
             enh_out = self.diffusion_enhancer.enhance(units_in, f0_in, rms_in, spk, wav_in,

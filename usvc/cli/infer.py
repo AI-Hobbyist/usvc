@@ -11,14 +11,17 @@ from pathlib import Path
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="usvc-infer", description=(
         "Offline SVC inference (all backends: rift_dit/ddsp6/diffusion/sovits/rvc/reflow_vae)."))
-    p.add_argument("input", help="input wav path")
+    p.add_argument("input", nargs="?", help="input wav path")
     p.add_argument("--config", "-c", required=True, help="training config yaml")
     p.add_argument("--ckpt", required=True, help="model checkpoint (.ckpt)")
     p.add_argument("--output", "-o", default=None,
                    help="output wav path (default: out_<input>_<backend>.wav)")
     p.add_argument("--vocoder-dir", default=None,
                    help="NSF-HiFiGAN dir with config.json + model.ckpt (default usvc/pretrained/nsf_hifigan; mel-domain only)")
-    p.add_argument("--spk", type=int, default=0, help="speaker id")
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument("--spk", type=int, default=None, help="zero-based speaker id")
+    selection.add_argument("--speaker", default=None, help="speaker name from the model mapping")
+    p.add_argument("--list-speakers", action="store_true", help="list speakers without loading feature models")
     p.add_argument("--trans", type=int, default=0, help="pitch shift in semitones")
     p.add_argument("--steps", type=int, default=None, help="sampling steps (flow/diff backends)")
     p.add_argument("--resample-sr", type=int, default=None,
@@ -75,11 +78,27 @@ def main(argv=None) -> int:
     p.add_argument("--no-restore-loudness", action="store_true",
                    help="skip restoring output loudness to input's original loudness")
     args = p.parse_args(argv)
+    from ..train.config import TrainConfig
+    from ..speakers import load_model_speakers, resolve_speaker, TARGET_BACKENDS
+    cfg = TrainConfig.from_yaml(args.config)
+    chosen = args.speaker if args.speaker is not None else args.spk
+    if cfg.backend in TARGET_BACKENDS:
+        mapping, capacity = load_model_speakers(cfg, args.ckpt)
+        if args.list_speakers:
+            print(f"capacity: {capacity}")
+            for i in range(capacity):
+                print(f"{i}\t{next((n for n, sid in (mapping or {}).items() if sid == i), '(name unavailable)')}")
+            return 0
+        resolve_speaker(chosen, mapping, capacity)
+    elif args.speaker is not None or args.list_speakers:
+        p.error("name selection and speaker listing support ddsp6/sovits")
+    if args.input is None:
+        p.error("input is required unless --list-speakers is used")
 
     backend_name = ""
     try:
         import yaml
-        with open(args.config) as f: backend_name = str(yaml.safe_load(f).get("backend", ""))
+        with open(args.config, encoding="utf-8") as f: backend_name = str(yaml.safe_load(f).get("backend", ""))
     except Exception:
         pass
     use_half = args.half or (backend_name == "rvc" and not args.no_half)
@@ -97,7 +116,7 @@ def main(argv=None) -> int:
         output = f"out_{Path(args.input).stem}_{engine.backend_name}.wav"
 
     engine.convert_file(
-        args.input, output, spk=args.spk, trans=args.trans, steps=args.steps,
+        args.input, output, spk=chosen, trans=args.trans, steps=args.steps,
         index_path=args.index_path, index_ratio=args.index_ratio,
         cluster_path=args.cluster_path, cluster_ratio=args.cluster_ratio,
         shallow_diffusion=args.shallow_diffusion, k_step=args.k_step,

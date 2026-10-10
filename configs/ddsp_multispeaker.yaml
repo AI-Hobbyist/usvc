@@ -1,9 +1,9 @@
 # DDSP-SVC 6.5: dual-timestep rectified flow + RMSNorm + SoftSign GLU.
 # PyTorch backend. 6.1-6.3 checkpoints are incompatible with this architecture.
 # Preprocess with this same config so pitch-augmented features are registered:
-#   usvc-preprocess run data/my_dataset --backend ddsp6 --train-cfg configs/ddsp65.yaml
+#   usvc-preprocess run data/multi --backend ddsp6 --train-cfg configs/ddsp_multispeaker.yaml
 # Train:
-#   usvc-train --config configs/ddsp65.yaml
+#   usvc-train --config configs/ddsp_multispeaker.yaml
 backend: ddsp6
 dataset_dir: data/multi
 spk:

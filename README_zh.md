@@ -252,6 +252,29 @@ usvc-infer             # 离线推理（所有后端）
 - [NSF-HiFiGAN](https://github.com/openvpi/SingingVocoders) — 神经源滤波器声码器
 - [RMVPE](https://github.com/yxliang20/RMVPE) / [FCPE](https://github.com/CNChTu/FCPE) — 基频提取
 
+## DDSP / SoVITS 多说话人
+
+专用模板为 `configs/ddsp_multispeaker.yaml`（6.5，可改为6.1/6.2/6.3）和
+`configs/sovits_multispeaker.yaml`。现有 USVC 配置仍可使用；新增顶层 `spk` 是名称到零基整数的映射，
+`backend_opts.num_speaker` 必须等于映射容量。未写 `spk` 的新训练按训练 meta 顺序固定映射。
+原始数据按 `<src>/<说话人>/<音频>` 放置；split 使用 `说话人/文件名` 避免同名音频歧义。
+预处理与训练使用同一配置。训练目录保存已解析 `config.yaml`；完整 checkpoint 与导出权重均携带映射。
+
+```powershell
+usvc-preprocess init data/multi --src data/multi_raw
+usvc-preprocess run data/multi --backend ddsp6 --train-cfg configs/ddsp_multispeaker.yaml
+usvc-train --config configs/ddsp_multispeaker.yaml
+usvc-export --ckpt experiments/ddsp_multi/last.ckpt -o experiments/ddsp_multi/model.pth
+usvc-infer --config experiments/ddsp_multi/model.yaml --ckpt experiments/ddsp_multi/model.pth --list-speakers
+usvc-infer input.wav --config experiments/ddsp_multi/model.yaml --ckpt experiments/ddsp_multi/model.pth --speaker '歌手乙' -o output.wav
+```
+
+多人推理必须提供互斥的 `--speaker <名称>` 或 `--spk <整数>`；单人默认ID0。
+旧无映射多人权重仅接受显式数字；名称需要可信的训练映射，不能从目录猜测 embedding 行。
+恢复训练拒绝角色新增、删除或行语义变化。SoVITS 聚类与每角色 `.pt` 索引跟随目标名称选择；
+DDSP 增强器的多人组合也需可验证的同名对应关系。`usvc-serve` job 参数支持互斥的 `speaker` / `spk`。
+本次多说话人验收针对 Windows/PyTorch；MLX 多说话人仍为待验收。
+
 ## 许可证
 
 MIT

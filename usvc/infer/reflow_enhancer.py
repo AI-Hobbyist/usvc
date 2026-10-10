@@ -19,7 +19,10 @@ class ReflowEnhancer:
     def __init__(self, reflow_ckpt, reflow_config, vocoder_dir, device="cuda",
                  sr=44100, hop=512):
         self.device = device
-        cfg = yaml.safe_load(open(reflow_config)) or {}
+        with open(reflow_config, encoding="utf-8") as stream:
+            cfg = yaml.safe_load(stream) or {}
+        self.speaker_mapping = cfg.get("spk")
+        self.speaker_capacity = cfg.get("backend_opts", {}).get("num_speaker", cfg.get("model", {}).get("n_spk", 1))
         m = cfg.get("model", cfg)  # DDSP6 usvc 配置的参数在 model 下, 裸配置在顶层
         self.n_units = int(m.get("n_unit", cfg.get("n_unit", 768)))
         win_length = int(m.get("win_length", cfg.get("win_length", 2048)))
@@ -40,9 +43,20 @@ class ReflowEnhancer:
             self._load_shallow_weights(reflow_ckpt)
             self.shallow_model.eval().to(device)
             self.ddsp_model = None
+        elif cfg.get("backend") == "ddsp6":
+            from ..train.config import TrainConfig
+            from ..speakers import load_model_speakers
+            from ..backends.ddsp6.module import DDSPModule
+            train_cfg = TrainConfig.from_yaml(reflow_config)
+            self.speaker_mapping, self.speaker_capacity = load_model_speakers(train_cfg, reflow_ckpt)
+            self.ddsp_model = DDSPModule(train_cfg).model
+            self.n_units = train_cfg.backend_opts.get("n_units", 768)
+            self._load_reflow_weights(reflow_ckpt)
+            self.ddsp_model.eval().to(device)
+            self.shallow_model = None
         else:
             self.ddsp_model = DDSP6Model(
-                n_units=self.n_units, n_spk=1, win_length=win_length,
+                n_units=self.n_units, n_spk=self.speaker_capacity, win_length=win_length,
                 sampling_rate=44100, block_size=512,
                 n_aux_layers=int(m.get("n_aux_layers", cfg.get("n_aux_layers", 6))),
                 n_aux_chans=int(m.get("n_aux_chans", cfg.get("n_aux_chans", 512))),
@@ -54,7 +68,7 @@ class ReflowEnhancer:
             self.shallow_model = None
         self.mel_extractor = mel_ext(mel_cfg, 44100, 512, device,
                                      win=win_length, fmax=16000.0)
-        self.units_kind = str(cfg.get("units_kind", "contentvec"))
+        self.units_kind = str(cfg.get("units_kind", cfg.get("backend_opts", {}).get("units_kind", "contentvec")))
         self.units_extractor = units_ext(
             self.units_kind,
             cfg.get("units_ckpt", "pretrained/contentvec/pytorch_model.bin"),

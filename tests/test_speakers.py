@@ -57,3 +57,10 @@ def test_existing_configs_are_compatible(tmp_path, filename):
     meta.speakers = ["原有角色"]
     assert resolve_training_speakers(cfg, meta) == {"原有角色": 0}
     assert cfg.backend_opts["num_speaker"] == 1
+
+
+def test_duplicate_yaml_names_are_rejected(tmp_path):
+    path = tmp_path / "duplicate.yaml"
+    path.write_text("backend: ddsp6\nspk:\n  甲: 0\n  甲: 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate speaker"):
+        TrainConfig.from_yaml(path)

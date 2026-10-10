@@ -69,6 +69,8 @@ def bind_dataset_speakers(ds, mapping, *, training=False):
 
 
 def resolve_speaker(selection, mapping, capacity):
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("speaker capacity must be a positive integer")
     if mapping is not None:
         mapping = validate_mapping(mapping)
         if len(mapping) != capacity:
@@ -84,3 +86,31 @@ def resolve_speaker(selection, mapping, capacity):
     if type(selection) is not int or not 0 <= selection < capacity:
         raise ValueError(f"speaker ID must be an integer in 0..{capacity - 1}")
     return selection
+
+
+def load_model_speakers(cfg, path):
+    """Resolve metadata separately from weight unwrapping, before building any GPU model."""
+    import torch
+    from .train.speaker_checkpoint import read_speaker_metadata
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    metadata = read_speaker_metadata(payload)
+    mapping = validate_mapping(cfg.spk) if cfg.spk is not None else None
+    if metadata is not None:
+        if mapping is not None and mapping != metadata["spk"]:
+            raise ValueError("configuration/checkpoint speaker mapping mismatch")
+        mapping = metadata["spk"]
+    sd = payload.get("state_dict", payload.get("model", payload.get("weight", payload)))
+    rows = {v.shape[0] for k, v in sd.items()
+            if k.endswith(("spk_embed.weight", "emb_g.weight")) and torch.is_tensor(v)}
+    if len(rows) > 1:
+        raise ValueError("checkpoint has inconsistent speaker embedding capacities")
+    capacity = cfg.backend_opts.get("num_speaker", len(mapping) if mapping is not None else next(iter(rows), 1))
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("invalid speaker capacity")
+    if rows and rows != {capacity}:
+        raise ValueError("configuration/checkpoint embedding capacity mismatch")
+    if mapping is not None and len(mapping) != capacity:
+        raise ValueError("configuration/checkpoint speaker capacity mismatch")
+    cfg.spk = mapping
+    cfg.backend_opts["num_speaker"] = capacity
+    return mapping, capacity

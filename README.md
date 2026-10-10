@@ -263,6 +263,21 @@ This framework is built upon the work of these projects:
 - [NSF-HiFiGAN](https://github.com/openvpi/SingingVocoders) — Neural source-filter vocoder
 - [RMVPE](https://github.com/yxliang20/RMVPE) / [FCPE](https://github.com/CNChTu/FCPE) — F0 extraction
 
+## DDSP / SoVITS multiple speakers
+
+Use `configs/ddsp_multispeaker.yaml` (6.5, also supports 6.1/6.2/6.3) or
+`configs/sovits_multispeaker.yaml`. Existing USVC configs remain compatible.
+Top-level `spk` maps names to contiguous zero-based IDs; `backend_opts.num_speaker` must match.
+Without `spk`, new training fixes the mapping from training metadata. Place source clips under
+`<source>/<speaker>/<file>` and use `speaker/file_name` split identities. Preprocess with the same
+training config. Checkpoints and exports preserve mappings; exports include an adjacent `.yaml` config.
+Use `--list-speakers` without an input file, then select `--speaker <name>` or `--spk <integer>`.
+Multiple speakers require an explicit selection; a single speaker defaults to ID 0.
+Legacy unmapped multi-speaker weights require explicit numeric IDs. Full resume rejects changed
+speaker identities or architecture. SoVITS resources and multi-speaker DDSP enhancement follow
+verified target names. Existing `usvc-serve` jobs accept mutually exclusive `speaker` and `spk`.
+Multi-speaker validation targets Windows/PyTorch; MLX remains pending validation.
+
 ## License
 
 MIT
