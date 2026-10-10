@@ -19,10 +19,23 @@ from __future__ import annotations
 
 import os
 import shutil
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 _HF_REPO = "baicai1145/usvc-pretrained"
 _MS_REPO = "baicai1145/usvc-pretrained"  # ModelScope uses the same path layout
+_LOCAL_ONLY = ContextVar("usvc_local_pretrained_only", default=False)
+
+
+@contextmanager
+def local_pretrained_only():
+    """A service execution must never trigger automatic downloads."""
+    token = _LOCAL_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _LOCAL_ONLY.reset(token)
 
 
 def pretrained_dir() -> Path:
@@ -100,6 +113,8 @@ def ensure_pretrained(relative_path: str | Path) -> str:
     local = _resolve(relative_path)
     if local.exists():
         return str(local)
+    if _LOCAL_ONLY.get():
+        raise FileNotFoundError(f"Required local pretrained resource is missing: {local}")
 
     # Determine the remote path (without "pretrained/" prefix).
     rel = str(relative_path).replace("\\", "/")
@@ -134,6 +149,8 @@ def ensure_dir(relative_dir: str | Path) -> str:
     local = _resolve(relative_dir)
     if local.exists() and any(local.iterdir()):
         return str(local)
+    if _LOCAL_ONLY.get():
+        raise FileNotFoundError(f"Required local pretrained directory is missing: {local}")
 
     rel = str(relative_dir).replace("\\", "/")
     if rel.startswith("pretrained/"):

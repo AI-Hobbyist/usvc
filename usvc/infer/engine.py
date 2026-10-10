@@ -123,9 +123,11 @@ class InferenceEngine:
     def __init__(self, config_path, ckpt_path, vocoder_dir=None, device="cuda",
                  half=False, diffusion_ckpt=None, diffusion_config=None,
                  reflow_ckpt=None, reflow_config=None, t_start=0.6,
-                 compile_graph=False, dec_cl=True, vocoder_cl=True, impl=None):
+                 compile_graph=False, dec_cl=True, vocoder_cl=True, impl=None, config_override=None,
+                 strict_shapes=False):
         from .._device import resolve_impl
-        self.cfg = TrainConfig.from_yaml(config_path)
+        self.cfg = config_override if config_override is not None else TrainConfig.from_yaml(config_path)
+        self.strict_shapes = strict_shapes
         self.backend_name = self.cfg.backend
         if self.backend_name in ("ddsp6", "sovits"):
             from ..speakers import load_model_speakers
@@ -269,7 +271,7 @@ class InferenceEngine:
         # shape 不匹配的键跳过 (如 num_speaker 不同的 emb_g)
         skipped_shape = {k for k, v in remapped.items()
                          if k in module_sd_flat and v.shape != module_sd_flat[k].shape}
-        if self.backend_name in ("ddsp6", "sovits") and skipped_shape:
+        if (self.backend_name in ("ddsp6", "sovits") or getattr(self, "strict_shapes", False)) and skipped_shape:
             raise RuntimeError(f"inference weight shape mismatch: {sorted(skipped_shape)[:8]}")
         filtered = {k: v for k, v in remapped.items() if k not in skipped_shape}
         flat_to_real = {k.replace("._orig_mod.", "."): k for k in module_sd}

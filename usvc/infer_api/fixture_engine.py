@@ -8,6 +8,7 @@ from ..train.dataset import SVCBatch
 def load_network(model, device="cpu"):
     engine = InferenceEngine.__new__(InferenceEngine)
     engine.backend_name, engine.ckpt_path = model.backend, str(model.checkpoint)
+    engine.strict_shapes = True
     module = get_backend(model.backend)().build_module(model.cfg)
     engine._load_weights(module)
     return module.eval().to(device)
