@@ -42,7 +42,7 @@ def main(argv=None) -> int:
     p.add_argument("--no-half", action="store_true", help="强制 fp32 推理（rvc 也关闭 fp16）")
     p.add_argument("--compile-graph", action="store_true",
                    help="torch.compile the generator/model (reduce-overhead CUDA graph)")
-    p.add_argument("--index-path", default=None, help="retrieval index .pt (RVC style)")
+    p.add_argument("--index-path", default=None, help="retrieval .pt or native RVC .index (requires rvc-index extra)")
     p.add_argument("--index-ratio", type=float, default=0.0, help="retrieval blend ratio (0-1)")
     p.add_argument("--cluster-path", default=None, help="cluster model .pt (so-vits style)")
     p.add_argument("--cluster-ratio", type=float, default=0.0, help="cluster blend ratio (0-1)")

@@ -24,6 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rvc-index = ["faiss-cpu>=1.8,<2"]
 # Training stack: lightning + schedulefree optimizer
 train = [
     "lightning>=2.4",

@@ -151,9 +151,11 @@ def test_cluster_builder_integration():
 
 
 def test_pyproject_no_faiss_dependency():
-    """pyproject.toml must not require faiss."""
-    content = Path("pyproject.toml").read_text()
-    assert "faiss" not in content, "pyproject.toml still references faiss"
+    """Base install keeps FAISS optional; native RVC indexes have an explicit extra."""
+    content = Path("pyproject.toml").read_text(encoding="utf-8")
+    base, extras = content.split("[project.optional-dependencies]")
+    assert "faiss" not in base
+    assert 'rvc-index = ["faiss-cpu' in extras
 
 
 if __name__ == "__main__":

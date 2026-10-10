@@ -305,6 +305,14 @@ class InferenceEngine:
                        cluster_path=None, cluster_ratio=0.0, spk=None):
         mapping = getattr(self, "speaker_mapping", None)
         name = next((n for n, i in (mapping or {}).items() if i == spk), None)
+        if index_path and index_ratio > 0 and Path(index_path).suffix.lower() == ".index":
+            if self.backend_name != "rvc":
+                raise ValueError("native .index retrieval supports the RVC backend")
+            from ..retrieval.faiss_index import NativeIndexCache
+            if not hasattr(self, "_native_index_cache"):
+                self._native_index_cache = NativeIndexCache()
+            units = self._native_index_cache.retrieve(index_path, units, ratio=index_ratio)
+            index_path = None
         if index_path and index_ratio > 0:
             data = torch.load(index_path, map_location="cpu", weights_only=False)
             if self.backend_name == "sovits" and isinstance(data, dict) and data.get("spk_id") is not None:

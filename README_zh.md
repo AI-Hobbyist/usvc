@@ -275,6 +275,10 @@ usvc-infer input.wav --config experiments/ddsp_multi/model.yaml --ckpt experimen
 DDSP 增强器的多人组合也需可验证的同名对应关系。`usvc-serve` job 参数支持互斥的 `speaker` / `spk`。
 本次多说话人验收针对 Windows/PyTorch；MLX 多说话人仍为待验收。
 
+RVC 的 `--index-path` 同时接受现有 `.pt` 与原生 `.index`。原生格式需安装 `.[rvc-index]` extra，
+支持 L2 Flat / IVF Flat，保留保存的 IVF `nprobe`，使用有预算限制的 CPU 缓存；比例0跳过索引。
+完整操作与各后端说话人支持范围见 [训练推理教程](训练推理教程.md)。
+
 ## 许可证
 
 MIT

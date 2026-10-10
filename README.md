@@ -278,6 +278,10 @@ speaker identities or architecture. SoVITS resources and multi-speaker DDSP enha
 verified target names. Existing `usvc-serve` jobs accept mutually exclusive `speaker` and `spk`.
 Multi-speaker validation targets Windows/PyTorch; MLX remains pending validation.
 
+Native RVC `.index` retrieval is available with the `rvc-index` extra alongside existing `.pt` retrieval.
+L2 Flat / IVF Flat search preserves the saved `nprobe` and uses a bounded CPU cache.
+See [the training and inference tutorial (Chinese)](训练推理教程.md) for commands and speaker support by backend.
+
 ## License
 
 MIT
