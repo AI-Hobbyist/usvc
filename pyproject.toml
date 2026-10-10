@@ -53,6 +53,7 @@ usvc-index = "usvc.retrieval.cli:main_index"
 usvc-cluster = "usvc.retrieval.cli:main_cluster"
 usvc-checkenv = "usvc._envcheck:main"
 usvc-serve = "usvc.api.main:main"
+usvc-infer-api = "usvc.infer_api.cli:main"
 
 [build-system]
 requires = ["hatchling"]
