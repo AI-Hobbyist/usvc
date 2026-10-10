@@ -608,6 +608,8 @@ class DDSP6Model(nn.Module):
         from .._convert import load_torch_ckpt_to_mlx, strip_prefix
 
         sd = load_torch_ckpt_to_mlx(ckpt_path, dtype=dtype)
+        if any("ddsp_model.unit2ctrl.residual_layers." in k for k in sd):
+            raise NotImplementedError("DDSP-SVC 6.5 checkpoints currently require the PyTorch backend")
         obj = cls(**config) if config is not None else cls(**cls._infer_config(sd))
         if any(k.startswith("model.") for k in sd):
             sd = strip_prefix(sd, "model.")  # 训练 ckpt 的 lightning 前缀

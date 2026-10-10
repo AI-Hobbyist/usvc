@@ -108,6 +108,35 @@ modelscope download --model baicai1145/usvc-pretrained --local_dir pretrained
 
 ## Quick start
 
+### DDSP-SVC 6.5
+
+The `ddsp6` backend supports 6.1, 6.2, 6.3 and 6.5; the default remains 6.3.
+Use `configs/ddsp65.yaml` for 6.5:
+
+```bash
+usvc-preprocess run data/my_dataset --backend ddsp6 --train-cfg configs/ddsp65.yaml
+usvc-train --config configs/ddsp65.yaml
+```
+
+6.5 adds dual-timestep training (25% of frames select a second timestep), RMSNorm,
+configurable SoftSign/ATan/double-SoftSign GLU and a new DDSP control network.
+Original 6.5 state-dict keys are preserved; 6.1–6.3 weights are incompatible.
+Local reference tests require identical FP32/CUDA BF16 losses and Euler/RK4 mel
+outputs with shared inputs, weights and random seeds, and numerically matching
+gradients (allowing CUDA STFT reduction rounding). The shared
+mel frontend is checked independently too.
+BF16 parity uses FP32 spectral controls on both sides: raw upstream BF16 complex
+operations fail on the current PyTorch, so usvc keeps 6.5 spectral synthesis in
+FP32 while preserving gradients.
+
+Differences from upstream: usvc uses zero-based speaker IDs and masks padded
+frames in the flow loss. Preprocessing retains usvc's frame alignment and RMS
+volume, whereas upstream uses centered-window standard deviation. Dataset
+features are therefore not guaranteed to match frame for frame. The template
+uses AdamW rather than upstream Muon+AdamW. Upstream-specific fused Triton training
+kernels are not ported; usvc's `compile_velocity` remains optional. 6.5 currently
+requires PyTorch; MLX explicitly rejects it.
+
 ### Inference
 
 ```bash

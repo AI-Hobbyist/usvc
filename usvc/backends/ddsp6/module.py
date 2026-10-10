@@ -4,6 +4,7 @@ backend_opts version selects DDSP-SVC release defaults (table in ../_defaults.py
 6.1 -> LYNXNet, n_aux_layers=3, n_aux_chans=256, n_chans=512, t_start=0.7, use_norm=False
 6.2 -> LYNXNet, n_aux_layers=6, n_aux_chans=512, n_chans=1024, t_start=0.0, use_norm=True
 6.3 -> LYNXNet2 (default), same dims as 6.2
+6.5 -> dual-timestep LYNXNet2 + RMSNorm + configurable GLU, same dims as 6.3
 Explicit opts always override version defaults.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ class DDSPModule(BaseSVCModule):
     def __init__(self, cfg: TrainConfig):
         super().__init__(cfg)
         opts = _resolve_opts(cfg.backend_opts)
+        is_v65 = opts.get("velocity_net") == "LYNXNet2_65"
         self.model = DDSP6Model(
             n_units=opts.get("n_units", 768),
             n_spk=opts.get("num_speaker", 1),
@@ -37,6 +39,9 @@ class DDSPModule(BaseSVCModule):
             n_chans=opts.get("n_chans", 1024),
             out_dims=opts.get("out_dims", 128),
             velocity_net=opts.get("velocity_net", "LYNXNet2"),
+            glu_type=opts.get("glu_type", "softsign_glu"),
+            use_pitch_aug=opts.get("use_pitch_aug", True) if is_v65 else True,
+            use_attention=opts.get("use_attention", False) if is_v65 else False,
         )
         # torch.compile velocity_fn（LYNXNet2 纯 conv 可安全编译；DDSP 谱路径含 complex STFT 不能编译）。
         # 实测 83→75ms/step (1.1×)，胶水 41%→28%；由 backend_opts.compile_velocity 开关，默认关

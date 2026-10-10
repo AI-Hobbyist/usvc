@@ -1,7 +1,8 @@
 """ddsp6 backend feature spec (DSP-002 §3.2), from DDSP-SVC-6.3 defaults (LYNXNet2).
 
 Version-aware: 6.1 units default to contentvec (non-tta2x, hop 320) + LYNXNet;
-6.2 units default to contentvec_tta2x + LYNXNet; 6.3 -> LYNXNet2. Same
+6.2 units default to contentvec_tta2x + LYNXNet; 6.3 -> LYNXNet2;
+6.5 -> dual-timestep LYNXNet2 (PyTorch). Same
 mel/f0/rms as rift_dit; user can switch to hubertsoft.
 """
 from __future__ import annotations

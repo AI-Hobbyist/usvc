@@ -104,6 +104,31 @@ modelscope download --model baicai1145/usvc-pretrained --local_dir pretrained
 
 ## 快速开始
 
+### DDSP-SVC 6.5
+
+`ddsp6` 后端支持 6.1、6.2、6.3 和 6.5，默认仍为 6.3。6.5 使用
+`configs/ddsp65.yaml` 模板：
+
+```bash
+usvc-preprocess run data/my_dataset --backend ddsp6 --train-cfg configs/ddsp65.yaml
+usvc-train --config configs/ddsp65.yaml
+```
+
+6.5 的核心变化是双时间步训练（25% 的帧选择第二时间步）、RMSNorm、
+可配置的 `softsign_glu` / `atanglu` / `double_softsign_glu`，以及新的 DDSP
+控制网络。新结构保持原版 6.5 权重键，6.1–6.3 权重不能作为 6.5 权重加载。
+在同一输入、权重和随机种子下，本地原版对照测试要求 FP32 / CUDA BF16
+训练损失、Euler / RK4 推理 mel 完全一致，梯度数值一致（共享 mel 前端也
+单独验证；CUDA STFT 梯度归约允许微小舍入误差）。
+BF16 对照在两侧都将频谱控制值提升为 FP32；当前 PyTorch 下，原版直接
+使用 BF16 复数运算会失败，usvc 6.5 保持频谱合成 FP32，梯度仍正常回传。
+
+与原版 6.5 的区别：usvc 说话人编号从 0 开始，支持变长批次的 flow 损失
+掩码；预处理继续使用 usvc 的统一帧对齐和 RMS 音量，原版音量为中心窗口
+标准差。因此，原版数据与 usvc 数据不保证逐帧一致。模板使用 AdamW，
+原版使用 Muon+AdamW；原版专用 Triton 融合训练核未移植，可选用 usvc 的
+`compile_velocity`。6.5 当前支持 PyTorch，MLX 会明确拒绝此版本。
+
 ### 推理
 
 ```bash

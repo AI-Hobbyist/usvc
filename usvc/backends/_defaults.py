@@ -15,6 +15,9 @@ DDSP6_VERSION_DEFAULTS = {
                 n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
     "6.3": dict(velocity_net="LYNXNet2", n_aux_layers=6, n_aux_chans=512,
                 n_layers=6, n_chans=1024, t_start=0.0, use_norm=True),
+    "6.5": dict(velocity_net="LYNXNet2_65", glu_type="softsign_glu",
+                n_aux_layers=6, n_aux_chans=512, n_layers=6, n_chans=1024,
+                t_start=0.0, use_norm=True),
 }
 
 

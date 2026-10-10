@@ -266,16 +266,23 @@ class Unit2Control(nn.Module):
 
 class CombSubSuperFast(nn.Module):
     def __init__(self, sampling_rate, block_size, win_length, n_unit=256, n_spk=1, num_layers=3,
-                 dim_model=256, use_norm=False, use_attention=False, use_pitch_aug=False, conv_block='linear'):
+                 dim_model=256, use_norm=False, use_attention=False, use_pitch_aug=False, conv_block='linear',
+                 glu_type='softsign_glu'):
         super().__init__()
         self.register_buffer('sampling_rate', torch.tensor(sampling_rate))
         self.register_buffer('block_size', torch.tensor(block_size))
         self.register_buffer('win_length', torch.tensor(win_length))
         self.register_buffer('window', torch.hann_window(win_length))
+        self._spectral_fp32 = conv_block == '6.5'
         s = win_length // 2 + 1
-        self.unit2ctrl = Unit2Control(n_unit, block_size, n_spk,
-                                      dict(harmonic_magnitude=s, harmonic_phase=s, noise_magnitude=s, noise_phase=s),
-                                      num_layers, dim_model, use_norm, use_attention, use_pitch_aug, conv_block)
+        splits = dict(harmonic_magnitude=s, harmonic_phase=s, noise_magnitude=s, noise_phase=s)
+        if conv_block == '6.5':
+            from .v65 import Unit2Control65
+            self.unit2ctrl = Unit2Control65(n_unit, block_size, n_spk, splits,
+                                           num_layers, dim_model, use_pitch_aug, glu_type)
+        else:
+            self.unit2ctrl = Unit2Control(n_unit, block_size, n_spk, splits,
+                                          num_layers, dim_model, use_norm, use_attention, use_pitch_aug, conv_block)
 
     def fast_source_gen(self, f0_frames):
         n = torch.arange(self.block_size, device=f0_frames.device)
@@ -296,6 +303,10 @@ class CombSubSuperFast(nn.Module):
         ctrls, hidden = self.unit2ctrl(units_frames, combtooth.unfold(1, self.block_size, self.block_size),
                                        noise.unfold(1, self.block_size, self.block_size), volume_frames,
                                        spk_id=spk_id, spk_mix_dict=spk_mix_dict, aug_shift=aug_shift)
+        if self._spectral_fp32:
+            # AMP linear outputs may be BF16; PyTorch cannot multiply BComplex32.
+            # Keep the 6.5 spectral synthesis in FP32 without detaching gradients.
+            ctrls = {key: value.float() for key, value in ctrls.items()}
         src_filter = torch.exp(ctrls['harmonic_magnitude'] + 1.j * math.pi * ctrls['harmonic_phase'])
         src_filter = torch.cat((src_filter, src_filter[:, -1:, :]), 1)
         noise_filter = torch.exp(ctrls['noise_magnitude'] + 1.j * math.pi * ctrls['noise_phase']) / 128
@@ -423,21 +434,28 @@ class MelExtractor:
 class Unit2Wav(nn.Module):
     def __init__(self, sampling_rate, block_size, win_length, n_unit, n_spk, use_norm=False,
                  use_attention=False, use_pitch_aug=False, out_dims=128, n_aux_layers=3, n_aux_chans=256,
-                 n_layers=6, n_chans=512, mel_extractor=None, velocity_net="LYNXNet2"):
+                 n_layers=6, n_chans=512, mel_extractor=None, velocity_net="LYNXNet2", glu_type='softsign_glu'):
         super().__init__()
         self.sampling_rate, self.block_size = sampling_rate, block_size
         self.velocity_net = velocity_net
-        if velocity_net not in ("LYNXNet", "LYNXNet2"):
-            raise ValueError(f"unknown velocity_net {velocity_net!r} (expected 'LYNXNet' or 'LYNXNet2')")
-        conv_block = "conv1d" if velocity_net == "LYNXNet" else "linear"  # 6.1/6.2 conv backbone, 6.3 linear
+        if velocity_net not in ("LYNXNet", "LYNXNet2", "LYNXNet2_65"):
+            raise ValueError(f"unknown velocity_net {velocity_net!r}")
+        if velocity_net == "LYNXNet2_65" and use_attention:
+            raise ValueError("DDSP-SVC 6.5 does not have an attention backbone")
+        conv_block = "6.5" if velocity_net == "LYNXNet2_65" else "conv1d" if velocity_net == "LYNXNet" else "linear"
         self.ddsp_model = CombSubSuperFast(
             sampling_rate, block_size, win_length, n_unit, n_spk,
             n_aux_layers if n_aux_layers is not None else 3,
             n_aux_chans if n_aux_chans is not None else 256,
-            use_norm, use_attention, use_pitch_aug, conv_block=conv_block)
-        velocity_cls = LYNXNet if velocity_net == "LYNXNet" else LYNXNet2
-        self.reflow_model = RectifiedFlow(
-            velocity_cls(in_dims=out_dims, dim_cond=out_dims, n_layers=n_layers, n_chans=n_chans), out_dims=out_dims)
+            use_norm, use_attention, use_pitch_aug, conv_block=conv_block, glu_type=glu_type)
+        if velocity_net == "LYNXNet2_65":
+            from .v65 import LYNXNet2_65, RectifiedFlow65
+            self.reflow_model = RectifiedFlow65(
+                LYNXNet2_65(out_dims, out_dims, n_layers, n_chans, glu_type=glu_type), out_dims=out_dims)
+        else:
+            velocity_cls = LYNXNet if velocity_net == "LYNXNet" else LYNXNet2
+            self.reflow_model = RectifiedFlow(
+                velocity_cls(in_dims=out_dims, dim_cond=out_dims, n_layers=n_layers, n_chans=n_chans), out_dims=out_dims)
         self.mel_extractor = mel_extractor if mel_extractor is not None else MelExtractor(
             sr=sampling_rate, n_mels=out_dims, n_fft=win_length, win_size=win_length, hop_length=block_size)
 
@@ -476,9 +494,11 @@ class Unit2Wav(nn.Module):
 class DDSP6Model(Unit2Wav):
     def __init__(self, n_units=768, n_spk=1, win_length=2048, sampling_rate=44100, block_size=512,
                  use_norm=True, use_attention=False, use_pitch_aug=True, out_dims=128, n_aux_layers=6,
-                 n_aux_chans=512, n_layers=6, n_chans=1024, t_start=0.0, mel_extractor=None, velocity_net="LYNXNet2"):
+                 n_aux_chans=512, n_layers=6, n_chans=1024, t_start=0.0, mel_extractor=None, velocity_net="LYNXNet2",
+                 glu_type='softsign_glu'):
         super().__init__(sampling_rate, block_size, win_length, n_units, n_spk, use_norm, use_attention,
-                         use_pitch_aug, out_dims, n_aux_layers, n_aux_chans, n_layers, n_chans, mel_extractor, velocity_net)
+                         use_pitch_aug, out_dims, n_aux_layers, n_aux_chans, n_layers, n_chans, mel_extractor, velocity_net,
+                         glu_type)
         self.t_start = t_start
 
     def forward(self, units, f0, volume, spk_id, gt_spec, aug_shift=None, frame_len=None, lambda_ddsp=1.0, t_start=None):
