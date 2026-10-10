@@ -14,6 +14,8 @@ def main(argv=None):
     parser.add_argument("--max-upload-bytes", type=int, default=64 * 1024 ** 2)
     parser.add_argument("--max-audio-seconds", type=float, default=600.)
     parser.add_argument("--max-pending", type=int, default=4)
+    parser.add_argument("--probe-models", action="store_true",
+                        help="Run bounded inference probes during model discovery (disabled by default)")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("port must be in 1..65535")
@@ -37,7 +39,8 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO)
     import uvicorn
     uvicorn.run(create_app(root, device=device, token=args.token, max_upload_bytes=args.max_upload_bytes,
-                           max_audio_seconds=args.max_audio_seconds, max_pending=args.max_pending), host=args.host, port=args.port)
+                           max_audio_seconds=args.max_audio_seconds, max_pending=args.max_pending,
+                           probe_models=args.probe_models), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

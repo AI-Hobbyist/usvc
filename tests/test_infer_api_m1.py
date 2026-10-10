@@ -133,7 +133,7 @@ def test_http_and_authentication(token):
     model_copy(root)
     (root / "reflow_shallow" / "enhancer").mkdir(parents=True)
     calls = []
-    app = create_app(root, token=token, validator=lambda model: calls.append(model.id))
+    app = create_app(root, token=token, validator=lambda model: calls.append(model.id), probe_models=True)
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer test-secret"} if token else {}
         if token:
@@ -150,6 +150,31 @@ def test_http_and_authentication(token):
         assert client.get("/settings", params={"backend": "sovits"}, headers=headers).status_code == 404
         assert client.get("/settings", params={"backend": "ddsp6", "model": "missing"}, headers=headers).status_code == 404
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize("probe_models", [False, True])
+def test_discovery_probe_option_and_selected_model_validation(probe_models):
+    root = controlled_root()
+    directory = model_copy(root)
+    calls = []
+    app = create_app(root, validator=lambda model: calls.append(model.id),
+                     **({"probe_models": True} if probe_models else {}))
+    with TestClient(app) as client:
+        response = client.get("/model")
+        assert response.status_code == 200 and len(response.json()) == 1
+        identity = response.json()[0]["id"]
+        assert len(calls) == int(probe_models)
+        assert client.get("/settings", params={"backend": "ddsp6", "model": identity}).status_code == 200
+        assert len(calls) == int(probe_models)
+        config = directory / "config.yaml"
+        config.write_text(config.read_text(encoding="utf-8") + "\n# resource changed\n", encoding="utf-8")
+        assert client.get("/model").status_code == 200
+        assert len(calls) == 2 * int(probe_models)
+        catalog = app.state.catalog
+        catalog.ensure_ready(catalog.candidate(identity))
+        assert len(calls) == (2 if probe_models else 1)
+        catalog.ensure_ready(catalog.candidate(identity))
+        assert len(calls) == (2 if probe_models else 1)
 
 
 def test_empty_catalog():

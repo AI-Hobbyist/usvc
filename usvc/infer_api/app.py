@@ -23,12 +23,13 @@ class PrettyJSONResponse(JSONResponse):
 
 
 def create_app(model_root="models", device="cpu", token=None, validator=None, runtime=None,
-               max_upload_bytes=64 * 1024 ** 2, max_audio_seconds=600., max_pending=4):
+               max_upload_bytes=64 * 1024 ** 2, max_audio_seconds=600., max_pending=4,
+               probe_models=False):
     from .runtime import Runtime
     if min(max_upload_bytes, max_audio_seconds, max_pending) <= 0:
         raise ValueError("upload, duration and scheduler limits must be positive")
     runtime = runtime or Runtime(device)
-    catalog = Catalog(model_root, validator or runtime.probe)
+    catalog = Catalog(model_root, validator or runtime.probe, probe_models=probe_models)
 
     @asynccontextmanager
     async def lifespan(app):

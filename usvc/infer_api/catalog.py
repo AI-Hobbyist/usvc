@@ -64,12 +64,13 @@ class Model:
 
 
 class Catalog:
-    def __init__(self, root, validator, shared_roots=()):
+    def __init__(self, root, validator, shared_roots=(), probe_models=False):
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError("model root must be a directory")
         self.roots = (self.root, *(Path(p).resolve() for p in shared_roots))
         self.validator = validator
+        self.probe_models = probe_models
         self.models, self.diagnostics, self.cache, self.enhancers = {}, {}, {}, {}
         self.lock = threading.RLock()
         self.records = {}
@@ -185,14 +186,14 @@ class Catalog:
                             owner = getattr(self.validator, "__self__", None)
                             if owner is None or not hasattr(owner, "probe_enhancer"):
                                 continue
-                            if self.cache.get(identity) != model.fingerprint:
+                            if self.probe_models and self.cache.get(identity) != model.fingerprint:
                                 owner.probe_enhancer(model)
                                 self.cache[identity] = model.fingerprint
                             enhancers[identity] = model
                             self.records[identity] = model
                             continue
                         cached = self.cache.get(identity)
-                        if cached != model.fingerprint:
+                        if self.probe_models and cached != model.fingerprint:
                             self.validator(model)
                             self.cache[identity] = model.fingerprint
                         models[identity] = model

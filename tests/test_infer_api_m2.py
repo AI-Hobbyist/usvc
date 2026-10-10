@@ -285,7 +285,7 @@ def test_catalog_revokes_and_revalidates_without_mutating_files():
         calls.append(model.id)
         if failure[0] and model.id == MODEL:
             raise ValueError("controlled unavailable resource")
-    catalog = Catalog(ROOT / "models", validator)
+    catalog = Catalog(ROOT / "models", validator, probe_models=True)
     assert MODEL in {m["id"] for m in catalog.refresh()}
     before = len(calls)
     catalog.refresh()
