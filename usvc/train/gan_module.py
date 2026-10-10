@@ -9,11 +9,12 @@ from lightning.pytorch import LightningModule
 
 from .config import TrainConfig
 from .dataset import SVCBatch
+from .speaker_checkpoint import SpeakerCheckpointMixin
 
 __all__ = ["BaseGANModule"]
 
 
-class BaseGANModule(LightningModule):
+class BaseGANModule(SpeakerCheckpointMixin, LightningModule):
     """Base for GAN backends (so-vits, rvc) with G/D alternating optimization.
 
     Subclass must implement:

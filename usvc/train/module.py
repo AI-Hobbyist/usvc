@@ -4,9 +4,10 @@ import torch
 
 from .config import TrainConfig
 from .metrics import compute_all_metrics
+from .speaker_checkpoint import SpeakerCheckpointMixin
 
 
-class BaseSVCModule(LightningModule):
+class BaseSVCModule(SpeakerCheckpointMixin, LightningModule):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.cfg = cfg

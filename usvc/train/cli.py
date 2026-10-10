@@ -45,6 +45,14 @@ def run_training(cfg: TrainConfig, resume=None, device=None):
     meta = load_meta(cfg.dataset_dir)
     from ..speakers import TARGET_BACKENDS, resolve_training_speakers, bind_dataset_speakers
     if cfg.backend in TARGET_BACKENDS:
+        if resume or cfg.resume:
+            from .speaker_checkpoint import read_speaker_metadata
+            saved = _t.load(resume or cfg.resume, map_location="cpu", weights_only=False)
+            metadata = read_speaker_metadata(saved)
+            if metadata is None:
+                raise ValueError("full resume requires trusted checkpoint speaker metadata")
+            if cfg.spk is None:
+                cfg.spk = metadata["spk"]
         resolve_training_speakers(cfg, meta)
     want_spec = backend.feature_spec(dict(cfg.backend_opts or {}))
     units_kind = want_spec.units.params.get("kind", "contentvec") if want_spec.units else None
@@ -69,6 +77,14 @@ def run_training(cfg: TrainConfig, resume=None, device=None):
                         persistent_workers=cfg.num_workers > 0, collate_fn=svc_collate, pin_memory=True)
 
     module = backend.build_module(cfg)
+    if cfg.backend in TARGET_BACKENDS and (resume or cfg.resume):
+        module.on_load_checkpoint(saved)
+    if cfg.backend in TARGET_BACKENDS:
+        from .speaker_checkpoint import config_payload
+        import yaml
+        Path(cfg.exp_dir).mkdir(parents=True, exist_ok=True)
+        (Path(cfg.exp_dir) / "config.yaml").write_text(
+            yaml.safe_dump(config_payload(cfg), allow_unicode=True, sort_keys=False), encoding="utf-8")
 
     # ---- pretrained: so-vits base ships G_0.pth/D_0.pth separately, RVC f0G48k.pth/f0D48k.pth; when pointed at
     # the generator file we also try the sibling discriminator; keys get (no prefix, generator., discriminator.,
@@ -101,6 +117,9 @@ def run_training(cfg: TrainConfig, resume=None, device=None):
             else:
                 remapped[k] = v  # leave as-is (will be "unexpected")
         filtered = {k: v for k, v in remapped.items() if k in keys and v.shape == msd[k].shape}
+        for k, v in remapped.items():
+            if cfg.backend in TARGET_BACKENDS and k in keys and v.shape != msd[k].shape and ("spk_embed" in k or "emb_g" in k):
+                print(f"[pretrained] reinitializing speaker embedding {k}: {tuple(v.shape)} -> {tuple(msd[k].shape)}")
         missing, unexpected = module.load_state_dict(filtered, strict=False)
         if missing:
             print(f"[pretrained] missing keys: {len(missing)}")

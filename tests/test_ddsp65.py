@@ -141,7 +141,7 @@ def test_dual_time_mask_is_not_padding_mask():
 
 @pytest.fixture
 def original():
-    root = Path(os.environ.get("USVC_DDSP65_DIR", ROOT / "DDSP-SVC"))
+    root = Path(os.environ.get("USVC_DDSP65_DIR", ROOT / "refs/ddsp65"))
     if not (root / "reflow/lynxnet2.py").exists():
         pytest.skip("local DDSP-SVC 6.5 reference unavailable")
     # Load only the original model definitions, avoiding unrelated pitch-extractor

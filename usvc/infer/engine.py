@@ -266,6 +266,8 @@ class InferenceEngine:
         # shape 不匹配的键跳过 (如 num_speaker 不同的 emb_g)
         skipped_shape = {k for k, v in remapped.items()
                          if k in module_sd_flat and v.shape != module_sd_flat[k].shape}
+        if self.backend_name in ("ddsp6", "sovits") and skipped_shape:
+            raise RuntimeError(f"inference weight shape mismatch: {sorted(skipped_shape)[:8]}")
         filtered = {k: v for k, v in remapped.items() if k not in skipped_shape}
         flat_to_real = {k.replace("._orig_mod.", "."): k for k in module_sd}
         missing, unexpected = module.load_state_dict(

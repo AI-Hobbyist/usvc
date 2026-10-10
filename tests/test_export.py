@@ -56,3 +56,21 @@ def test_export_missing_ckpt(tmp_path):
         ["--ckpt", str(tmp_path / "nope.ckpt"), "--output", str(tmp_path / "x.pth")]
     )
     assert rc == 1
+
+
+def test_export_speaker_metadata_half(tmp_path):
+    from usvc.train.config import TrainConfig
+    from usvc.train.speaker_checkpoint import config_payload, speaker_metadata
+    cfg = TrainConfig(backend="ddsp6", backend_opts={"num_speaker": 2}, spk={"歌手 甲": 0, "乙": 1})
+    path = tmp_path / "last.ckpt"
+    _fake_ckpt(path)
+    checkpoint = torch.load(path, weights_only=False)
+    checkpoint.update(usvc_speakers=speaker_metadata(cfg), usvc_config=config_payload(cfg))
+    torch.save(checkpoint, path)
+    output = tmp_path / "model.pth"
+    assert export.main(["--ckpt", str(path), "-o", str(output), "--half"]) == 0
+    payload = torch.load(output, weights_only=True)
+    assert payload["usvc_speakers"]["spk"] == cfg.spk
+    assert payload["state_dict"]["model.layers.0.weight"].dtype == torch.float16
+    restored = TrainConfig.from_yaml(output.with_suffix(".yaml"))
+    assert restored.spk == cfg.spk

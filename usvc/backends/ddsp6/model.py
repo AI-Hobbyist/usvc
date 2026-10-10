@@ -256,7 +256,7 @@ class Unit2Control(nn.Module):
                 for k, v in spk_mix_dict.items():
                     x = x + v * self.spk_embed(torch.tensor([[k]], dtype=torch.long, device=units.device))
             else:
-                x = x + self.spk_embed(spk_id)
+                x = x + self.spk_embed(spk_id.reshape(-1, 1))
         if self.aug_shift_embed is not None and aug_shift is not None:
             x = x + self.aug_shift_embed(aug_shift / 5)
         x = self.norm(self.decoder(x))

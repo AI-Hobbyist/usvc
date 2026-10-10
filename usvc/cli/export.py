@@ -31,7 +31,18 @@ def main(argv=None) -> int:
     if args.half:
         infer_sd = {k: (v.half() if v.is_floating_point() else v) for k, v in infer_sd.items()}
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(infer_sd, str(out_path))  # bare state_dict, no Lightning wrapper
+    from ..train.speaker_checkpoint import read_speaker_metadata
+    metadata = read_speaker_metadata(ckpt)
+    if metadata is not None:
+        import yaml
+        config = ckpt.get("usvc_config")
+        if config is None:
+            raise ValueError("speaker-aware export requires resolved checkpoint config")
+        torch.save({"state_dict": infer_sd, "usvc_speakers": metadata}, str(out_path))
+        out_path.with_suffix(".yaml").write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    else:
+        torch.save(infer_sd, str(out_path))
 
     mb = lambda f: os.path.getsize(f) / 1024 / 1024
     ckb, outb = mb(ckpt_path), mb(out_path)
