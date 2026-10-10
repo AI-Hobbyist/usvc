@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException
 from .catalog import Catalog
 from .errors import APIError
 from .settings import settings, validate
@@ -58,6 +59,12 @@ def create_app(model_root="models", device="cpu", token=None, validator=None, ru
     @app.exception_handler(APIError)
     async def api_error(request, exc):
         return PrettyJSONResponse(exc.body(), status_code=exc.status)
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request, exc):
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        return PrettyJSONResponse(APIError(exc.status_code, code, str(exc.detail)).body(),
+                                  status_code=exc.status_code, headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def unexpected_error(request, exc):
