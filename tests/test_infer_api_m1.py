@@ -177,6 +177,34 @@ def test_discovery_probe_option_and_selected_model_validation(probe_models):
         assert len(calls) == (2 if probe_models else 1)
 
 
+@pytest.mark.parametrize("count", [1, 2])
+def test_visible_ddsp_speakers_preserve_checkpoint_capacity(count):
+    from usvc.infer_api.settings import validate
+    from usvc.infer_api.errors import APIError
+    root = controlled_root()
+    directory = root / "ddsp6" / "visible"
+    directory.mkdir(parents=True)
+    source = ROOT / "models/ddsp6/__test_ddsp65_multi"
+    for file in source.iterdir():
+        if file.is_file():
+            (directory / file.name).write_bytes(file.read_bytes())
+    cfg = yaml.safe_load((directory / "config.yaml").read_text(encoding="utf-8"))
+    names = sorted(cfg["spk"], key=cfg["spk"].get)[:count]
+    path = directory / "model.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta.update(visible_speakers=names, default_speaker=0)
+    path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    catalog = Catalog(root, lambda model: None)
+    public = catalog.refresh()[0]
+    assert public["multi_speaker"] == (count >= 2)
+    assert public["speakers"] == [{"id": i, "name": name} for i, name in enumerate(names)]
+    model = catalog.candidate(public["id"])
+    assert len(model.cfg.spk) == model.cfg.backend_opts["num_speaker"] == 2
+    assert validate(model, {"speaker": names[-1]}, "cpu")["speaker"] == count - 1
+    with pytest.raises(APIError):
+        validate(model, {"speaker": count}, "cpu")
+
+
 def test_empty_catalog():
     root = controlled_root()
     with TestClient(create_app(root, validator=lambda model: None)) as client:

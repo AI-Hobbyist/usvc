@@ -108,6 +108,14 @@ class Catalog:
             mapping = validate_mapping(declared) if declared is not None else {"default": 0}
             if len(mapping) != 1 and backend != "reflow_shallow":
                 raise ValueError("this backend exposes one logical speaker")
+        visible = metadata.get("visible_speakers")
+        if visible is not None:
+            if (backend != "ddsp6" or not isinstance(visible, list) or not visible
+                    or any(not isinstance(name, str) or name not in mapping for name in visible)
+                    or len(set(visible)) != len(visible)):
+                raise ValueError("visible_speakers must contain unique configured DDSP speaker names")
+            # Keep cfg.spk at checkpoint capacity for loading; expose only source names.
+            mapping = validate_mapping({name: mapping[name] for name in visible})
         default = metadata.get("default_speaker")
         if default is not None:
             default = resolve_speaker(default, mapping, len(mapping))
